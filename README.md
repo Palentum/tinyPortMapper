@@ -27,6 +27,27 @@ Assume you want to map/forward local port 1234 to 10.222.2.1:443
 ./tinymapper_amd64 -l[::]:1234 -r[2001:19f0:7001:1111:00:ff:11:22]:443 -t -u
 ```
 
+You can also start multiple forwarding rules in one process with a config file:
+```toml
+[[endpoints]]
+listen = "0.0.0.0:1234"
+remote = "10.222.2.1:443"
+
+[[endpoints]]
+listen = "0.0.0.0:1235"
+remote = "10.222.2.2:443"
+```
+```sh
+./tinymapper_amd64 -c mapper.toml
+```
+
+The config parser supports only this project's minimal TOML subset: optional `[network]`
+defaults with `no_tcp` / `use_udp`, plus `[[endpoints]]` entries with `listen`,
+`remote`, `no_tcp`, and `use_udp`. Address syntax is the same as the CLI
+(`ipv4:port` and `[ipv6]:port`). Domain names, JSON config, recursive directory
+loading, Realm transports, DNS, balancing, and proxy protocol settings are not
+supported.
+
 ##### NOTE
 ```
 # local port and remote port can be the same
@@ -49,10 +70,12 @@ repository: https://github.com/wangyu-/tinyPortMapper
 
 usage:
     ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip>:<remote_port>  [options]
+    ./this_program  -c <config_file>  [options]
 
 main options:
-    -t                                    enable TCP forwarding/mapping
-    -u                                    enable UDP forwarding/mapping
+    -c, --config <path>                 use config file
+    -t                                  enable TCP forwarding/mapping
+    -u                                  enable UDP forwarding/mapping
 
 other options:
     --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024

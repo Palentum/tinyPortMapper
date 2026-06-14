@@ -2,6 +2,12 @@
 #include "log.h"
 #include "git_version.h"
 #include "fd_manager.h"
+#include "config.h"
+
+#include <sys/stat.h>
+#ifndef S_ISREG
+#define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
+#endif
 
 using  namespace std;
 
@@ -14,10 +20,10 @@ typedef int i32_t;
 int disable_conn_clear=0;
 
 int max_pending_packet=0;
-int enable_udp=0,enable_tcp=0;
+
+static app_config_t app_config;
 
 const int listen_fd_buf_size=2*1024*1024;
-address_t local_addr,remote_addr;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -113,13 +119,23 @@ struct conn_manager_udp_t
 	list<udp_pair_t> udp_pair_list;
 	long long last_clear_time;
 	lru_collector_t lru;
+	int reserved;
 	//list<udp_pair_t>::iterator clear_it;
 
 	conn_manager_udp_t()
 	{
 		last_clear_time=0;
-		adress_to_info.reserve(10007);
+		reserved=0;
 		//clear_it=udp_pair_list.begin();
+	}
+	int reserve()
+	{
+		if(!reserved)
+		{
+			adress_to_info.reserve(10007);
+			reserved=1;
+		}
+		return 0;
 	}
 
 	int erase(list<udp_pair_t>::iterator &it)
@@ -176,7 +192,7 @@ struct conn_manager_udp_t
 		}
 		return 0;
 	}
-}conn_manager_udp;
+};
 
 struct conn_manager_tcp_t
 {
@@ -253,7 +269,32 @@ struct conn_manager_tcp_t
 
 		return 0;
 	}
-}conn_manager_tcp;
+};
+
+struct forward_rule_t:not_copy_able_t
+{
+	int index;
+	address_t local_addr;
+	address_t remote_addr;
+	int enable_tcp;
+	int enable_udp;
+	int local_listen_fd_tcp;
+	int local_listen_fd_udp;
+	ev_io tcp_accept_watcher;
+	ev_io udp_accept_watcher;
+	conn_manager_tcp_t tcp_manager;
+	conn_manager_udp_t udp_manager;
+	forward_rule_t()
+	{
+		index=0;
+		enable_tcp=0;
+		enable_udp=0;
+		local_listen_fd_tcp=-1;
+		local_listen_fd_udp=-1;
+	}
+};
+
+static list<forward_rule_t> forward_rules;
 
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
@@ -276,6 +317,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	assert(fd_info.is_tcp==1);
 
 	tcp_pair_t &tcp_pair=*(fd_info.tcp_pair_p);
+	assert(tcp_pair.owner!=0);
+	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
 
 	/*if((revents&EV_ERROR) !=0)
 	{
@@ -283,7 +326,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//mylog(log_info,"[tcp]connection closed, events[idx].events=%x \n",(u32_t) revents);
 		//ev_io_stop(loop, &tcp_pair.local.ev);
 		//ev_io_stop(loop, &tcp_pair.remote.ev);
-		//conn_manager_tcp.erase(tcp_pair.it);
 		return;
 	}*/
 
@@ -449,6 +491,10 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 }
 void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
+	forward_rule_t *rule=(forward_rule_t *)watcher->data;
+	assert(rule!=0);
+	conn_manager_tcp_t &conn_manager_tcp=rule->tcp_manager;
+	address_t &remote_addr=rule->remote_addr;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
 	if((revents&EV_ERROR) !=0)
@@ -519,6 +565,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	conn_manager_tcp.lru.new_key(&(*it));
 
 	tcp_pair_t &tcp_pair=*it;
+	tcp_pair.owner=rule;
 	strcpy(tcp_pair.addr_s,ip_addr);
 
 	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr_s,new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
@@ -557,8 +604,11 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 {
-	conn_manager_tcp.clear_inactive();
-	conn_manager_udp.clear_inactive();
+	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	{
+		it->tcp_manager.clear_inactive();
+		it->udp_manager.clear_inactive();
+	}
 }
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
@@ -579,6 +629,8 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	int udp_fd=fd_manager.to_fd(fd64);
 	udp_pair_t & udp_pair=*fd_manager.get_info(fd64).udp_pair_p;
+	assert(udp_pair.owner!=0);
+	conn_manager_udp_t &conn_manager_udp=udp_pair.owner->udp_manager;
 	//assert(conn_manager.exist_fd(udp_fd));
 	//if(!conn_manager.exist_fd(udp_fd)) continue;
 
@@ -616,6 +668,10 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 }
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
+	forward_rule_t *rule=(forward_rule_t *)watcher->data;
+	assert(rule!=0);
+	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
+	address_t &remote_addr=rule->remote_addr;
 
 	if((revents&EV_ERROR) !=0)
 	{
@@ -693,6 +749,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		list_it--;
 		conn_manager_udp.lru.new_key(&(*list_it));
 		udp_pair_t &udp_pair=*list_it;
+		udp_pair.owner=rule;
 
 		udp_pair.ev.u64=fd64;
 		ev_io_init (&udp_pair.ev, udp_cb, new_udp_fd, EV_READ);
@@ -714,7 +771,6 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//it=adress_to_info.
 	}
 
-	//auto it=conn_manager_udp.adress_to_info.find(tmp_addr);
 	assert(it!=conn_manager_udp.adress_to_info.end() );
 
 	udp_pair_t &udp_pair=*(it->second);
@@ -747,116 +803,127 @@ void sigint_cb(struct ev_loop *l, ev_signal *w, int revents)
 }
 
 
+static void check_and_record_listen(unordered_map<address_t,int,address_t::hash_function> &listen_rules,forward_rule_t &rule,const char *protocol)
+{
+	auto it=listen_rules.find(rule.local_addr);
+	if(it!=listen_rules.end())
+	{
+		char listen_addr[max_addr_len];
+		rule.local_addr.to_str(listen_addr);
+		mylog(log_fatal,"rule %d [%s] listen address %s conflicts with rule %d\n",rule.index,protocol,listen_addr,it->second);
+		myexit(-1);
+	}
+	listen_rules[rule.local_addr]=rule.index;
+}
+
+static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
+{
+	assert(loop!=0);
+	char listen_addr[max_addr_len];
+	rule.local_addr.to_str(listen_addr);
+	int yes=1;
+
+	if(rule.enable_tcp)
+	{
+		rule.local_listen_fd_tcp=socket(rule.local_addr.get_type(), SOCK_STREAM, 0);
+		if(rule.local_listen_fd_tcp<0)
+		{
+			mylog(log_fatal,"rule %d [tcp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+			myexit(1);
+		}
+
+		setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+		set_buf_size(rule.local_listen_fd_tcp,listen_fd_buf_size);
+		setnonblocking(rule.local_listen_fd_tcp);
+
+		if(::bind(rule.local_listen_fd_tcp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
+		{
+			mylog(log_fatal,"rule %d [tcp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+			myexit(1);
+		}
+
+		if(listen(rule.local_listen_fd_tcp, 512) !=0)
+		{
+			mylog(log_fatal,"rule %d [tcp] socket listen failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+			myexit(1);
+		}
+
+		ev_io_init(&rule.tcp_accept_watcher, tcp_accept_cb, rule.local_listen_fd_tcp, EV_READ);
+		rule.tcp_accept_watcher.data=&rule;
+		ev_io_start(loop, &rule.tcp_accept_watcher);
+	}
+
+	if(rule.enable_udp)
+	{
+		rule.udp_manager.reserve();
+		rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
+		if(rule.local_listen_fd_udp<0)
+		{
+			mylog(log_fatal,"rule %d [udp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+			myexit(1);
+		}
+
+		setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+		set_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
+		setnonblocking(rule.local_listen_fd_udp);
+
+		if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
+		{
+			mylog(log_fatal,"rule %d [udp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+			myexit(1);
+		}
+
+		ev_io_init(&rule.udp_accept_watcher, udp_accept_cb, rule.local_listen_fd_udp, EV_READ);
+		rule.udp_accept_watcher.data=&rule;
+		ev_io_start(loop, &rule.udp_accept_watcher);
+	}
+}
+
+
 int event_loop()
 {
-
-
-	int local_listen_fd_tcp=-1;
-	int local_listen_fd_udp=-1;
-
-	//struct sockaddr_in local_me,remote_dst;
-	int yes = 1;int ret;
-	local_listen_fd_tcp = socket(local_addr.get_type(), SOCK_STREAM, 0);
-	if(local_listen_fd_tcp<0)
-	{
-		mylog(log_fatal,"[tcp]create listen socket failed\n");
-		myexit(1);
-	}
-
-	setsockopt(local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes)); //avoid annoying bind problem
-	set_buf_size(local_listen_fd_tcp,listen_fd_buf_size);
-	setnonblocking(local_listen_fd_tcp);
-
-
-
-
-	local_listen_fd_udp = socket(local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
-	if(local_listen_fd_udp<0)
-	{
-		mylog(log_fatal,"[udp]create listen socket failed\n");
-		myexit(1);
-	}
-	setsockopt(local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));  //this is not necessary.
-	set_buf_size(local_listen_fd_udp,listen_fd_buf_size);
-	setnonblocking(local_listen_fd_udp);
-
-
-	//int epollfd = epoll_create1(0);
-	//const int max_events = 4096;
-	//struct epoll_event ev, events[max_events];
-	//if (epollfd < 0)
-	//{
-	//	mylog(log_fatal,"epoll created return %d\n", epollfd);
-	//	myexit(-1);
-	//}
-
 	struct ev_loop * loop= ev_default_loop(0);
 	assert(loop != NULL);
+	unordered_map<address_t,int,address_t::hash_function> tcp_listen_rules;
+	unordered_map<address_t,int,address_t::hash_function> udp_listen_rules;
+	tcp_listen_rules.reserve(app_config.rules.size());
+	udp_listen_rules.reserve(app_config.rules.size());
 
-	struct ev_io tcp_accept_watcher;
 
-	if(enable_tcp)
+	forward_rules.clear();
+	if(app_config.rules.empty())
 	{
-		if (::bind(local_listen_fd_tcp, (struct sockaddr*) &local_addr.inner, local_addr.get_len()) !=0)
-		{
-			mylog(log_fatal,"[tcp]socket bind failed, %s",get_sock_error());
-			myexit(1);
-		}
-
-	    if (listen (local_listen_fd_tcp, 512) !=0) //512 is max pending tcp connection,its large enough
-	    {
-			mylog(log_fatal,"[tcp]socket listen failed error, %s",get_sock_error());
-			myexit(1);
-	    }
-
-		//ev.events = EPOLLIN;
-		//ev.data.u64 = local_listen_fd_tcp;
-		//int ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, local_listen_fd_tcp, &ev);
-		//if(ret!=0)
-		//{
-		//	mylog(log_fatal,"[tcp]epoll EPOLL_CTL_ADD return %d\n", epollfd);
-		//	myexit(-1);
-		//}
-	    ev_io_init(&tcp_accept_watcher, tcp_accept_cb, local_listen_fd_tcp, EV_READ);
-	    ev_io_start(loop, &tcp_accept_watcher);
+		mylog(log_fatal,"no forward rules configured\n");
+		myexit(-1);
 	}
 
-	struct ev_io udp_accept_watcher;
-
-	if(enable_udp)
+	for(size_t i=0;i<app_config.rules.size();i++)
 	{
-		if (::bind(local_listen_fd_udp, (struct sockaddr*) &local_addr.inner, local_addr.get_len()) == -1)
+		forward_rules.emplace_back();
+		forward_rule_t &rule=forward_rules.back();
+		forward_rule_config_t &rule_config=app_config.rules[i];
+		rule.index=(int)i+1;
+		rule.local_addr=rule_config.local_addr;
+		rule.remote_addr=rule_config.remote_addr;
+		rule.enable_tcp=rule_config.enable_tcp;
+		rule.enable_udp=rule_config.enable_udp;
+		if(rule.enable_tcp)
 		{
-			mylog(log_fatal,"[udp]socket bind error");
-			myexit(1);
+			check_and_record_listen(tcp_listen_rules,rule,"tcp");
 		}
-
-		//ev.events = EPOLLIN;
-		//ev.data.u64 = local_listen_fd_udp;
-		//int ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, local_listen_fd_udp, &ev);
-		//if(ret!=0)
-		//{
-		//	mylog(log_fatal,"[udp]epoll created return %d\n", epollfd);
-		//	myexit(-1);
-		//}
-
-	    ev_io_init(&udp_accept_watcher, udp_accept_cb, local_listen_fd_udp, EV_READ);
-	    ev_io_start(loop, &udp_accept_watcher);
+		if(rule.enable_udp)
+		{
+			check_and_record_listen(udp_listen_rules,rule,"udp");
+		}
+		start_forward_rule(loop,rule);
 	}
 
-	//int clear_timer_fd=-1;
 	struct ev_timer clear_timer;
 
 	ev_timer_init(&clear_timer, clear_timer_cb, 0, timer_interval/1000.0);
 	ev_timer_start(loop, &clear_timer);
 
 	ev_run(loop, 0);
-	/*
-	set_timer(epollfd,clear_timer_fd);
-
-	//u32_t roller=0;
-
-	*/
 	myexit(0);
 	return 0;
 }
@@ -873,12 +940,13 @@ void print_help()
 	printf("\n");
 	printf("usage:\n");
 	printf("    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip>:<remote_port>  [options]\n");
+	printf("    ./this_program  -c <config_file>  [options]\n");
 	printf("\n");
 
 	printf("main options:\n");
-	printf("    -t                                    enable TCP forwarding/mapping\n");
-	printf("    -u                                    enable UDP forwarding/mapping\n");
-	//printf("NOTE: If neither of -t or -u is provided,this program enables both TCP and UDP forward\n");
+	printf("    -c, --config <path>                 use config file\n");
+	printf("    -t                                  enable TCP forwarding/mapping\n");
+	printf("    -u                                  enable UDP forwarding/mapping\n");
 	printf("\n");
 
 	printf("other options:\n");
@@ -896,10 +964,11 @@ void print_help()
 }
 void process_arg(int argc, char *argv[])
 {
-	int i, j, k;
+	int i;
 	int opt;
     static struct option long_options[] =
       {
+		{"config", required_argument,    0, 'c'},
 		{"log-level", required_argument,    0, 1},
 		{"log-position", no_argument,    0, 1},
 		{"disable-color", no_argument,    0, 1},
@@ -961,27 +1030,44 @@ void process_arg(int argc, char *argv[])
 		myexit(-1);
 	}
 
+	app_config.rules.clear();
+	const char *config_path=0;
+	const char *local_arg=0;
+	const char *remote_arg=0;
 	int no_l = 1, no_r = 1;
-	while ((opt = getopt_long(argc, argv, "l:r:tuh:",long_options,&option_index)) != -1)
+	int cli_enable_tcp=0,cli_enable_udp=0;
+	int used_cli_rule_option=0;
+
+	optind=1;
+	while ((opt = getopt_long(argc, argv, "c:l:r:tuh",long_options,&option_index)) != -1)
 	{
-		//string opt_key;
-		//opt_key+=opt;
 		switch (opt)
 		{
-
+		case 'c':
+			if(config_path!=0)
+			{
+				mylog(log_fatal,"duplicate -c/--config option\n");
+				myexit(-1);
+			}
+			config_path=optarg;
+			break;
 		case 'l':
 			no_l = 0;
-			local_addr.from_str(optarg);
+			local_arg=optarg;
+			used_cli_rule_option=1;
 			break;
 		case 'r':
 			no_r = 0;
-			remote_addr.from_str(optarg);
+			remote_arg=optarg;
+			used_cli_rule_option=1;
 			break;
 		case 't':
-			enable_tcp=1;
+			cli_enable_tcp=1;
+			used_cli_rule_option=1;
 			break;
 		case 'u':
-			enable_udp=1;
+			cli_enable_udp=1;
+			used_cli_rule_option=1;
 			break;
 		case 'h':
 			break;
@@ -1027,18 +1113,65 @@ void process_arg(int argc, char *argv[])
 		}
 	}
 
-	if (no_l)
-		mylog(log_fatal,"error: -l not found\n");
-	if (no_r)
-		mylog(log_fatal,"error: -r not found\n");
-	if (no_l || no_r)
-		myexit(-1);
-
-	if(enable_tcp==0&&enable_udp==0)
+	if(config_path!=0)
 	{
-		//enable_tcp=1;
-		//enable_udp=1;
-		mylog(log_fatal,"you must specify -t or -u or both\n");
+		if(used_cli_rule_option)
+		{
+			mylog(log_fatal,"-c/--config cannot be combined with -l/-r/-t/-u\n");
+			myexit(-1);
+		}
+		struct stat st;
+		if(stat(config_path,&st)!=0)
+		{
+			mylog(log_fatal,"config file %s cannot be accessed\n",config_path);
+			myexit(-1);
+		}
+		if(!S_ISREG(st.st_mode))
+		{
+			mylog(log_fatal,"config path %s must be a regular file\n",config_path);
+			myexit(-1);
+		}
+		load_config_file(config_path,app_config);
+	}
+	else
+	{
+		if (no_l)
+			mylog(log_fatal,"error: -l not found\n");
+		if (no_r)
+			mylog(log_fatal,"error: -r not found\n");
+		if (no_l || no_r)
+			myexit(-1);
+
+		if(cli_enable_tcp==0&&cli_enable_udp==0)
+		{
+			mylog(log_fatal,"you must specify -t or -u or both\n");
+			myexit(-1);
+		}
+
+		if(strlen(local_arg)>=max_addr_len)
+		{
+			mylog(log_fatal,"-l address is too long\n");
+			myexit(-1);
+		}
+		if(strlen(remote_arg)>=max_addr_len)
+		{
+			mylog(log_fatal,"-r address is too long\n");
+			myexit(-1);
+		}
+
+		forward_rule_config_t rule;
+		rule.enable_tcp=cli_enable_tcp;
+		rule.enable_udp=cli_enable_udp;
+		snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",local_arg);
+		snprintf(rule.remote_str,sizeof(rule.remote_str),"%s",remote_arg);
+		rule.local_addr.from_str(rule.listen_str);
+		rule.remote_addr.from_str(rule.remote_str);
+		app_config.rules.push_back(rule);
+	}
+
+	if(app_config.rules.empty())
+	{
+		mylog(log_fatal,"no forward rules configured\n");
 		myexit(-1);
 	}
 }

@@ -10,7 +10,7 @@ cc_amd64=/toolchains/lede-sdk-17.01.2-x86-64_gcc-5.4.0_musl-1.1.16.Linux-x86_64/
 #cc_bcm2708=/home/wangyu/raspberry/tools/arm-bcm2708/gcc-linaro-arm-linux-gnueabihf-raspbian/bin/arm-linux-gnueabihf-g++ 
 
 
-SOURCES0=main.cpp log.cpp common.cpp fd_manager.cpp
+SOURCES0=main.cpp log.cpp common.cpp fd_manager.cpp config.cpp
 SOURCES=${SOURCES0} my_ev.cpp -isystem libev
 NAME=tinymapper
 

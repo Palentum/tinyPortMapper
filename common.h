@@ -260,17 +260,21 @@ struct address_t  //TODO scope id
 };
 
 
+struct forward_rule_t;
+
 struct udp_pair_t:not_copy_able_t
 {
 	address_t adress;
 	fd64_t fd64;
 	ev_io ev;
 	int local_listen_fd;
+	forward_rule_t *owner;
 	//u64_t last_active_time;
 	char addr_s[max_addr_len];
 	list<udp_pair_t>::iterator it;
 	udp_pair_t()
 	{
+		owner=0;
 		addr_s[0]=0;
 	}
 	//int not_used=0;
@@ -282,10 +286,12 @@ struct tcp_pair_t:not_copy_able_t
 	tcp_info_t remote;
 	//u64_t last_active_time;
 	list<tcp_pair_t>::iterator it;
+	forward_rule_t *owner;
 	char addr_s[max_addr_len];
 	//int not_used=0;
 	tcp_pair_t()
 	{
+		owner=0;
 		addr_s[0]=0;
 	}
 };
