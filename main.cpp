@@ -5,6 +5,10 @@
 #include "config.h"
 
 #include <sys/stat.h>
+#include <thread>
+#include <mutex>
+#include <condition_variable>
+#include <deque>
 #ifndef S_ISREG
 #define S_ISREG(m) (((m) & S_IFMT) == S_IFREG)
 #endif
@@ -24,6 +28,7 @@ int max_pending_packet=0;
 static app_config_t app_config;
 
 const int listen_fd_buf_size=2*1024*1024;
+static const u32_t dns_refresh_interval=30000;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -157,6 +162,18 @@ struct conn_manager_udp_t
 		return 0;
 	}
 
+	int clear_all()
+	{
+		int cnt=0;
+		while(!udp_pair_list.empty())
+		{
+			auto it=udp_pair_list.begin();
+			erase(it);
+			cnt++;
+		}
+		return cnt;
+	}
+
 	int clear_inactive()
 	{
 		if(get_current_time()-last_clear_time>conn_clear_interval)
@@ -231,6 +248,18 @@ struct conn_manager_tcp_t
 		tcp_pair_list.erase(it);
 		return 0;
 	}
+	int clear_all()
+	{
+		int cnt=0;
+		while(!tcp_pair_list.empty())
+		{
+			auto it=tcp_pair_list.begin();
+			erase_closed(it);
+			cnt++;
+		}
+		return cnt;
+	}
+
 	int clear_inactive()
 	{
 		if(get_current_time()-last_clear_time>conn_clear_interval)
@@ -278,6 +307,11 @@ struct forward_rule_t:not_copy_able_t
 	address_t remote_addr;
 	int enable_tcp;
 	int enable_udp;
+	int remote_is_domain;
+	char remote_host[max_domain_len];
+	u32_t remote_port;
+	my_time_t last_dns_refresh_time;
+	int dns_query_pending;
 	int local_listen_fd_tcp;
 	int local_listen_fd_udp;
 	ev_io tcp_accept_watcher;
@@ -289,12 +323,215 @@ struct forward_rule_t:not_copy_able_t
 		index=0;
 		enable_tcp=0;
 		enable_udp=0;
+		remote_is_domain=0;
+		remote_host[0]=0;
+		remote_port=0;
+		last_dns_refresh_time=0;
+		dns_query_pending=0;
 		local_listen_fd_tcp=-1;
 		local_listen_fd_udp=-1;
 	}
 };
 
 static list<forward_rule_t> forward_rules;
+
+struct dns_refresh_request_t
+{
+	int rule_index;
+	char host[max_domain_len];
+	u32_t port;
+	address_t current_addr;
+};
+
+struct dns_refresh_result_t
+{
+	int rule_index;
+	char host[max_domain_len];
+	u32_t port;
+	int ok;
+	int current_still_valid;
+	address_t next_addr;
+	char err[dns_error_len];
+};
+
+static ev_async dns_async_watcher;
+static std::thread dns_thread;
+static std::mutex dns_mutex;
+static std::condition_variable dns_cv;
+static std::deque<dns_refresh_request_t> dns_requests;
+static std::deque<dns_refresh_result_t> dns_results;
+static struct ev_loop *dns_loop=0;
+static int dns_worker_started=0;
+
+static void dns_worker_main()
+{
+	for(;;)
+	{
+		dns_refresh_request_t request;
+		{
+			std::unique_lock<std::mutex> lock(dns_mutex);
+			while(dns_requests.empty())
+			{
+				dns_cv.wait(lock);
+			}
+			request=dns_requests.front();
+			dns_requests.pop_front();
+		}
+
+		dns_refresh_result_t result;
+		memset(&result,0,sizeof(result));
+		result.rule_index=request.rule_index;
+		snprintf(result.host,sizeof(result.host),"%s",request.host);
+		result.port=request.port;
+
+		address_t addrs[dns_max_result];
+		int addr_count=0;
+		char err[dns_error_len];
+		if(resolve_domain_addresses(request.host,request.port,addrs,dns_max_result,addr_count,err,sizeof(err))==0)
+		{
+			result.ok=1;
+			result.current_still_valid=0;
+			result.next_addr=addrs[0];
+			for(int i=0;i<addr_count;i++)
+			{
+				if(addrs[i]==request.current_addr)
+				{
+					result.current_still_valid=1;
+					result.next_addr=request.current_addr;
+					break;
+				}
+			}
+		}
+		else
+		{
+			result.ok=0;
+			result.current_still_valid=0;
+			snprintf(result.err,sizeof(result.err),"%s",err);
+		}
+
+		{
+			std::lock_guard<std::mutex> lock(dns_mutex);
+			dns_results.push_back(result);
+		}
+		ev_async_send(dns_loop,&dns_async_watcher);
+	}
+}
+
+static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int revents)
+{
+	std::deque<dns_refresh_result_t> results;
+	{
+		std::lock_guard<std::mutex> lock(dns_mutex);
+		results.swap(dns_results);
+	}
+
+	for(auto it=results.begin();it!=results.end();++it)
+	{
+		dns_refresh_result_t &result=*it;
+		forward_rule_t *rule_p=0;
+		for(auto rule_it=forward_rules.begin();rule_it!=forward_rules.end();++rule_it)
+		{
+			if(rule_it->index==result.rule_index)
+			{
+				rule_p=&*rule_it;
+				break;
+			}
+		}
+		if(rule_p==0)
+		{
+			continue;
+		}
+		forward_rule_t &rule=*rule_p;
+		if(rule.remote_is_domain==0)
+		{
+			continue;
+		}
+		if(strcmp(rule.remote_host,result.host)!=0||rule.remote_port!=result.port)
+		{
+			continue;
+		}
+		rule.dns_query_pending=0;
+
+		if(result.ok==0)
+		{
+			mylog(log_warn,"rule %d remote domain %s:%u resolve failed: %s, keeping current address\n",rule.index,rule.remote_host,rule.remote_port,result.err);
+			continue;
+		}
+		if(result.current_still_valid)
+		{
+			continue;
+		}
+		if(result.next_addr==rule.remote_addr)
+		{
+			continue;
+		}
+		char old_addr[max_addr_len];
+		char new_addr[max_addr_len];
+		rule.remote_addr.to_str(old_addr);
+		result.next_addr.to_str(new_addr);
+		rule.remote_addr=result.next_addr;
+		int tcp_closed=rule.tcp_manager.clear_all();
+		int udp_closed=rule.udp_manager.clear_all();
+		mylog(log_info,"rule %d remote domain %s:%u changed from %s to %s, reloaded rule connections tcp=%d udp=%d\n",rule.index,rule.remote_host,rule.remote_port,old_addr,new_addr,tcp_closed,udp_closed);
+	}
+}
+
+static void start_dns_worker(struct ev_loop *loop)
+{
+	if(dns_worker_started)
+	{
+		return;
+	}
+	int has_domain=0;
+	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	{
+		if(it->remote_is_domain)
+		{
+			has_domain=1;
+			break;
+		}
+	}
+	if(!has_domain)
+	{
+		return;
+	}
+	dns_loop=loop;
+	ev_async_init(&dns_async_watcher,dns_result_cb);
+	ev_async_start(loop,&dns_async_watcher);
+	dns_worker_started=1;
+	dns_thread=std::thread(dns_worker_main);
+	dns_thread.detach();
+}
+
+static void schedule_dns_refresh(forward_rule_t &rule)
+{
+	if(rule.remote_is_domain==0)
+	{
+		return;
+	}
+	if(rule.dns_query_pending)
+	{
+		return;
+	}
+	my_time_t now=get_current_time();
+	if(now-rule.last_dns_refresh_time<dns_refresh_interval)
+	{
+		return;
+	}
+	dns_refresh_request_t request;
+	memset(&request,0,sizeof(request));
+	request.rule_index=rule.index;
+	snprintf(request.host,sizeof(request.host),"%s",rule.remote_host);
+	request.port=rule.remote_port;
+	request.current_addr=rule.remote_addr;
+	{
+		std::lock_guard<std::mutex> lock(dns_mutex);
+		dns_requests.push_back(request);
+	}
+	rule.dns_query_pending=1;
+	rule.last_dns_refresh_time=now;
+	dns_cv.notify_one();
+}
 
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
@@ -608,6 +845,7 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 	{
 		it->tcp_manager.clear_inactive();
 		it->udp_manager.clear_inactive();
+		schedule_dns_refresh(*it);
 	}
 }
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -907,6 +1145,13 @@ int event_loop()
 		rule.remote_addr=rule_config.remote_addr;
 		rule.enable_tcp=rule_config.enable_tcp;
 		rule.enable_udp=rule_config.enable_udp;
+		rule.remote_is_domain=rule_config.remote_is_domain;
+		snprintf(rule.remote_host,sizeof(rule.remote_host),"%s",rule_config.remote_host);
+		rule.remote_port=rule_config.remote_port;
+		if(rule.remote_is_domain)
+		{
+			rule.last_dns_refresh_time=get_current_time();
+		}
 		if(rule.enable_tcp)
 		{
 			check_and_record_listen(tcp_listen_rules,rule,"tcp");
@@ -917,6 +1162,8 @@ int event_loop()
 		}
 		start_forward_rule(loop,rule);
 	}
+
+	start_dns_worker(loop);
 
 	struct ev_timer clear_timer;
 
@@ -939,7 +1186,7 @@ void print_help()
 	printf("repository: https://github.com/wangyu-/tinyPortMapper\n");
 	printf("\n");
 	printf("usage:\n");
-	printf("    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip>:<remote_port>  [options]\n");
+	printf("    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port>  [options]\n");
 	printf("    ./this_program  -c <config_file>  [options]\n");
 	printf("\n");
 
@@ -947,6 +1194,7 @@ void print_help()
 	printf("    -c, --config <path>                 use config file\n");
 	printf("    -t                                  enable TCP forwarding/mapping\n");
 	printf("    -u                                  enable UDP forwarding/mapping\n");
+	printf("    remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s\n");
 	printf("\n");
 
 	printf("other options:\n");
@@ -1153,7 +1401,7 @@ void process_arg(int argc, char *argv[])
 			mylog(log_fatal,"-l address is too long\n");
 			myexit(-1);
 		}
-		if(strlen(remote_arg)>=max_addr_len)
+		if(strlen(remote_arg)>=max_remote_len)
 		{
 			mylog(log_fatal,"-r address is too long\n");
 			myexit(-1);
@@ -1165,7 +1413,12 @@ void process_arg(int argc, char *argv[])
 		snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",local_arg);
 		snprintf(rule.remote_str,sizeof(rule.remote_str),"%s",remote_arg);
 		rule.local_addr.from_str(rule.listen_str);
-		rule.remote_addr.from_str(rule.remote_str);
+		char err[dns_error_len];
+		if(parse_remote_target(rule.remote_str,rule.remote_addr,rule.remote_host,sizeof(rule.remote_host),rule.remote_port,rule.remote_is_domain,err,sizeof(err))!=0)
+		{
+			mylog(log_fatal,"-r remote: %s\n",err);
+			myexit(-1);
+		}
 		app_config.rules.push_back(rule);
 	}
 

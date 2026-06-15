@@ -82,6 +82,7 @@ int get_sock_errno()
 	return WSAGetLastError();
 }
 #else
+#include <netdb.h>
 char *get_sock_error()
 {
 	static char buf[1000];
@@ -585,6 +586,240 @@ int address_t::from_str(char *str)
 
 	return 0;
 }
+static void set_err(char *err,int err_len,const char *fmt,...)
+{
+	if(err==0||err_len<=0)
+	{
+		return;
+	}
+	va_list ap;
+	va_start(ap,fmt);
+	vsnprintf(err,err_len,fmt,ap);
+	va_end(ap);
+	err[err_len-1]=0;
+}
+
+static int parse_port_str(const char *port_str,u32_t &port,char *err,int err_len)
+{
+	if(port_str==0||port_str[0]==0)
+	{
+		set_err(err,err_len,"empty port");
+		return -1;
+	}
+	u32_t value=0;
+	for(const char *p=port_str;*p;p++)
+	{
+		if(*p<'0'||*p>'9')
+		{
+			set_err(err,err_len,"invalid port");
+			return -1;
+		}
+		value=value*10+(u32_t)(*p-'0');
+		if(value>65535)
+		{
+			set_err(err,err_len,"invalid port");
+			return -1;
+		}
+	}
+	port=value;
+	return 0;
+}
+
+static int copy_host_part(const char *begin,int len,char *host,int host_len,char *err,int err_len)
+{
+	if(len<=0)
+	{
+		set_err(err,err_len,"empty host");
+		return -1;
+	}
+	if(len>=host_len||len>=max_domain_len)
+	{
+		set_err(err,err_len,"host too long");
+		return -1;
+	}
+	memcpy(host,begin,len);
+	host[len]=0;
+	return 0;
+}
+
+int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len)
+{
+	addr_count=0;
+	if(host==0||host[0]==0)
+	{
+		set_err(err,err_len,"empty host");
+		return -1;
+	}
+	if(addrs==0||max_addrs<=0)
+	{
+		set_err(err,err_len,"invalid address buffer");
+		return -1;
+	}
+
+	char service[16];
+	snprintf(service,sizeof(service),"%u",port);
+	addrinfo hints;
+	memset(&hints,0,sizeof(hints));
+	hints.ai_family=AF_UNSPEC;
+	hints.ai_socktype=SOCK_STREAM;
+
+	addrinfo *res=0;
+	int ret=getaddrinfo(host,service,&hints,&res);
+	if(ret!=0)
+	{
+#if defined(__MINGW32__)
+		set_err(err,err_len,"getaddrinfo failed %d",ret);
+#else
+		set_err(err,err_len,"%s",gai_strerror(ret));
+#endif
+		return -1;
+	}
+
+	for(addrinfo *p=res;p!=0&&addr_count<max_addrs;p=p->ai_next)
+	{
+		if(p->ai_family!=AF_INET&&p->ai_family!=AF_INET6)
+		{
+			continue;
+		}
+		addrs[addr_count].from_sockaddr(p->ai_addr,(socklen_t)p->ai_addrlen);
+		if(addrs[addr_count].get_type()==AF_INET)
+		{
+			addrs[addr_count].inner.ipv4.sin_port=htons((u16_t)port);
+		}
+		else if(addrs[addr_count].get_type()==AF_INET6)
+		{
+			addrs[addr_count].inner.ipv6.sin6_port=htons((u16_t)port);
+		}
+		addr_count++;
+	}
+
+	freeaddrinfo(res);
+	if(addr_count==0)
+	{
+		set_err(err,err_len,"no A or AAAA address found");
+		return -1;
+	}
+	return 0;
+}
+
+int parse_remote_target(const char *str,address_t &addr,char *remote_host,int remote_host_len,u32_t &remote_port,int &remote_is_domain,char *err,int err_len)
+{
+	remote_is_domain=0;
+	remote_port=0;
+	if(remote_host!=0&&remote_host_len>0)
+	{
+		remote_host[0]=0;
+	}
+	if(str==0||str[0]==0)
+	{
+		set_err(err,err_len,"empty remote");
+		return -1;
+	}
+	if(remote_host==0||remote_host_len<=0)
+	{
+		set_err(err,err_len,"invalid host buffer");
+		return -1;
+	}
+
+	char host[max_domain_len];
+	u32_t port=0;
+
+	if(str[0]=='[')
+	{
+		const char *end=strchr(str,']');
+		if(end==0)
+		{
+			set_err(err,err_len,"missing ']'");
+			return -1;
+		}
+		if(end[1]!=':')
+		{
+			set_err(err,err_len,"missing ':'");
+			return -1;
+		}
+		if(copy_host_part(str+1,(int)(end-str-1),host,sizeof(host),err,err_len)!=0)
+		{
+			return -1;
+		}
+		if(parse_port_str(end+2,port,err,err_len)!=0)
+		{
+			return -1;
+		}
+		addr.clear();
+		addr.inner.ipv6.sin6_family=AF_INET6;
+		int ret=inet_pton(AF_INET6,host,&addr.inner.ipv6.sin6_addr);
+		if(ret!=1)
+		{
+			set_err(err,err_len,"invalid IPv6 address");
+			return -1;
+		}
+		addr.inner.ipv6.sin6_port=htons((u16_t)port);
+		remote_port=port;
+		return 0;
+	}
+
+	const char *colon=strchr(str,':');
+	if(colon==0)
+	{
+		set_err(err,err_len,"missing ':'");
+		return -1;
+	}
+	if(strchr(colon+1,':')!=0)
+	{
+		set_err(err,err_len,"IPv6 address must be enclosed in []");
+		return -1;
+	}
+	if(copy_host_part(str,(int)(colon-str),host,sizeof(host),err,err_len)!=0)
+	{
+		return -1;
+	}
+	if(strlen(host)>=(size_t)remote_host_len)
+	{
+		set_err(err,err_len,"host too long");
+		return -1;
+	}
+	if(parse_port_str(colon+1,port,err,err_len)!=0)
+	{
+		return -1;
+	}
+
+	addr.clear();
+	addr.inner.ipv4.sin_family=AF_INET;
+	if(inet_pton(AF_INET,host,&addr.inner.ipv4.sin_addr)==1)
+	{
+		addr.inner.ipv4.sin_port=htons((u16_t)port);
+		remote_port=port;
+		return 0;
+	}
+
+	int ipv4_shaped=1;
+	for(const char *p=host;*p;p++)
+	{
+		if(!((*p>='0'&&*p<='9')||*p=='.'))
+		{
+			ipv4_shaped=0;
+			break;
+		}
+	}
+	if(ipv4_shaped)
+	{
+		set_err(err,err_len,"invalid IPv4 address");
+		return -1;
+	}
+
+	address_t addrs[dns_max_result];
+	int addr_count=0;
+	if(resolve_domain_addresses(host,port,addrs,dns_max_result,addr_count,err,err_len)!=0)
+	{
+		return -1;
+	}
+	strcpy(remote_host,host);
+	remote_is_domain=1;
+	remote_port=port;
+	addr=addrs[0];
+	return 0;
+}
+
 
 char * address_t::get_str()
 {

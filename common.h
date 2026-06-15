@@ -105,6 +105,10 @@ typedef u64_t my_time_t;
 //const int buf_len=max_data_len+200;
 
 const int max_addr_len=100;
+const int max_domain_len=256;
+const int max_remote_len=max_domain_len+16;
+const int dns_error_len=200;
+const int dns_max_result=16;
 
 const int max_data_len_udp=65536;
 const int max_data_len_tcp=4096*4;
@@ -258,6 +262,8 @@ struct address_t  //TODO scope id
 
     int new_connected_udp_fd();
 };
+int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len);
+int parse_remote_target(const char *str,address_t &addr,char *remote_host,int remote_host_len,u32_t &remote_port,int &remote_is_domain,char *err,int err_len);
 
 
 struct forward_rule_t;

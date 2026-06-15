@@ -300,12 +300,11 @@ namespace
 			{
 				config_fatal(path,endpoint.line_listen,"listen","address string is too long");
 			}
-			if(endpoint.remote.size()>=max_addr_len)
+			if(endpoint.remote.size()>=max_remote_len)
 			{
 				config_fatal(path,endpoint.line_remote,"remote","address string is too long");
 			}
 			validate_address_literal(path,endpoint.line_listen,"listen",endpoint.listen);
-			validate_address_literal(path,endpoint.line_remote,"remote",endpoint.remote);
 
 			bool no_tcp=network.has_no_tcp ? network.no_tcp : false;
 			bool use_udp=network.has_use_udp ? network.use_udp : false;
@@ -322,7 +321,11 @@ namespace
 			snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",endpoint.listen.c_str());
 			snprintf(rule.remote_str,sizeof(rule.remote_str),"%s",endpoint.remote.c_str());
 			rule.local_addr.from_str(rule.listen_str);
-			rule.remote_addr.from_str(rule.remote_str);
+			char err[dns_error_len];
+			if(parse_remote_target(rule.remote_str,rule.remote_addr,rule.remote_host,sizeof(rule.remote_host),rule.remote_port,rule.remote_is_domain,err,sizeof(err))!=0)
+			{
+				config_fatal(path,endpoint.line_remote,"remote",err);
+			}
 			config.rules.push_back(rule);
 		}
 	}

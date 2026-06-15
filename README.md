@@ -19,6 +19,9 @@ Assume you want to map/forward local port 1234 to 10.222.2.1:443
 # for TCP only
 ./tinymapper_amd64 -l0.0.0.0:1234 -r10.222.2.1:443 -t
 
+# for TCP with a hostname remote
+./tinymapper_amd64 -l0.0.0.0:1234 -rexample.com:443 -t
+
 # for UDP only
 ./tinymapper_amd64 -l0.0.0.0:1234 -r10.222.2.1:443 -u
 
@@ -36,6 +39,10 @@ remote = "10.222.2.1:443"
 [[endpoints]]
 listen = "0.0.0.0:1235"
 remote = "10.222.2.2:443"
+
+[[endpoints]]
+listen = "0.0.0.0:1236"
+remote = "example.com:443"
 ```
 ```sh
 ./tinymapper_amd64 -c mapper.toml
@@ -43,10 +50,13 @@ remote = "10.222.2.2:443"
 
 The config parser supports only this project's minimal TOML subset: optional `[network]`
 defaults with `no_tcp` / `use_udp`, plus `[[endpoints]]` entries with `listen`,
-`remote`, `no_tcp`, and `use_udp`. Address syntax is the same as the CLI
-(`ipv4:port` and `[ipv6]:port`). Domain names, JSON config, recursive directory
-loading, Realm transports, DNS, balancing, and proxy protocol settings are not
-supported.
+`remote`, `no_tcp`, and `use_udp`. `listen` remains an IP literal. `remote`
+supports `ipv4:port`, `[ipv6]:port`, and `hostname:port`; hostnames are
+resolved at startup and refreshed every 30 seconds. When the active resolved
+address disappears from DNS results, only that endpoint's active TCP/UDP
+connections are closed and new connections use the new address. JSON config,
+recursive directory loading, Realm transports, balancing, and proxy protocol
+settings are not supported.
 
 ##### NOTE
 ```
@@ -69,13 +79,14 @@ git version:25ea4ec047    build date:Nov  4 2017 22:55:23
 repository: https://github.com/wangyu-/tinyPortMapper
 
 usage:
-    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip>:<remote_port>  [options]
+    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port>  [options]
     ./this_program  -c <config_file>  [options]
 
 main options:
     -c, --config <path>                 use config file
     -t                                  enable TCP forwarding/mapping
     -u                                  enable UDP forwarding/mapping
+    remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s
 
 other options:
     --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024
