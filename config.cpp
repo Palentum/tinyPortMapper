@@ -8,6 +8,173 @@
 
 using namespace std;
 
+
+static void set_parse_error(char *err,int err_len,const char *msg)
+{
+	if(err!=0&&err_len>0)
+	{
+		snprintf(err,err_len,"%s",msg);
+	}
+}
+
+static string trim_balance_token(const string &s)
+{
+	size_t begin=0;
+	while(begin<s.size()&&isspace((unsigned char)s[begin])) begin++;
+	size_t end=s.size();
+	while(end>begin&&isspace((unsigned char)s[end-1])) end--;
+	return s.substr(begin,end-begin);
+}
+
+int parse_remote_config_target(const char *str, remote_target_config_t &target, char *err, int err_len)
+{
+	remote_target_config_t clean;
+	target=clean;
+	if(str==0||str[0]==0)
+	{
+		set_parse_error(err,err_len,"empty remote");
+		return -1;
+	}
+	if(strlen(str)>=max_remote_len)
+	{
+		set_parse_error(err,err_len,"remote address string is too long");
+		return -1;
+	}
+	snprintf(target.remote_str,sizeof(target.remote_str),"%s",str);
+	return parse_remote_target(target.remote_str,target.addr,target.host,sizeof(target.host),target.port,target.is_domain,err,err_len);
+}
+
+static int parse_balance_weight(const string &token,int &weight,char *err,int err_len)
+{
+	if(token.empty())
+	{
+		set_parse_error(err,err_len,"empty weight item");
+		return -1;
+	}
+	for(size_t i=0;i<token.size();i++)
+	{
+		if(!isdigit((unsigned char)token[i]))
+		{
+			set_parse_error(err,err_len,"weight must contain only digits");
+			return -1;
+		}
+	}
+	errno=0;
+	char *end=0;
+	unsigned long value=strtoul(token.c_str(),&end,10);
+	if(errno!=0||end==0||*end!=0||value<1||value>255)
+	{
+		set_parse_error(err,err_len,"weight must be between 1 and 255");
+		return -1;
+	}
+	weight=(int)value;
+	return 0;
+}
+
+int parse_balance_spec(const char *spec, int remote_count, balance_strategy_t &strategy, vector<int> &weights, char *err, int err_len)
+{
+	strategy=balance_strategy_off;
+	weights.clear();
+	if(remote_count<=0)
+	{
+		set_parse_error(err,err_len,"remote count must be positive");
+		return -1;
+	}
+
+	string text=spec==0 ? string() : trim_balance_token(spec);
+	if(text.empty())
+	{
+		if(remote_count==1)
+		{
+			return 0;
+		}
+		set_parse_error(err,err_len,"balance is required when multiple remotes are configured");
+		return -1;
+	}
+
+	size_t colon=text.find(':');
+	if(colon==string::npos)
+	{
+		set_parse_error(err,err_len,"missing ':' in balance spec");
+		return -1;
+	}
+	string strategy_s=trim_balance_token(text.substr(0,colon));
+	string weights_s=trim_balance_token(text.substr(colon+1));
+
+	if(strategy_s=="off")
+	{
+		if(remote_count!=1)
+		{
+			set_parse_error(err,err_len,"off balance allows only one remote");
+			return -1;
+		}
+		if(!weights_s.empty())
+		{
+			set_parse_error(err,err_len,"off balance does not accept weights");
+			return -1;
+		}
+		return 0;
+	}
+	if(strategy_s=="roundrobin")
+	{
+		strategy=balance_strategy_roundrobin;
+	}
+	else if(strategy_s=="iphash")
+	{
+		strategy=balance_strategy_iphash;
+	}
+	else
+	{
+		set_parse_error(err,err_len,"unknown balance strategy");
+		return -1;
+	}
+
+	if(weights_s.empty())
+	{
+		set_parse_error(err,err_len,"missing weight list");
+		strategy=balance_strategy_off;
+		return -1;
+	}
+
+	vector<int> parsed;
+	size_t start=0;
+	for(;;)
+	{
+		size_t comma=weights_s.find(',',start);
+		string token;
+		if(comma==string::npos)
+		{
+			token=trim_balance_token(weights_s.substr(start));
+		}
+		else
+		{
+			token=trim_balance_token(weights_s.substr(start,comma-start));
+		}
+		int weight=0;
+		if(parse_balance_weight(token,weight,err,err_len)!=0)
+		{
+			strategy=balance_strategy_off;
+			weights.clear();
+			return -1;
+		}
+		parsed.push_back(weight);
+		if(comma==string::npos)
+		{
+			break;
+		}
+		start=comma+1;
+	}
+
+	if((int)parsed.size()!=remote_count)
+	{
+		set_parse_error(err,err_len,"weight count must equal remote count");
+		strategy=balance_strategy_off;
+		weights.clear();
+		return -1;
+	}
+	weights.swap(parsed);
+	return 0;
+}
 namespace
 {
 	enum config_section_t
@@ -41,14 +208,20 @@ namespace
 		int line;
 		int has_listen;
 		int has_remote;
+		int has_extra_remotes;
+		int has_balance;
 		int has_no_tcp;
 		int has_use_udp;
 		int line_listen;
 		int line_remote;
+		int line_extra_remotes;
+		int line_balance;
 		int line_no_tcp;
 		int line_use_udp;
 		string listen;
 		string remote;
+		vector<string> extra_remotes;
+		string balance;
 		bool no_tcp;
 		bool use_udp;
 		endpoint_config_raw_t()
@@ -56,10 +229,14 @@ namespace
 			line=0;
 			has_listen=0;
 			has_remote=0;
+			has_extra_remotes=0;
+			has_balance=0;
 			has_no_tcp=0;
 			has_use_udp=0;
 			line_listen=0;
 			line_remote=0;
+			line_extra_remotes=0;
+			line_balance=0;
 			line_no_tcp=0;
 			line_use_udp=0;
 			no_tcp=false;
@@ -145,6 +322,77 @@ namespace
 			}
 		}
 		return result;
+	}
+
+	static vector<string> parse_string_array_value(const char *path,int line,const char *field,const string &value)
+	{
+		vector<string> result;
+		size_t pos=0;
+		size_t len=value.size();
+		while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+		if(pos>=len||value[pos]!='[')
+		{
+			config_fatal(path,line,field,"expected inline string array");
+		}
+		pos++;
+		while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+		if(pos<len&&value[pos]==']')
+		{
+			pos++;
+			while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+			if(pos!=len)
+			{
+				config_fatal(path,line,field,"unexpected data after array");
+			}
+			return result;
+		}
+		for(;;)
+		{
+			while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+			if(pos>=len||value[pos]!='"')
+			{
+				config_fatal(path,line,field,"expected double quoted string array item");
+			}
+			pos++;
+			string item;
+			while(pos<len&&value[pos]!='"')
+			{
+				item.push_back(value[pos]);
+				pos++;
+			}
+			if(pos>=len)
+			{
+				config_fatal(path,line,field,"unterminated double quoted string");
+			}
+			pos++;
+			result.push_back(item);
+			while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+			if(pos>=len)
+			{
+				config_fatal(path,line,field,"missing closing ']'");
+			}
+			if(value[pos]==',')
+			{
+				pos++;
+				while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+				if(pos>=len||value[pos]==']')
+				{
+					config_fatal(path,line,field,"trailing comma or empty array item");
+				}
+				continue;
+			}
+			if(value[pos]==']')
+			{
+				pos++;
+				while(pos<len&&isspace((unsigned char)value[pos])) pos++;
+				if(pos!=len)
+				{
+					config_fatal(path,line,field,"unexpected data after array");
+				}
+				return result;
+			}
+			config_fatal(path,line,field,"missing comma between array items");
+		}
 	}
 
 	static unsigned long parse_port(const char *path,int line,const char *field,const string &port_s)
@@ -258,6 +506,22 @@ namespace
 			endpoint.line_remote=line;
 			return;
 		}
+		if(key=="extra_remotes")
+		{
+			if(endpoint.has_extra_remotes) config_fatal(path,line,"extra_remotes","duplicate key in [[endpoints]]");
+			endpoint.extra_remotes=parse_string_array_value(path,line,"extra_remotes",value);
+			endpoint.has_extra_remotes=1;
+			endpoint.line_extra_remotes=line;
+			return;
+		}
+		if(key=="balance")
+		{
+			if(endpoint.has_balance) config_fatal(path,line,"balance","duplicate key in [[endpoints]]");
+			endpoint.balance=parse_string_value(path,line,"balance",value);
+			endpoint.has_balance=1;
+			endpoint.line_balance=line;
+			return;
+		}
 		if(key=="no_tcp")
 		{
 			if(endpoint.has_no_tcp) config_fatal(path,line,"no_tcp","duplicate key in [[endpoints]]");
@@ -304,6 +568,10 @@ namespace
 			{
 				config_fatal(path,endpoint.line_remote,"remote","address string is too long");
 			}
+			if(endpoint.extra_remotes.size()+1>(size_t)max_remote_targets)
+			{
+				config_fatal(path,endpoint.line_extra_remotes,"extra_remotes","too many remote targets");
+			}
 			validate_address_literal(path,endpoint.line_listen,"listen",endpoint.listen);
 
 			bool no_tcp=network.has_no_tcp ? network.no_tcp : false;
@@ -319,12 +587,31 @@ namespace
 				config_fatal(path,endpoint.line,"no_tcp/use_udp","both tcp and udp are disabled for endpoint");
 			}
 			snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",endpoint.listen.c_str());
-			snprintf(rule.remote_str,sizeof(rule.remote_str),"%s",endpoint.remote.c_str());
 			rule.local_addr.from_str(rule.listen_str);
+			rule.remote_targets.reserve(1+endpoint.extra_remotes.size());
 			char err[dns_error_len];
-			if(parse_remote_target(rule.remote_str,rule.remote_addr,rule.remote_host,sizeof(rule.remote_host),rule.remote_port,rule.remote_is_domain,err,sizeof(err))!=0)
+			remote_target_config_t target;
+			if(parse_remote_config_target(endpoint.remote.c_str(),target,err,sizeof(err))!=0)
 			{
 				config_fatal(path,endpoint.line_remote,"remote",err);
+			}
+			rule.remote_targets.push_back(target);
+			for(size_t j=0;j<endpoint.extra_remotes.size();j++)
+			{
+				const string &remote=endpoint.extra_remotes[j];
+				if(remote.size()>=max_remote_len)
+				{
+					config_fatal(path,endpoint.line_extra_remotes,"extra_remotes","address string is too long");
+				}
+				if(parse_remote_config_target(remote.c_str(),target,err,sizeof(err))!=0)
+				{
+					config_fatal(path,endpoint.line_extra_remotes,"extra_remotes",err);
+				}
+				rule.remote_targets.push_back(target);
+			}
+			if(parse_balance_spec(endpoint.has_balance ? endpoint.balance.c_str() : 0,(int)rule.remote_targets.size(),rule.balance_strategy,rule.balance_weights,err,sizeof(err))!=0)
+			{
+				config_fatal(path,endpoint.has_balance ? endpoint.line_balance : endpoint.line,"balance",err);
 			}
 			config.rules.push_back(rule);
 		}

@@ -162,14 +162,18 @@ struct conn_manager_udp_t
 		return 0;
 	}
 
-	int clear_all()
+	int clear_remote_index(int remote_index)
 	{
 		int cnt=0;
-		while(!udp_pair_list.empty())
+		for(auto it=udp_pair_list.begin();it!=udp_pair_list.end();)
 		{
-			auto it=udp_pair_list.begin();
-			erase(it);
-			cnt++;
+			auto current=it;
+			it++;
+			if(current->remote_index==remote_index)
+			{
+				erase(current);
+				cnt++;
+			}
 		}
 		return cnt;
 	}
@@ -248,14 +252,18 @@ struct conn_manager_tcp_t
 		tcp_pair_list.erase(it);
 		return 0;
 	}
-	int clear_all()
+	int clear_remote_index(int remote_index)
 	{
 		int cnt=0;
-		while(!tcp_pair_list.empty())
+		for(auto it=tcp_pair_list.begin();it!=tcp_pair_list.end();)
 		{
-			auto it=tcp_pair_list.begin();
-			erase_closed(it);
-			cnt++;
+			auto current=it;
+			it++;
+			if(current->remote_index==remote_index)
+			{
+				erase_closed(current);
+				cnt++;
+			}
 		}
 		return cnt;
 	}
@@ -300,18 +308,49 @@ struct conn_manager_tcp_t
 	}
 };
 
+struct remote_target_t
+{
+	address_t addr;
+	int is_domain;
+	char remote_str[max_remote_len];
+	char host[max_domain_len];
+	u32_t port;
+	my_time_t last_dns_refresh_time;
+	int dns_query_pending;
+	remote_target_t()
+	{
+		is_domain=0;
+		remote_str[0]=0;
+		host[0]=0;
+		port=0;
+		last_dns_refresh_time=0;
+		dns_query_pending=0;
+	}
+};
+
+struct balance_rr_node_t
+{
+	int current_weight;
+	int effective_weight;
+	int weight;
+	balance_rr_node_t()
+	{
+		current_weight=0;
+		effective_weight=0;
+		weight=0;
+	}
+};
+
 struct forward_rule_t:not_copy_able_t
 {
 	int index;
 	address_t local_addr;
-	address_t remote_addr;
 	int enable_tcp;
 	int enable_udp;
-	int remote_is_domain;
-	char remote_host[max_domain_len];
-	u32_t remote_port;
-	my_time_t last_dns_refresh_time;
-	int dns_query_pending;
+	vector<remote_target_t> remote_targets;
+	balance_strategy_t balance_strategy;
+	vector<int> balance_weights;
+	vector<balance_rr_node_t> rr_nodes;
 	int local_listen_fd_tcp;
 	int local_listen_fd_udp;
 	ev_io tcp_accept_watcher;
@@ -323,11 +362,7 @@ struct forward_rule_t:not_copy_able_t
 		index=0;
 		enable_tcp=0;
 		enable_udp=0;
-		remote_is_domain=0;
-		remote_host[0]=0;
-		remote_port=0;
-		last_dns_refresh_time=0;
-		dns_query_pending=0;
+		balance_strategy=balance_strategy_off;
 		local_listen_fd_tcp=-1;
 		local_listen_fd_udp=-1;
 	}
@@ -338,6 +373,7 @@ static list<forward_rule_t> forward_rules;
 struct dns_refresh_request_t
 {
 	int rule_index;
+	int remote_index;
 	char host[max_domain_len];
 	u32_t port;
 	address_t current_addr;
@@ -346,6 +382,7 @@ struct dns_refresh_request_t
 struct dns_refresh_result_t
 {
 	int rule_index;
+	int remote_index;
 	char host[max_domain_len];
 	u32_t port;
 	int ok;
@@ -381,6 +418,7 @@ static void dns_worker_main()
 		dns_refresh_result_t result;
 		memset(&result,0,sizeof(result));
 		result.rule_index=request.rule_index;
+		result.remote_index=request.remote_index;
 		snprintf(result.host,sizeof(result.host),"%s",request.host);
 		result.port=request.port;
 
@@ -442,37 +480,42 @@ static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int re
 			continue;
 		}
 		forward_rule_t &rule=*rule_p;
-		if(rule.remote_is_domain==0)
+		if(result.remote_index<0||result.remote_index>=(int)rule.remote_targets.size())
 		{
 			continue;
 		}
-		if(strcmp(rule.remote_host,result.host)!=0||rule.remote_port!=result.port)
+		remote_target_t &target=rule.remote_targets[result.remote_index];
+		if(target.is_domain==0)
 		{
 			continue;
 		}
-		rule.dns_query_pending=0;
+		if(strcmp(target.host,result.host)!=0||target.port!=result.port)
+		{
+			continue;
+		}
+		target.dns_query_pending=0;
 
 		if(result.ok==0)
 		{
-			mylog(log_warn,"rule %d remote domain %s:%u resolve failed: %s, keeping current address\n",rule.index,rule.remote_host,rule.remote_port,result.err);
+			mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",rule.index,result.remote_index,target.host,target.port,result.err);
 			continue;
 		}
 		if(result.current_still_valid)
 		{
 			continue;
 		}
-		if(result.next_addr==rule.remote_addr)
+		if(result.next_addr==target.addr)
 		{
 			continue;
 		}
 		char old_addr[max_addr_len];
 		char new_addr[max_addr_len];
-		rule.remote_addr.to_str(old_addr);
+		target.addr.to_str(old_addr);
 		result.next_addr.to_str(new_addr);
-		rule.remote_addr=result.next_addr;
-		int tcp_closed=rule.tcp_manager.clear_all();
-		int udp_closed=rule.udp_manager.clear_all();
-		mylog(log_info,"rule %d remote domain %s:%u changed from %s to %s, reloaded rule connections tcp=%d udp=%d\n",rule.index,rule.remote_host,rule.remote_port,old_addr,new_addr,tcp_closed,udp_closed);
+		target.addr=result.next_addr;
+		int tcp_closed=rule.tcp_manager.clear_remote_index(result.remote_index);
+		int udp_closed=rule.udp_manager.clear_remote_index(result.remote_index);
+		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,result.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
 	}
 }
 
@@ -485,9 +528,16 @@ static void start_dns_worker(struct ev_loop *loop)
 	int has_domain=0;
 	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
 	{
-		if(it->remote_is_domain)
+		for(size_t i=0;i<it->remote_targets.size();i++)
 		{
-			has_domain=1;
+			if(it->remote_targets[i].is_domain)
+			{
+				has_domain=1;
+				break;
+			}
+		}
+		if(has_domain)
+		{
 			break;
 		}
 	}
@@ -505,32 +555,115 @@ static void start_dns_worker(struct ev_loop *loop)
 
 static void schedule_dns_refresh(forward_rule_t &rule)
 {
-	if(rule.remote_is_domain==0)
-	{
-		return;
-	}
-	if(rule.dns_query_pending)
-	{
-		return;
-	}
 	my_time_t now=get_current_time();
-	if(now-rule.last_dns_refresh_time<dns_refresh_interval)
+	for(size_t i=0;i<rule.remote_targets.size();i++)
 	{
-		return;
+		remote_target_t &target=rule.remote_targets[i];
+		if(target.is_domain==0)
+		{
+			continue;
+		}
+		if(target.dns_query_pending)
+		{
+			continue;
+		}
+		if(now-target.last_dns_refresh_time<dns_refresh_interval)
+		{
+			continue;
+		}
+		dns_refresh_request_t request;
+		memset(&request,0,sizeof(request));
+		request.rule_index=rule.index;
+		request.remote_index=(int)i;
+		snprintf(request.host,sizeof(request.host),"%s",target.host);
+		request.port=target.port;
+		request.current_addr=target.addr;
+		{
+			std::lock_guard<std::mutex> lock(dns_mutex);
+			dns_requests.push_back(request);
+		}
+		target.dns_query_pending=1;
+		target.last_dns_refresh_time=now;
+		dns_cv.notify_one();
 	}
-	dns_refresh_request_t request;
-	memset(&request,0,sizeof(request));
-	request.rule_index=rule.index;
-	snprintf(request.host,sizeof(request.host),"%s",rule.remote_host);
-	request.port=rule.remote_port;
-	request.current_addr=rule.remote_addr;
+}
+
+static int select_remote_index(forward_rule_t &rule, const address_t &client_addr)
+{
+	int remote_count=(int)rule.remote_targets.size();
+	assert(remote_count>0);
+	if(remote_count==1||rule.balance_strategy==balance_strategy_off)
 	{
-		std::lock_guard<std::mutex> lock(dns_mutex);
-		dns_requests.push_back(request);
+		return 0;
 	}
-	rule.dns_query_pending=1;
-	rule.last_dns_refresh_time=now;
-	dns_cv.notify_one();
+	assert((int)rule.balance_weights.size()==remote_count);
+
+	if(rule.balance_strategy==balance_strategy_roundrobin)
+	{
+		assert((int)rule.rr_nodes.size()==remote_count);
+		int best=-1;
+		int total=0;
+		for(int i=0;i<remote_count;i++)
+		{
+			balance_rr_node_t &node=rule.rr_nodes[i];
+			assert(node.weight>0);
+			assert(node.effective_weight>0);
+			node.current_weight+=node.effective_weight;
+			total+=node.effective_weight;
+			if(best==-1||node.current_weight>rule.rr_nodes[best].current_weight)
+			{
+				best=i;
+			}
+		}
+		assert(best>=0);
+		assert(total>0);
+		rule.rr_nodes[best].current_weight-=total;
+		return best;
+	}
+
+	if(rule.balance_strategy==balance_strategy_iphash)
+	{
+		const sockaddr *sa=(const sockaddr*)&client_addr.inner;
+		const unsigned char *hash_data=0;
+		int hash_len=0;
+		if(sa->sa_family==AF_INET)
+		{
+			hash_data=(const unsigned char*)&client_addr.inner.ipv4.sin_addr;
+			hash_len=sizeof(client_addr.inner.ipv4.sin_addr);
+		}
+		else if(sa->sa_family==AF_INET6)
+		{
+			hash_data=(const unsigned char*)&client_addr.inner.ipv6.sin6_addr;
+			hash_len=sizeof(client_addr.inner.ipv6.sin6_addr);
+		}
+		else
+		{
+			assert(0==1);
+		}
+		u32_t hash=sdbm((unsigned char*)hash_data,hash_len);
+		int total=0;
+		for(int i=0;i<remote_count;i++)
+		{
+			assert(rule.balance_weights[i]>0);
+			total+=rule.balance_weights[i];
+		}
+		assert(total>0);
+		int bucket=(int)(hash%(u32_t)total);
+		int cursor=0;
+		for(int i=0;i<remote_count;i++)
+		{
+			cursor+=rule.balance_weights[i];
+			if(bucket<cursor)
+			{
+				return i;
+			}
+		}
+		assert(0==1);
+		return 0;
+	}
+
+	assert(0==1);
+	return 0;
 }
 
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -731,7 +864,6 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
 	assert(rule!=0);
 	conn_manager_tcp_t &conn_manager_tcp=rule->tcp_manager;
-	address_t &remote_addr=rule->remote_addr;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
 	if((revents&EV_ERROR) !=0)
@@ -774,6 +906,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		return ;
 		//continue;
 	}
+	int remote_index=select_remote_index(*rule,tmp_addr);
+	address_t &remote_addr=rule->remote_targets[remote_index].addr;
 
 
 	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM, 0);
@@ -803,6 +937,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	tcp_pair_t &tcp_pair=*it;
 	tcp_pair.owner=rule;
+	tcp_pair.remote_index=remote_index;
 	strcpy(tcp_pair.addr_s,ip_addr);
 
 	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr_s,new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
@@ -909,7 +1044,6 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
 	assert(rule!=0);
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
-	address_t &remote_addr=rule->remote_addr;
 
 	if((revents&EV_ERROR) !=0)
 	{
@@ -964,6 +1098,8 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",ip_addr);
 			return;
 		}
+		int remote_index=select_remote_index(*rule,tmp_addr);
+		address_t &remote_addr=rule->remote_targets[remote_index].addr;
 		int new_udp_fd=remote_addr.new_connected_udp_fd();
 		if(new_udp_fd==-1)
 		{
@@ -988,6 +1124,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		conn_manager_udp.lru.new_key(&(*list_it));
 		udp_pair_t &udp_pair=*list_it;
 		udp_pair.owner=rule;
+		udp_pair.remote_index=remote_index;
 
 		udp_pair.ev.u64=fd64;
 		ev_io_init (&udp_pair.ev, udp_cb, new_udp_fd, EV_READ);
@@ -1142,15 +1279,44 @@ int event_loop()
 		forward_rule_config_t &rule_config=app_config.rules[i];
 		rule.index=(int)i+1;
 		rule.local_addr=rule_config.local_addr;
-		rule.remote_addr=rule_config.remote_addr;
 		rule.enable_tcp=rule_config.enable_tcp;
 		rule.enable_udp=rule_config.enable_udp;
-		rule.remote_is_domain=rule_config.remote_is_domain;
-		snprintf(rule.remote_host,sizeof(rule.remote_host),"%s",rule_config.remote_host);
-		rule.remote_port=rule_config.remote_port;
-		if(rule.remote_is_domain)
+		rule.balance_strategy=rule_config.balance_strategy;
+		rule.balance_weights=rule_config.balance_weights;
+		assert(!rule_config.remote_targets.empty());
+		rule.remote_targets.reserve(rule_config.remote_targets.size());
+		my_time_t now=get_current_time();
+		for(size_t j=0;j<rule_config.remote_targets.size();j++)
 		{
-			rule.last_dns_refresh_time=get_current_time();
+			const remote_target_config_t &config_target=rule_config.remote_targets[j];
+			remote_target_t target;
+			target.addr=config_target.addr;
+			target.is_domain=config_target.is_domain;
+			snprintf(target.remote_str,sizeof(target.remote_str),"%s",config_target.remote_str);
+			snprintf(target.host,sizeof(target.host),"%s",config_target.host);
+			target.port=config_target.port;
+			if(target.is_domain)
+			{
+				target.last_dns_refresh_time=now;
+			}
+			rule.remote_targets.push_back(target);
+		}
+		if(rule.balance_strategy!=balance_strategy_off)
+		{
+			assert(rule.balance_weights.size()==rule.remote_targets.size());
+		}
+		if(rule.balance_strategy==balance_strategy_roundrobin)
+		{
+			rule.rr_nodes.reserve(rule.remote_targets.size());
+			for(size_t j=0;j<rule.remote_targets.size();j++)
+			{
+				int weight=rule.balance_weights[j];
+				balance_rr_node_t node;
+				node.current_weight=0;
+				node.effective_weight=weight;
+				node.weight=weight;
+				rule.rr_nodes.push_back(node);
+			}
 		}
 		if(rule.enable_tcp)
 		{
@@ -1186,12 +1352,15 @@ void print_help()
 	printf("repository: https://github.com/wangyu-/tinyPortMapper\n");
 	printf("\n");
 	printf("usage:\n");
-	printf("    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port>  [options]\n");
+	printf("    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port> [-r <remote_ip_or_domain>:<remote_port> ...] [options]\n");
 	printf("    ./this_program  -c <config_file>  [options]\n");
 	printf("\n");
 
 	printf("main options:\n");
 	printf("    -c, --config <path>                 use config file\n");
+	printf("    -l <listen_ip>:<listen_port>        listen address\n");
+	printf("    -r <remote_ip_or_domain>:<remote_port> remote target, can be repeated\n");
+	printf("    --balance <strategy: weights>       load balance repeated -r remotes, strategies: roundrobin, iphash\n");
 	printf("    -t                                  enable TCP forwarding/mapping\n");
 	printf("    -u                                  enable UDP forwarding/mapping\n");
 	printf("    remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s\n");
@@ -1217,6 +1386,7 @@ void process_arg(int argc, char *argv[])
     static struct option long_options[] =
       {
 		{"config", required_argument,    0, 'c'},
+		{"balance", required_argument,    0, 1},
 		{"log-level", required_argument,    0, 1},
 		{"log-position", no_argument,    0, 1},
 		{"disable-color", no_argument,    0, 1},
@@ -1281,8 +1451,9 @@ void process_arg(int argc, char *argv[])
 	app_config.rules.clear();
 	const char *config_path=0;
 	const char *local_arg=0;
-	const char *remote_arg=0;
-	int no_l = 1, no_r = 1;
+	vector<const char*> remote_args;
+	const char *balance_arg=0;
+	int no_l = 1;
 	int cli_enable_tcp=0,cli_enable_udp=0;
 	int used_cli_rule_option=0;
 
@@ -1305,8 +1476,7 @@ void process_arg(int argc, char *argv[])
 			used_cli_rule_option=1;
 			break;
 		case 'r':
-			no_r = 0;
-			remote_arg=optarg;
+			remote_args.push_back(optarg);
 			used_cli_rule_option=1;
 			break;
 		case 't':
@@ -1334,6 +1504,16 @@ void process_arg(int argc, char *argv[])
 			else if(strcmp(long_options[option_index].name,"log-position")==0)
 			{
 				enable_log_position=1;
+			}
+			else if(strcmp(long_options[option_index].name,"balance")==0)
+			{
+				if(balance_arg!=0)
+				{
+					mylog(log_fatal,"duplicate --balance option\n");
+					myexit(-1);
+				}
+				balance_arg=optarg;
+				used_cli_rule_option=1;
 			}
 			else if(strcmp(long_options[option_index].name,"sock-buf")==0)
 			{
@@ -1365,7 +1545,7 @@ void process_arg(int argc, char *argv[])
 	{
 		if(used_cli_rule_option)
 		{
-			mylog(log_fatal,"-c/--config cannot be combined with -l/-r/-t/-u\n");
+			mylog(log_fatal,"-c/--config cannot be combined with -l/-r/-t/-u/--balance\n");
 			myexit(-1);
 		}
 		struct stat st;
@@ -1385,9 +1565,9 @@ void process_arg(int argc, char *argv[])
 	{
 		if (no_l)
 			mylog(log_fatal,"error: -l not found\n");
-		if (no_r)
+		if (remote_args.empty())
 			mylog(log_fatal,"error: -r not found\n");
-		if (no_l || no_r)
+		if (no_l || remote_args.empty())
 			myexit(-1);
 
 		if(cli_enable_tcp==0&&cli_enable_udp==0)
@@ -1401,22 +1581,40 @@ void process_arg(int argc, char *argv[])
 			mylog(log_fatal,"-l address is too long\n");
 			myexit(-1);
 		}
-		if(strlen(remote_arg)>=max_remote_len)
+		if(remote_args.size()>(size_t)max_remote_targets)
 		{
-			mylog(log_fatal,"-r address is too long\n");
+			mylog(log_fatal,"too many -r remote targets\n");
 			myexit(-1);
+		}
+		for(size_t remote_i=0;remote_i<remote_args.size();remote_i++)
+		{
+			if(strlen(remote_args[remote_i])>=max_remote_len)
+			{
+				mylog(log_fatal,"-r address is too long\n");
+				myexit(-1);
+			}
 		}
 
 		forward_rule_config_t rule;
 		rule.enable_tcp=cli_enable_tcp;
 		rule.enable_udp=cli_enable_udp;
 		snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",local_arg);
-		snprintf(rule.remote_str,sizeof(rule.remote_str),"%s",remote_arg);
 		rule.local_addr.from_str(rule.listen_str);
+		rule.remote_targets.reserve(remote_args.size());
 		char err[dns_error_len];
-		if(parse_remote_target(rule.remote_str,rule.remote_addr,rule.remote_host,sizeof(rule.remote_host),rule.remote_port,rule.remote_is_domain,err,sizeof(err))!=0)
+		for(size_t remote_i=0;remote_i<remote_args.size();remote_i++)
 		{
-			mylog(log_fatal,"-r remote: %s\n",err);
+			remote_target_config_t target;
+			if(parse_remote_config_target(remote_args[remote_i],target,err,sizeof(err))!=0)
+			{
+				mylog(log_fatal,"-r remote: %s\n",err);
+				myexit(-1);
+			}
+			rule.remote_targets.push_back(target);
+		}
+		if(parse_balance_spec(balance_arg,(int)rule.remote_targets.size(),rule.balance_strategy,rule.balance_weights,err,sizeof(err))!=0)
+		{
+			mylog(log_fatal,"--balance: %s\n",err);
 			myexit(-1);
 		}
 		app_config.rules.push_back(rule);

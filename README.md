@@ -43,6 +43,12 @@ remote = "10.222.2.2:443"
 [[endpoints]]
 listen = "0.0.0.0:1236"
 remote = "example.com:443"
+
+[[endpoints]]
+listen = "0.0.0.0:1237"
+remote = "10.222.2.1:443"
+extra_remotes = ["10.222.2.2:443", "example.com:443"]
+balance = "roundrobin: 2, 1, 1"
 ```
 ```sh
 ./tinymapper_amd64 -c mapper.toml
@@ -50,13 +56,15 @@ remote = "example.com:443"
 
 The config parser supports only this project's minimal TOML subset: optional `[network]`
 defaults with `no_tcp` / `use_udp`, plus `[[endpoints]]` entries with `listen`,
-`remote`, `no_tcp`, and `use_udp`. `listen` remains an IP literal. `remote`
-supports `ipv4:port`, `[ipv6]:port`, and `hostname:port`; hostnames are
-resolved at startup and refreshed every 30 seconds. When the active resolved
-address disappears from DNS results, only that endpoint's active TCP/UDP
-connections are closed and new connections use the new address. JSON config,
-recursive directory loading, Realm transports, balancing, and proxy protocol
-settings are not supported.
+`remote`, `extra_remotes`, `balance`, `no_tcp`, and `use_udp`. `listen` remains
+an IP literal. `remote` and `extra_remotes` support `ipv4:port`, `[ipv6]:port`,
+and `hostname:port`; hostnames are resolved at startup and refreshed every
+30 seconds. `extra_remotes` is a Realm-style inline string array. `balance`
+supports `roundrobin` and `iphash`; the weight count must equal the total number
+of `remote` plus `extra_remotes` targets. When an active resolved address
+disappears from DNS results, only connections that selected that target are
+closed and new connections use the new address. JSON config, recursive directory
+loading, Realm transports, and proxy protocol settings are not supported.
 
 ##### NOTE
 ```
@@ -79,11 +87,14 @@ git version:25ea4ec047    build date:Nov  4 2017 22:55:23
 repository: https://github.com/wangyu-/tinyPortMapper
 
 usage:
-    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port>  [options]
+    ./this_program  -l <listen_ip>:<listen_port> -r <remote_ip_or_domain>:<remote_port> [-r <remote_ip_or_domain>:<remote_port> ...] [options]
     ./this_program  -c <config_file>  [options]
 
 main options:
     -c, --config <path>                 use config file
+    -l <listen_ip>:<listen_port>        listen address
+    -r <remote_ip_or_domain>:<remote_port> remote target, can be repeated
+    --balance <strategy: weights>       load balance repeated -r remotes, strategies: roundrobin, iphash
     -t                                  enable TCP forwarding/mapping
     -u                                  enable UDP forwarding/mapping
     remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s

@@ -275,12 +275,14 @@ struct udp_pair_t:not_copy_able_t
 	ev_io ev;
 	int local_listen_fd;
 	forward_rule_t *owner;
+	int remote_index;
 	//u64_t last_active_time;
 	char addr_s[max_addr_len];
 	list<udp_pair_t>::iterator it;
 	udp_pair_t()
 	{
 		owner=0;
+		remote_index=-1;
 		addr_s[0]=0;
 	}
 	//int not_used=0;
@@ -293,11 +295,13 @@ struct tcp_pair_t:not_copy_able_t
 	//u64_t last_active_time;
 	list<tcp_pair_t>::iterator it;
 	forward_rule_t *owner;
+	int remote_index;
 	char addr_s[max_addr_len];
 	//int not_used=0;
 	tcp_pair_t()
 	{
 		owner=0;
+		remote_index=-1;
 		addr_s[0]=0;
 	}
 };
