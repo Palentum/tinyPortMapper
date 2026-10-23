@@ -247,7 +247,9 @@ void myexit(int a)
     if(enable_log_color)
    	 printf("%s\n",RESET);
    // clear_iptables_rule();
-	exit(a);
+	//不走 exit()：析构静态对象时 detach 的 DNS 线程可能仍阻塞在 dns_cv 上，glibc 的 pthread_cond_destroy 会一直等它。_exit 不刷新 stdio，先 fflush
+	fflush(stdout);
+	_exit(a);
 }
 /*
 void  signal_handler(int sig)

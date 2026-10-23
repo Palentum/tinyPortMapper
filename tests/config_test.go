@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"slices"
 	"strconv"
@@ -49,7 +50,8 @@ func rrSequence(t testing.TB, listen string, n int) []int {
 	return got
 }
 
-// sigtermExits 断言 tinymapper 收到 SIGTERM 后 2 s 内以状态 0 退出
+// sigtermExits 断言 tinymapper 收到 SIGTERM 后 2 s 内以状态 0 退出，且日志里有退出行
+// （现在 log0 逐行刷新；T6 改为定时刷新后，防的是 myexit 的 _exit 丢掉最后几行）
 func sigtermExits(t testing.TB, remote string) {
 	t.Helper()
 	m := forward(t, "tu", loopback4(t), remote)
@@ -61,6 +63,9 @@ func sigtermExits(t testing.TB, remote string) {
 	if m.exitErr != nil {
 		t.Fatalf("SIGTERM 后退出状态异常：%v", m.exitErr)
 	}
+	if m.logLines("got sigterm, exit") != 1 {
+		t.Fatalf("日志中没有 \"got sigterm, exit\"：\n%s", m.logTail(5))
+	}
 }
 
 func TestSigtermExit(t *testing.T) {
@@ -68,14 +73,21 @@ func TestSigtermExit(t *testing.T) {
 	sigtermExits(t, loopback4(t))
 }
 
-// 域名 remote 会启动 DNS 线程。已知缺陷 C8：glibc 构建在 exit() 析构 dns_cv 时阻塞，musl 不受影响
+// 域名 remote 会启动 DNS 线程。C8：修复前 glibc 构建在 exit() 析构 dns_cv 时阻塞（DNS 线程仍在 wait），musl 不受影响
 func TestSigtermExitDomain(t *testing.T) {
 	t.Parallel()
-	body := func(t testing.TB) { sigtermExits(t, fmt.Sprintf("localhost:%d", freePort(t))) }
-	if os.Getenv("TPM_VARIANT") == "glibc" {
-		xfail(t, "C8", body)
-	} else {
-		body(t)
+	sigtermExits(t, fmt.Sprintf("localhost:%d", freePort(t)))
+}
+
+// C8：myexit 用 _exit，不经过 exit 刷新 stdio。stdout 是管道时全缓冲，约 1.6 KB 的帮助文本要靠 myexit 里的 fflush 写出
+func TestHelpOutput(t *testing.T) {
+	t.Parallel()
+	out, err := exec.Command(mapperBin, "-h").Output()
+	if err != nil {
+		t.Fatalf("-h 退出状态异常：%v", err)
+	}
+	if !strings.Contains(string(out), "-h,--help") {
+		t.Fatalf("帮助文本不完整（%d B）：\n%s", len(out), out)
 	}
 }
 
