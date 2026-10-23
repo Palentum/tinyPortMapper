@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"fmt"
 	"net"
+	"os"
+	"strings"
 	"testing"
 	"time"
 )
@@ -76,43 +78,51 @@ func TestUDPSessionIsolation(t *testing.T) {
 	}
 }
 
-// udpSessionAfterIdle 让同一客户端空闲 idle 后再发包，返回上游看到的源地址序列
-func udpSessionAfterIdle(t testing.TB, idle time.Duration) []string {
+// 空闲超过 conn_timeout_udp（180 s）的会话被清理，期间保持活跃的会话不受影响；
+// 被清理的客户端再发包时，tinymapper 为它新建会话，上游看到新的源地址
+func TestUDPSessionTimeout(t *testing.T) {
+	t.Parallel()
+	slow(t)
 	be := serveUDP(t, loopback4(t), "")
 	listen := loopback4(t)
-	forward(t, "u", listen, be.addr)
-	c := udpDial(t, "", listen)
-	for _, msg := range []string{"first", "second"} {
+	m := forward(t, "u", listen, be.addr)
+	idle := udpDial(t, "", listen)
+	active := udpDial(t, "", listen)
+	roundTrip := func(c *net.UDPConn, msg string) {
+		t.Helper()
 		if _, err := udpRoundTrip(c, []byte(msg)); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if peers := be.peerList(); len(peers) != 1 {
-		t.Fatalf("同一客户端连续发包应复用同一会话，上游看到 %v", peers)
+	cleared := func(c *net.UDPConn) bool {
+		data, _ := os.ReadFile(m.logPath)
+		return strings.Contains(string(data), fmt.Sprintf("inactive connection {%s} cleared", c.LocalAddr()))
 	}
-	time.Sleep(idle)
-	if _, err := udpRoundTrip(c, []byte("after-idle")); err != nil {
-		t.Fatal(err)
-	}
-	return be.peerList()
-}
-
-// UDP 会话空闲超过 conn_timeout_udp（180 s）后应被清理（已知缺陷 C4：实际使用了 TCP 的 360 s）
-func TestUDPSessionTimeout(t *testing.T) {
-	t.Parallel()
-	slow(t)
-	xfail(t, "C4", func(t testing.TB) {
-		if peers := udpSessionAfterIdle(t, 200*time.Second); len(peers) != 2 {
-			t.Fatalf("空闲 200 s 后仍复用旧会话（上游源地址 %v），UDP 超时应为 180 s", peers)
+	roundTrip(active, "active")
+	roundTrip(idle, "idle")
+	last := time.Now()
+	keepalive := last
+	for !cleared(idle) {
+		if elapsed := time.Since(last); elapsed > 210*time.Second {
+			t.Fatalf("空闲 %v 后会话仍未被清理（超时应为 180 s）", elapsed.Round(time.Second))
 		}
-	})
-}
-
-// 无论超时取 180 s 还是 360 s，空闲 380 s 后会话都应已被清理
-func TestUDPSessionExpiry(t *testing.T) {
-	t.Parallel()
-	slow(t)
-	if peers := udpSessionAfterIdle(t, 380*time.Second); len(peers) != 2 {
-		t.Fatalf("空闲 380 s 后会话仍未被清理（上游源地址 %v）", peers)
+		if time.Since(keepalive) >= 30*time.Second {
+			roundTrip(active, "keepalive")
+			keepalive = time.Now()
+		}
+		time.Sleep(time.Second)
+	}
+	elapsed := time.Since(last)
+	t.Logf("空闲会话在 %v 后被清理", elapsed.Round(time.Second))
+	if elapsed < 170*time.Second {
+		t.Errorf("空闲会话过早被清理：%v（超时应为 180 s）", elapsed.Round(time.Second))
+	}
+	if cleared(active) {
+		t.Error("保持活跃的会话也被清理了")
+	}
+	roundTrip(active, "after")
+	roundTrip(idle, "after")
+	if peers := be.peerList(); len(peers) != 3 {
+		t.Errorf("上游源地址 %v，期望 3 个：活跃客户端 1 个，空闲客户端清理前后各 1 个", peers)
 	}
 }

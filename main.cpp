@@ -202,7 +202,7 @@ struct conn_manager_udp_t
 			if(lru.empty()) break;
 			lru_collector_t::key_t key;
 			my_time_t ts=lru.peek_back(key);
-			if(current_time- ts < conn_timeout_tcp) break;
+			if(current_time- ts < conn_timeout_udp) break;
 
 			erase( ((udp_pair_t *) key)->it  );
 
