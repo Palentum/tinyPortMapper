@@ -45,26 +45,13 @@
 #include <stdarg.h>
 #include <assert.h>
 
-#if !defined(NO_LIBEV_EMBED)
 #include <my_ev.h>
-#else
-#include "ev.h"
-#endif
 
-#if defined(__MINGW32__)
-#include <winsock2.h>
-#include <ws2tcpip.h>
-typedef unsigned char u_int8_t;
-typedef unsigned short u_int16_t;
-typedef unsigned int u_int32_t;
-typedef int socklen_t;
-#else
 #include <sys/socket.h>    //for socket ofcourse
 #include <sys/types.h>
 #include <sys/ioctl.h>
 #include <arpa/inet.h>
 #include <netinet/in.h>
-#endif
 
 
 //#include <linux/if_packet.h>
@@ -79,12 +66,6 @@ typedef int socklen_t;
 #include <deque>
 //#include <pair>
 using  namespace std;
-
-#if defined(__MINGW32__)
-int inet_pton(int af, const char *src, void *dst);
-const char *inet_ntop(int af, const void *src, char *dst, socklen_t size);
-#define setsockopt(a,b,c,d,e) setsockopt(a,b,c,(const char *)(d),e)
-#endif
 
 char *get_sock_error();
 int get_sock_errno();
@@ -133,20 +114,11 @@ typedef u64_t fd64_t;
 
 
 
-#if defined(__MINGW32__)
-typedef SOCKET my_fd_t;
-inline int sock_close(my_fd_t fd)
-{
-	return closesocket(fd);
-}
-#else
 typedef int my_fd_t;
 inline int sock_close(my_fd_t fd)
 {
 	return close(fd);
 }
-
-#endif
 
 struct not_copy_able_t
 {
@@ -195,8 +167,6 @@ struct tcp_info_t:not_copy_able_t
 		begin=0;
 	}*/
 };
-
-int init_ws();
 
 u32_t djb2(unsigned char *str,int len);
 u32_t sdbm(unsigned char *str,int len);

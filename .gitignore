@@ -1,0 +1,31 @@
+# --- Claude Code dev workspace (LOCAL ONLY - never push) ---
+# Project-level instructions / memory paths
+CLAUDE.md
+# Project-scoped Claude state
+.claude/
+# docs/CHANGELOG.md, docs/tasks/, docs/mem/, docs/agent-*-job.md
+docs/
+
+# --- IDE / OS noise ---
+.idea/
+.DS_Store
+
+# --- Secrets / credentials ---
+.env
+.env.*
+proxy/
+
+# --- User data / sessions ---
+userdata/
+session/
+
+# --- Personal documents and exports ---
+*_article
+*.docx
+*.doc
+*.xlsx
+*.csv
+
+# --- Build outputs / benchmark results ---
+build/
+bench/results/

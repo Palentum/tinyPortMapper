@@ -1,0 +1,5 @@
+# musl 构建环境（与 OpenWRT 同类 libc 的静态二进制）；zig 提供 musl 交叉编译器，
+# 用于检查发布目标（amd64/x86/arm/mips24kc_be/mips24kc_le）能否编译
+FROM alpine:3.22
+RUN apk add --no-cache g++ make git linux-headers zig \
+    && git config --system --add safe.directory '*'

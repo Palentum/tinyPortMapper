@@ -2,7 +2,9 @@
 A Lightweight High-Performance Port Mapping/Forwarding Utility using epoll, Supports both TCP and UDP 
 
 # Supported Platforms
-Linux host (including desktop Linux,Android phone/tablet, OpenWRT router, or Raspberry PI). Binaries of `amd64` `x86` `mips_be` `mips_le` `arm` are provided.
+Linux only (including desktop/server Linux, Android phone/tablet, OpenWRT router, or Raspberry PI). Windows, macOS, FreeBSD and Cygwin builds are not supported. Binaries of `amd64` `x86` `mips_be` `mips_le` `arm` are provided.
+
+Build with `make all` on Linux. On a non-Linux development machine, `docker/build.sh` builds the same binaries inside Linux containers.
 
 # Getting Started
 

@@ -17,19 +17,30 @@ tinyPortMapper (`tinymapper`) is a lightweight C++11 TCP/UDP port mapping and fo
 ## Key Directories
 
 - `.`: Main project sources and hand-written build file.
-- `libev/`: Vendored libev snapshot and compatibility files. `.gitattributes` marks this directory as vendored.
-- No `tests/`, `scripts/`, or `docs/` project directories exist in this snapshot. Maintenance scripts live under `libev/`.
+- `libev/`: Vendored libev snapshot and compatibility files. `.gitattributes` marks this directory as vendored. Maintenance scripts live here too.
+- `docker/`: Build images and `docker/build.sh`, which builds tinymapper inside Linux containers (glibc, musl, and a zig-based compile check of the release cross targets) into `build/`.
+- `tests/`: Go functional test suite (own `go.mod`, standard library only) and `tests/run.sh`, which runs it inside `ubuntu:24.04` (glibc build) and `alpine:3.22` (musl build) containers.
+- `bench/`: Loopback benchmark (`run.sh`), host-mode benchmark over ssh (`host.sh`), syscall counting (`syscount.sh`), perf profiling (`prof/`), the Go load tool (`fwdbench/`), and the recorded baselines (`BASELINE.md`).
+- `build/` and `bench/results/`: Generated binaries and benchmark results; both are git-ignored.
 
 ## Development Commands
 
 ```sh
-make all        # Native Linux-style build: ./tinymapper, static, -O2, -lrt
-make mac        # Native macOS build without -lrt/static flags
+make all        # Native Linux build: ./tinymapper, static, -O2, -lrt
 make fast       # Faster debug-style local build, no -O2/static
 make debug      # Debug build with -D MY_DEBUG and -ggdb
 make clean      # Remove generated binaries and git_version.h
 make release    # Cross-build configured TARGETS and package tar.gz
-make release2   # release plus Windows/macOS cross targets
+make test       # tests/run.sh: build in containers, run the Go functional tests (glibc + musl)
+make bench      # bench/run.sh: loopback benchmark + syscall counts, results in bench/results/<stamp>/
+```
+
+Container builds (any machine with Docker, including macOS):
+
+```sh
+docker/build.sh                  # build/tinymapper-glibc and build/tinymapper-musl
+docker/build.sh cross            # compile check: amd64 x86 arm mips24kc_be mips24kc_le (zig, musl)
+REF=4acc876 docker/build.sh      # build a commit: build/tinymapper-{glibc,musl}-4acc876
 ```
 
 Run examples:
@@ -60,26 +71,28 @@ Notes:
 
 - `main.cpp`: Entry point, CLI/config selection, protocol callbacks, event loop, per-rule runtime, connection managers.
 - `config.h` / `config.cpp`: Minimal TOML subset parser for `[network]` defaults and `[[endpoints]]` forwarding rules.
-- `common.h` / `common.cpp`: Shared types, `address_t` parsing/formatting, time helpers, socket helpers, platform abstractions.
+- `common.h` / `common.cpp`: Shared types, `address_t` parsing/formatting, time helpers, socket helpers.
 - `fd_manager.h` / `fd_manager.cpp`: Unique fd handle mapping and fd-associated connection metadata.
 - `log.h` / `log.cpp`: Logging levels, color/position flags, `mylog()` implementation.
-- `my_ev_common.h`: Embedded libev configuration (`EV_STANDALONE`, `EV_COMMON`, `EV_COMPAT3`, MinGW fd settings).
+- `my_ev_common.h`: Embedded libev configuration (`EV_STANDALONE`, `EV_COMMON`, `EV_COMPAT3`).
 - `my_ev.h` / `my_ev.cpp`: Libev include wrapper and direct `#include "ev.c"` compilation unit.
-- `makefile`: Build, cross-build, release, and cleanup targets.
+- `makefile`: Build, cross-build, release, cleanup, and the `test` / `bench` entry points.
 - `README.md`: User-facing usage examples, options, supported platforms, and performance-test reference.
 - `libev/update_ev_wrap`, `libev/update_ev_c`, `libev/update_symbols`, `libev/import_libevent`: Vendored libev maintenance helpers.
 
 ## Runtime/Tooling Preferences
 
 - Required language/toolchain: C++11 with `g++`/compatible compiler and GNU Make-style `makefile`.
-- No Node, Bun, Python package manager, or dependency lockfile is used for the project build.
-- Embedded libev is the default. `NO_LIBEV_EMBED` appears only for special external-libev/wepoll build targets.
-- Primary supported runtime is Linux; README also mentions Android, OpenWRT, Raspberry Pi, and cross-built Windows/macOS binaries. Use `make mac` for native macOS work.
+- No Node, Bun, Python package manager, or dependency lockfile is used for the project build. Go (tests, `bench/fwdbench`) and Python 3 (bench summaries) use only their standard libraries.
+- libev is always embedded (`my_ev.cpp` includes `ev.c`).
+- Linux is the only supported platform (glibc distributions and OpenWRT/musl; deployed directly on hosts). Windows/macOS/FreeBSD/Cygwin targets and code paths were removed; do not add non-Linux fallbacks. On a macOS dev machine, build and test through `docker/build.sh` / `make test`.
 - Keep `libev/` treated as third-party vendored code. Prefer changing project wrapper/configuration files before modifying libev internals.
 
 ## Testing & QA
 
-- There is no formal test framework, no coverage setup, and no CI in this snapshot.
-- `main.cpp:1046` contains a commented-out `unit_test()` for `address_t` parsing/hashing only; it is not wired into any target.
-- Runtime QA currently relies on build success, startup assertions, manual forwarding checks, and README-documented `iperf3` performance testing.
-- For source changes, at minimum run the relevant build target (`make mac` on macOS, `make all` on Linux). For behavior changes, smoke-test TCP and/or UDP forwarding with local endpoints and include IPv4/IPv6 cases when address parsing is touched.
+- Functional tests: `make test` (= `tests/run.sh`) builds tinymapper with `docker/build.sh`, cross-compiles the Go test binary on the host (`GOOS=linux`), and runs it in `ubuntu:24.04` against the glibc build and in `alpine:3.22` against the musl build (`--network none`, loopback only). Useful knobs: `VARIANTS=glibc`, `REF=<commit>` (test a commit's build), `TPM_NO_BUILD=1`, `TPM_SLOW=1` (adds the ~6 min TCP/UDP idle-timeout tests), and test-binary flags such as `-test.run X -test.v`.
+- Coverage: TCP integrity (1 B–1 GiB, 100/5000 concurrent), TCP semantics (half-close, RST, refused/unreachable upstream, server-first), resource limits (`max_conn_num`, nofile exhaustion, idle timeout), UDP sizes/session isolation/timeouts, IPv4/IPv6/4to6/6to4, domain refresh, roundrobin/iphash, CLI vs TOML config, invalid configs, SIGTERM exit.
+- Known defects are wrapped in `xfail(t, "<id>", ...)` with IDs from the optimization roadmap (C3 half-close, C4 UDP timeout, C5/C6 fd exhaustion, C8 glibc SIGTERM hang with a domain remote). The body asserts the correct behavior; once a fix lands the test reports XPASS and fails until the `xfail` wrapper is removed.
+- Tests that edit `/etc/hosts` only run when `TPM_IN_CONTAINER=1` (set by `tests/run.sh`); never run them on a real host.
+- Benchmarks: `make bench` (= `bench/run.sh`) runs the loopback benchmark and syscall counts in Docker (forwarder CPU0, client CPU2-3, backends CPU4-5) and writes `bench/results/<stamp>/`. `FWDS="tinymapper@4acc876 tinymapper" bench/run.sh` compares a commit with the working tree; `QUICK=1` is a smoke run; `bench/host.sh` runs the same workloads on real client/forwarder/server hosts over ssh. Run benchmarks with the Docker VM otherwise idle. Baselines and procedures are in `bench/BASELINE.md`.
+- For source changes, at minimum run `make test`; for data-path changes also compare benchmarks and syscall counts against the baseline.

@@ -1,0 +1,6 @@
+# glibc 构建环境：与在 Ubuntu 上执行 `make all` 相同（静态链接，-O2）
+FROM ubuntu:24.04
+ENV DEBIAN_FRONTEND=noninteractive
+RUN apt-get update && apt-get install -y --no-install-recommends g++ make git ca-certificates \
+    && rm -rf /var/lib/apt/lists/* \
+    && git config --system --add safe.directory '*'
