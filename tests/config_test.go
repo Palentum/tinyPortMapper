@@ -124,6 +124,128 @@ func TestEventBackend(t *testing.T) {
 	})
 }
 
+// socketRoles 扫描 /proc/net/{tcp,tcp6,udp,udp6}，按 tinymapper 的监听端口 listen 与后端端口 remote
+// 给 socket 归类，返回 inode → 类别。调用方只查 tinymapper 持有的 inode，其他进程的行不影响结果
+func socketRoles(listen, remote int) map[string]string {
+	port := func(addr string) int {
+		p, _ := strconv.ParseUint(addr[strings.LastIndexByte(addr, ':')+1:], 16, 16)
+		return int(p)
+	}
+	roles := map[string]string{}
+	for _, name := range []string{"tcp", "tcp6", "udp", "udp6"} {
+		data, _ := os.ReadFile("/proc/net/" + name)
+		tcp := strings.HasPrefix(name, "tcp")
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) < 10 {
+				continue
+			}
+			lp, rp, st := port(f[1]), port(f[2]), f[3]
+			switch {
+			case tcp && st == "0A" && lp == listen:
+				roles[f[9]] = "TCP 监听"
+			case tcp && st == "01" && lp == listen:
+				roles[f[9]] = "TCP 客户端"
+			case tcp && st == "01" && rp == remote:
+				roles[f[9]] = "TCP 上游"
+			case !tcp && st == "07" && lp == listen:
+				roles[f[9]] = "UDP 监听"
+			case !tcp && st == "01" && rp == remote:
+				roles[f[9]] = "UDP 会话"
+			}
+		}
+	}
+	return roles
+}
+
+// T2：tinymapper 创建的 socket 都应带 O_NONBLOCK 与 O_CLOEXEC（socket()/accept4 传 SOCK_NONBLOCK|SOCK_CLOEXEC），
+// 修复前用 fcntl 设非阻塞、没有 close-on-exec。fdinfo 的 flags 在 close_on_exec 置位时含 O_CLOEXEC（fs/proc/fd.c）。
+// 五类 socket 按 /proc/net 中的端口认出并要求每类至少一个，防止一个都没查到也通过
+func TestFdFlags(t *testing.T) {
+	t.Parallel()
+	// -r 同时用于 TCP 与 UDP，两个回显后端共用一个端口
+	remote := loopback4(t)
+	serveTCP(t, remote, echoHandler(""))
+	serveUDP(t, remote, "")
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, remote)
+	mustEcho(t, dial(t, listen), "tcp") // 回显成功说明上游已连上
+	udpReplyFrom(t, udpDial(t, "", listen), "udp")
+
+	type sock struct {
+		fd, inode, role string
+		flags           uint64
+	}
+	var socks []sock
+	var others []string
+	dir := fmt.Sprintf("/proc/%d/fd", m.pid())
+	scans := 0
+	// /proc/net/tcp 不是一致快照，并行负载下可能漏行（见 synSentTo）：重扫直到每个 socket 都能归类
+	for deadline := time.Now().Add(10 * time.Second); ; time.Sleep(50 * time.Millisecond) {
+		socks, others = nil, nil
+		scans++
+		ents, err := os.ReadDir(dir)
+		if err != nil {
+			t.Fatal(err)
+		}
+		roles := socketRoles(portOf(listen), portOf(remote))
+		unknown := 0
+		for _, e := range ents {
+			link, _ := os.Readlink(filepath.Join(dir, e.Name()))
+			inode, ok := strings.CutPrefix(link, "socket:[")
+			if !ok {
+				others = append(others, e.Name()+"→"+link)
+				continue
+			}
+			s := sock{fd: e.Name(), inode: strings.TrimSuffix(inode, "]"), role: "未归类"}
+			if r, ok := roles[s.inode]; ok {
+				s.role = r
+			} else {
+				unknown++
+			}
+			info, err := os.ReadFile(fmt.Sprintf("/proc/%d/fdinfo/%s", m.pid(), e.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			for _, line := range strings.Split(string(info), "\n") {
+				if v, ok := strings.CutPrefix(line, "flags:"); ok {
+					s.flags, _ = strconv.ParseUint(strings.TrimSpace(v), 8, 32)
+				}
+			}
+			socks = append(socks, s)
+		}
+		if unknown == 0 || time.Now().After(deadline) {
+			break
+		}
+	}
+	t.Logf("扫描 /proc/net %d 次；非 socket fd：%v", scans, others)
+
+	count := map[string]int{}
+	for _, s := range socks {
+		count[s.role]++
+		var missing []string
+		if s.flags&syscall.O_NONBLOCK == 0 {
+			missing = append(missing, "O_NONBLOCK")
+		}
+		if s.flags&syscall.O_CLOEXEC == 0 {
+			missing = append(missing, "O_CLOEXEC")
+		}
+		if len(missing) > 0 {
+			t.Errorf("%s socket（fd %s，inode %s）flags=0%o，缺少 %s", s.role, s.fd, s.inode, s.flags, strings.Join(missing, "、"))
+		} else {
+			t.Logf("%s socket（fd %s，inode %s）flags=0%o", s.role, s.fd, s.inode, s.flags)
+		}
+	}
+	for _, k := range []string{"TCP 监听", "TCP 客户端", "TCP 上游", "UDP 监听", "UDP 会话"} {
+		if count[k] == 0 {
+			t.Errorf("没有找到 %s socket，这一类未被检查", k)
+		}
+	}
+	if n := count["未归类"]; n > 0 {
+		t.Errorf("%d 个 socket 在 /proc/net 中找不到对应行或无法归类", n)
+	}
+}
+
 // 命令行与 TOML 配置的等价性
 func TestConfigEquivalence(t *testing.T) {
 	t.Parallel()

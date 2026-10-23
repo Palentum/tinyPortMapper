@@ -762,12 +762,11 @@ int address_t::new_connected_udp_fd()
 {
 
 	int new_udp_fd;
-	new_udp_fd = socket(get_type(), SOCK_DGRAM, IPPROTO_UDP);
+	new_udp_fd = socket(get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
 	if (new_udp_fd < 0) {
 		mylog(log_warn, "create udp_fd error\n");
 		return -1;
 	}
-	setnonblocking(new_udp_fd);
 	set_buf_size(new_udp_fd,socket_buf_size);
 
 	mylog(log_debug, "created new udp_fd %d\n", new_udp_fd);

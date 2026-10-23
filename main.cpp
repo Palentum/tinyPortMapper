@@ -964,7 +964,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	address_t::storage_t tmp_sockaddr_in={0};
 	memset(&tmp_sockaddr_in,0,sizeof(tmp_sockaddr_in));
 
-	int new_fd=accept(local_listen_fd_tcp, (struct sockaddr*) &tmp_sockaddr_in,&tmp_len);
+	//Linux 上 accept 得到的 socket 不继承监听 socket 的 O_NONBLOCK，用 accept4 一次设好，省掉两次 fcntl
+	int new_fd=accept4(local_listen_fd_tcp, (struct sockaddr*) &tmp_sockaddr_in,&tmp_len,SOCK_NONBLOCK|SOCK_CLOEXEC);
 	if(new_fd<0)
 	{
 		int err=errno;
@@ -982,7 +983,6 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
 
 	set_buf_size(new_fd,socket_buf_size);
-	setnonblocking(new_fd);
 
 	char ip_addr[max_addr_len];
 	tmp_addr.to_str(ip_addr);
@@ -999,7 +999,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	address_t &remote_addr=rule->remote_targets[remote_index].addr;
 
 
-	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM, 0);
+	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
 	if(new_remote_fd<0)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",ip_addr,get_sock_error());
@@ -1007,7 +1007,6 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		return ;
 	}
 	set_buf_size(new_remote_fd,socket_buf_size);
-	setnonblocking(new_remote_fd);
 	if(!disable_tcp_nodelay)
 	{
 		int yes=1;
@@ -1311,7 +1310,7 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 
 	if(rule.enable_tcp)
 	{
-		rule.local_listen_fd_tcp=socket(rule.local_addr.get_type(), SOCK_STREAM, 0);
+		rule.local_listen_fd_tcp=socket(rule.local_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
 		if(rule.local_listen_fd_tcp<0)
 		{
 			mylog(log_fatal,"rule %d [tcp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
@@ -1323,7 +1322,6 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 		if(!disable_tcp_nodelay)
 			setsockopt(rule.local_listen_fd_tcp, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 		set_buf_size(rule.local_listen_fd_tcp,listen_fd_buf_size);
-		setnonblocking(rule.local_listen_fd_tcp);
 
 		if(::bind(rule.local_listen_fd_tcp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 		{
@@ -1345,7 +1343,7 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 	if(rule.enable_udp)
 	{
 		rule.udp_manager.reserve();
-		rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM, IPPROTO_UDP);
+		rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
 		if(rule.local_listen_fd_udp<0)
 		{
 			mylog(log_fatal,"rule %d [udp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
@@ -1354,7 +1352,6 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 
 		setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 		set_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
-		setnonblocking(rule.local_listen_fd_udp);
 
 		if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 		{
