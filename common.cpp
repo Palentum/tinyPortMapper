@@ -22,10 +22,6 @@ char *get_sock_error()
 	sprintf(buf, "%d:%s", errno,strerror(errno));
 	return buf;
 }
-int get_sock_errno()
-{
-	return errno;
-}
 
 
 /*
@@ -776,7 +772,7 @@ int address_t::new_connected_udp_fd()
 	int ret = connect(new_udp_fd, (struct sockaddr *) &inner, get_len());
 	if (ret != 0) {
 		mylog(log_warn, "udp fd connect fail %d %s\n",ret,get_sock_error() );
-		sock_close(new_udp_fd);
+		close(new_udp_fd);
 		return -1;
 	}
 

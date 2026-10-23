@@ -68,7 +68,6 @@
 using  namespace std;
 
 char *get_sock_error();
-int get_sock_errno();
 
 
 typedef unsigned long long u64_t;   //this works on most platform,avoid using the PRId64
@@ -113,12 +112,6 @@ extern int socket_buf_size;
 typedef u64_t fd64_t;
 
 
-
-typedef int my_fd_t;
-inline int sock_close(my_fd_t fd)
-{
-	return close(fd);
-}
 
 struct not_copy_able_t
 {

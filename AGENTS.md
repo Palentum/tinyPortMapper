@@ -61,7 +61,7 @@ Notes:
 
 - Style is pragmatic C-with-classes C++11: global process state, `struct` data holders, `using namespace std`, C socket APIs, `char*`/fixed buffers, and manual lifecycle management.
 - Naming is mostly `snake_case`; types commonly end in `_t` (`address_t`, `tcp_pair_t`, `fd_manager_t`). Runtime forwarding state lives in `app_config.rules` and `forward_rules`; each `forward_rule_t` owns its listener fds and TCP/UDP managers.
-- Keep networking nonblocking. Use `setnonblocking()`, `set_buf_size()`, `sock_close()`, and `fd_manager.fd64_close()` instead of ad-hoc fd handling.
+- Keep networking nonblocking. Use `setnonblocking()`, `set_buf_size()`, `close()`, and `fd_manager.fd64_close()` instead of ad-hoc fd handling.
 - Error handling uses `mylog(level, ...)`, `myexit()`, and `assert()` for invariants. Fatal setup errors usually log `log_fatal` then exit; runtime network errors usually log and close/erase the affected connection.
 - Async work is libev-based only: `ev_io_init/start/stop`, `ev_timer`, `ev_signal`, `EV_READ`, and `EV_WRITE`. When changing watcher events, existing code stops, mutates/re-initializes, then restarts the watcher.
 - Avoid introducing new allocation-heavy abstractions in hot paths. Existing TCP buffers are fixed arrays in `tcp_info_t`; UDP uses stack buffers in callbacks.

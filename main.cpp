@@ -899,7 +899,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	if(int(conn_manager_tcp.tcp_pair_list.size())>=max_conn_num)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",ip_addr);
-		sock_close(new_fd);
+		close(new_fd);
 		return ;
 		//continue;
 	}
