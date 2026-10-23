@@ -31,7 +31,7 @@ func serveTCP(t testing.TB, addr string, handle func(net.Conn)) *tcpServer {
 	t.Helper()
 	ln, err := net.Listen("tcp", addr)
 	if err != nil {
-		t.Fatalf("后端监听 %s 失败：%v", addr, err)
+		t.Fatalf("后端监听 %s 失败：%v；该端口上的 socket：%s", addr, err, portHolders(portOf(addr)))
 	}
 	s := &tcpServer{addr: ln.Addr().String(), conns: map[net.Conn]struct{}{}}
 	go func() {

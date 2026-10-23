@@ -333,6 +333,37 @@ func listening(pid int, proto string, port int) bool {
 	return false
 }
 
+// portHolders 列出 /proc/net/{tcp,tcp6,udp,udp6} 中本地端口为 port 的 socket 及持有它的进程，用于诊断 EADDRINUSE：
+// freePort 按代码不会重复分配，但全量运行中出现过一次两个用例同时 bind 失败，原因未查明
+func portHolders(port int) string {
+	owners := map[string][]string{}
+	procs, _ := os.ReadDir("/proc")
+	for _, p := range procs {
+		pid, err := strconv.Atoi(p.Name())
+		if err != nil {
+			continue
+		}
+		comm, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", pid))
+		for ino := range socketInodes(pid) {
+			owners[ino] = append(owners[ino], fmt.Sprintf("%d(%s)", pid, strings.TrimSpace(string(comm))))
+		}
+	}
+	var out []string
+	for _, name := range []string{"tcp", "tcp6", "udp", "udp6"} {
+		data, _ := os.ReadFile("/proc/net/" + name)
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) >= 10 && strings.HasSuffix(f[1], fmt.Sprintf(":%04X", port)) {
+				out = append(out, fmt.Sprintf("%s %s->%s st=%s inode=%s %v", name, f[1], f[2], f[3], f[9], owners[f[9]]))
+			}
+		}
+	}
+	if len(out) == 0 {
+		return "无"
+	}
+	return strings.Join(out, "；")
+}
+
 func fdCount(t testing.TB, pid int) int {
 	t.Helper()
 	ents, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", pid))

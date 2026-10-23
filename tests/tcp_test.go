@@ -260,10 +260,10 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	file := os.NewFile(uintptr(fd), "listen-full")
 	defer file.Close()
 	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
-		t.Fatal(err)
+		t.Fatalf("bind 127.0.0.1:%d 失败：%v；该端口上的 socket：%s", port, err, portHolders(port))
 	}
 	if err := syscall.Listen(fd, 1); err != nil {
-		t.Fatal(err)
+		t.Fatalf("listen 127.0.0.1:%d 失败：%v；该端口上的 socket：%s", port, err, portHolders(port))
 	}
 	if ln, err = net.FileListener(file); err != nil {
 		t.Fatal(err)
@@ -303,22 +303,25 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	}
 }
 
-// synSentTo 返回 /proc/net/tcp 中处于 SYN_SENT、目的端口为 port 的 socket 数。
-// 建连失败（收到 RST）的 socket 已从哈希表摘除，不再列出
+// synSentTo 返回 /proc/net/tcp 中处于 SYN_SENT、目的端口为 port 的 socket 数（按 inode 去重）。
+// 建连失败（收到 RST）的 socket 已从哈希表摘除，不再列出。
+// /proc/net/tcp 不是一致快照：每次 read(2) 最多一页，下一次按（桶号，桶内偏移）续读（tcp_seek_last_pos），
+// 两次 read 之间同一桶里的插入或删除会让一行重复出现或被跳过。TestTCPMaxConn 并行运行时实测同一 socket 被列出 4 次，
+// 所以这里去重，调用方再用两次扫描排除漏行
 func synSentTo(t testing.TB, port int) int {
 	t.Helper()
 	data, err := os.ReadFile("/proc/net/tcp")
 	if err != nil {
 		t.Fatal(err)
 	}
-	n := 0
+	inodes := map[string]bool{}
 	for _, line := range strings.Split(string(data), "\n")[1:] {
 		f := strings.Fields(line)
-		if len(f) >= 4 && f[3] == "02" && strings.HasSuffix(f[2], fmt.Sprintf(":%04X", port)) {
-			n++
+		if len(f) >= 10 && f[3] == "02" && strings.HasSuffix(f[2], fmt.Sprintf(":%04X", port)) {
+			inodes[f[9]] = true
 		}
 	}
-	return n
+	return len(inodes)
 }
 
 // 上游连接建立前客户端即关闭写方向：FIN 应推迟到上游连接建立后再转发，而不是中止连接
@@ -358,6 +361,35 @@ func TestTCPHalfCloseConnecting(t *testing.T) {
 	}
 }
 
+// streamUntil 以 64 KiB 为块向 c 持续写，每写完一块就非阻塞地读一次 c，done 返回真时停止，返回此时已写出的字节数。
+// 写和检查在同一个协程里交替：请求或 FIN 进入接收队列后，下一块写完时的检查就能看到，结果不受 Go 调度延迟影响。
+// 原来由另一个协程读，全量并行运行时它排队等 P 的那段时间里，写协程能把整条管道重新灌满（实测多写 3–4.6 MiB）
+func streamUntil(c *net.TCPConn, written *atomic.Int64, done func(data []byte, eof bool) bool) (int64, error) {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	wbuf, rbuf := make([]byte, 64<<10), make([]byte, 64<<10)
+	for {
+		n, err := c.Write(wbuf)
+		written.Add(int64(n))
+		if err != nil {
+			return written.Load(), err
+		}
+		var rn int
+		var rerr error
+		if err := rc.Read(func(fd uintptr) bool { rn, rerr = syscall.Read(int(fd), rbuf); return true }); err != nil {
+			return written.Load(), err
+		}
+		if rerr != nil && rerr != syscall.EAGAIN {
+			return written.Load(), rerr
+		}
+		if rerr == nil && done(rbuf[:rn], rn == 0) {
+			return written.Load(), nil
+		}
+	}
+}
+
 // 同上，但上游连上后立即持续推流、直到读到 EOF 才停：推迟的 FIN 不能因上游每轮都可读而一直发不出去。
 // 建连期间暂停 tinymapper，恢复时上游已同时可读可写，模拟转发器繁忙时的事件顺序
 func TestTCPHalfCloseConnectingStream(t *testing.T) {
@@ -384,20 +416,8 @@ func TestTCPHalfCloseConnectingStream(t *testing.T) {
 		defer be.Close()
 		close(accepted)
 		be.SetDeadline(time.Now().Add(3 * ioTimeout))
-		eof := make(chan struct{})
-		go func() { io.Copy(io.Discard, be); eofAt <- written.Load(); close(eof) }()
-		buf := make([]byte, 64<<10)
-		for {
-			select {
-			case <-eof:
-				return
-			default:
-			}
-			n, err := be.Write(buf)
-			written.Add(int64(n))
-			if err != nil {
-				return
-			}
+		if w, err := streamUntil(be.(*net.TCPConn), &written, func(_ []byte, eof bool) bool { return eof }); err == nil {
+			eofAt <- w
 		}
 	}()
 	select {
@@ -412,10 +432,13 @@ func TestTCPHalfCloseConnectingStream(t *testing.T) {
 	if n, err := io.Copy(io.Discard, c); err != nil {
 		t.Fatalf("客户端读了 %d 字节仍未读到 EOF（%v）：推迟的 FIN 没有转发给上游", n, err)
 	}
-	// 实测：FIN 先于读处理时恢复后上游没有再写出数据（0 字节）；只走读分支时要等客户端偶然背压，多写 1.9–4.6 MiB
+	// 实测：FIN 先于读处理时恰好多写 64 KiB（暂停时没写完的那一块）；只走读分支（c3pre）时要等客户端偶然背压，
+	// 多写 0.56–3.5 MiB，所以门槛取 256 KiB
 	select {
 	case w := <-eofAt:
-		if extra := w - before; extra > 1<<20 {
+		extra := w - before
+		t.Logf("恢复后上游又写出 %d 字节才收到 FIN", extra)
+		if extra > 256<<10 {
 			t.Fatalf("恢复后上游又写出 %d 字节才收到 FIN：推迟的 shutdown 被持续可读的上游拖延", extra)
 		}
 	case <-time.After(ioTimeout):
@@ -494,26 +517,13 @@ func TestTCPConnectingDataStream(t *testing.T) {
 		defer be.Close()
 		close(accepted)
 		be.SetDeadline(time.Now().Add(3 * ioTimeout))
-		got := make(chan struct{})
-		go func() {
-			buf := make([]byte, len(req))
-			if _, err := io.ReadFull(be, buf); err == nil && bytes.Equal(buf, req) {
-				reqAt <- written.Load()
-			}
-			close(got)
-		}()
-		buf := make([]byte, 64<<10)
-		for {
-			select {
-			case <-got:
-				return
-			default:
-			}
-			n, err := be.Write(buf)
-			written.Add(int64(n))
-			if err != nil {
-				return
-			}
+		var got []byte
+		w, err := streamUntil(be.(*net.TCPConn), &written, func(data []byte, eof bool) bool {
+			got = append(got, data...)
+			return eof || len(got) >= len(req)
+		})
+		if err == nil && bytes.Equal(got, req) {
+			reqAt <- w
 		}
 	}()
 	select {
@@ -525,11 +535,14 @@ func TestTCPConnectingDataStream(t *testing.T) {
 	before := written.Load()
 	go io.Copy(io.Discard, c) // 客户端持续读，不制造背压
 	m.cmd.Process.Signal(syscall.SIGCONT)
-	// 实测：先发缓冲的请求时恢复后上游没有再写出数据（40/40 次 0 字节，请求发出前两侧缓冲都是满的）；
-	// 只走读分支时要等某次发往客户端的 send 偶然只发出一部分，多写 0.3–6.5 MiB，所以门槛取 256 KiB
+	// 实测：先发缓冲的请求时恰好多写 64 KiB（暂停时没写完的那一块）；只走读分支（c7pre）时要等某次发往客户端的
+	// send 偶然只发出一部分，多写 0.19–3.8 MiB（约一成 ≤ 256 KiB 而漏过）。门槛取 256 KiB，不再降低：
+	// 请求在暂停前还没读到时，正确实现也可能多写一两块
 	select {
 	case w := <-reqAt:
-		if extra := w - before; extra > 256<<10 {
+		extra := w - before
+		t.Logf("恢复后上游又写出 %d 字节才收到请求", extra)
+		if extra > 256<<10 {
 			t.Fatalf("恢复后上游又写出 %d 字节才收到请求：建连期间缓冲的请求被持续可读的上游拖延", extra)
 		}
 	case <-time.After(ioTimeout):
@@ -653,7 +666,7 @@ func TestTCPConnectingRefusedData(t *testing.T) {
 	m := forward(t, "t", listen, upstream)
 	c := dial(t, listen)
 	time.Sleep(300 * time.Millisecond) // tinymapper 已接受连接并回到 epoll_wait，转发的 SYN 已被丢弃
-	if n := synSentTo(t, portOf(upstream)); n != 1 {
+	if n := max(synSentTo(t, portOf(upstream)), synSentTo(t, portOf(upstream))); n != 1 {
 		t.Fatalf("到上游的 SYN_SENT socket 有 %d 个，期望 1：用例没有测到上游建连中的路径", n)
 	}
 	m.cmd.Process.Signal(syscall.SIGSTOP)
@@ -661,7 +674,7 @@ func TestTCPConnectingRefusedData(t *testing.T) {
 	ln.Close() // 约 1 s 时重传的 SYN 收到 RST
 	// tinymapper 已暂停，多等不影响事件顺序；放宽到 3 倍是为了全量并行运行时 VM 繁忙的情形
 	eventually(t, 3*ioTimeout, 10*time.Millisecond, func() error {
-		if n := synSentTo(t, portOf(upstream)); n != 0 {
+		if n := max(synSentTo(t, portOf(upstream)), synSentTo(t, portOf(upstream))); n != 0 {
 			return fmt.Errorf("到上游的 SYN_SENT socket 仍有 %d 个：重传的 SYN 没有收到 RST", n)
 		}
 		return nil
