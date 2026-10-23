@@ -3,7 +3,7 @@
 // 环境变量：
 //
 //	TINYMAPPER_BIN    被测 tinymapper 可执行文件（必填）
-//	TPM_SLOW=1        运行耗时超过约 60 s 的用例（TCP/UDP 空闲超时）
+//	TPM_SLOW=1        运行耗时超过约 60 s 的用例（TCP/UDP 空闲超时、TCP 上游建连超时）
 //	TPM_IN_CONTAINER=1 允许修改 /etc/hosts 的用例运行（只应由 tests/run.sh 在容器中设置）
 //	TPM_VARIANT       被测构建的 libc（glibc 或 musl），用于只在某一变体上预期失败的已知缺陷
 package tests
@@ -249,6 +249,22 @@ func (m *mapper) logTail(n int) string {
 		lines = lines[len(lines)-n:]
 	}
 	return strings.Join(lines, "\n")
+}
+
+// logLines 返回日志中同时包含全部 substrs 的行数
+func (m *mapper) logLines(substrs ...string) int {
+	data, _ := os.ReadFile(m.logPath)
+	n := 0
+next:
+	for _, line := range strings.Split(string(data), "\n") {
+		for _, s := range substrs {
+			if !strings.Contains(line, s) {
+				continue next
+			}
+		}
+		n++
+	}
+	return n
 }
 
 func (m *mapper) waitListen(t testing.TB, wait []listenPoint) {

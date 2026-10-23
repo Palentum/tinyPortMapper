@@ -723,7 +723,40 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	//zdmylog(log_info,"[tcp]my_fd=%d,other_fd=%d \n",my_fd,other_fd);
 
-	//推迟的 shutdown：只有它会在没有待发数据时挂 EV_WRITE。先于读处理，否则本侧每轮都可读时下面的 if/else if 永远轮不到写
+	//上游建连中（CONNECTING）：watcher 同时等读写。建连失败时 EPOLLERR/EPOLLHUP 被 libev 报成读写同时就绪，
+	//只报可写就是连上了；报了可读（失败，或连上后已有数据、FIN、RST）才用 SO_ERROR 区分
+	if(!my_info.connected)
+	{
+		if( (revents & EV_READ) !=0 )
+		{
+			int err=0;
+			socklen_t err_len=sizeof(err);
+			if(getsockopt(my_fd,SOL_SOCKET,SO_ERROR,&err,&err_len)!=0) err=errno;
+			if(err!=0)
+			{
+				mylog(log_warn,"[tcp]connect to remote {%s} failed,connection {%s} closed bc of %d:%s\n",tcp_pair.owner->remote_targets[tcp_pair.remote_index].remote_str,tcp_pair.addr_s,err,strerror(err));
+				conn_manager_tcp.erase_closed(tcp_pair.it);
+				return;
+			}
+		}
+		my_info.connected=1;
+		//OPEN：建连期间客户端读到的数据由写分支发出，EOF 由下面推迟的 shutdown 发出；都没有就不再等可写
+		if(other_info.data_len==0&&!other_info.eof)
+		{
+			ev_io_stop(loop, &my_info.ev);
+			my_info.ev.events&=~EV_WRITE;
+			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
+			ev_io_start(loop, &my_info.ev);
+			if( (revents & EV_READ) ==0) return;
+		}
+		else if(other_info.data_len!=0&&(revents & EV_WRITE)!=0)
+		{
+			//先发留下的数据：上游连上后持续可读时，下面的 if/else if 每轮都只走读分支。可读是水平触发，下一轮还会报
+			revents&=~EV_READ;
+		}
+	}
+
+	//推迟的 shutdown：上游建连期间客户端已 EOF，连上后从上面落到这里；建连之后只有它会在没有待发数据时挂 EV_WRITE。先于读处理，否则本侧每轮都可读时下面的 if/else if 永远轮不到写
 	if( (revents & EV_WRITE) !=0 && (my_info.ev.events&EV_WRITE) !=0 && other_info.data_len==0 )
 	{
 		assert(other_info.eof);
@@ -778,12 +811,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			}
 			else
 			{
-				//上游还在建连：此时 shutdown 会中止 connect，等它可写后再发
+				//上游还在建连：此时 shutdown 会中止 connect。它本来就在等可写，连上后再发
 				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d,shutdown deferred until connected\n",tcp_pair.addr_s,my_fd);
-				ev_io_stop(loop, &other_info.ev);
-				other_info.ev.events|=EV_WRITE;
-				ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
-				ev_io_start(loop, &other_info.ev);
 			}
 			return;
 		}
@@ -799,9 +828,13 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		my_info.data_len=recv_len;
 		my_info.begin=my_info.data;
 
-		assert((other_info.ev.events & EV_WRITE)==0);
-
-		int send_len=send(other_fd,my_info.begin,my_info.data_len,0);
+		//上游建连中不发：它本来就在等可写，数据留在缓冲里、停读本侧，连上后由写分支发出
+		int send_len=0;
+		if(other_info.connected)
+		{
+			assert((other_info.ev.events & EV_WRITE)==0);
+			send_len=send(other_fd,my_info.begin,my_info.data_len,0);
+		}
 
 		if(send_len<=0)
 		{
@@ -809,7 +842,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		else
 		{
-			other_info.connected=1;
 			my_info.data_len-=send_len;
 			my_info.begin+=send_len;
 		}
@@ -821,10 +853,13 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//ev=other_info.ev;
 			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, other_fd, &ev);
 			//assert(ret==0);
-			ev_io_stop(loop, &other_info.ev);
-			other_info.ev.events|=EV_WRITE;
-			ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
-			ev_io_start(loop, &other_info.ev);
+			if(other_info.connected)
+			{
+				ev_io_stop(loop, &other_info.ev);
+				other_info.ev.events|=EV_WRITE;
+				ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
+				ev_io_start(loop, &other_info.ev);
+			}
 
 
 			//ev=my_info.ev;
@@ -847,7 +882,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLOUT) ==0 \n");
 			return;
 		}
-		my_info.connected=1;//建连中的 socket 只有连上或出错才可写，出错由下面的 send 发现
 
 		assert(other_info.data_len!=0);
 		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
@@ -974,6 +1008,14 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	setnonblocking(new_remote_fd);
 
 	ret=connect(new_remote_fd,(struct sockaddr*) &remote_addr.inner,remote_addr.get_len());
+	if(ret!=0&&errno!=EINPROGRESS)
+	{
+		//立即失败（如无路由的 ENETUNREACH、本地端口耗尽的 EADDRNOTAVAIL）：不建连接对
+		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",ip_addr,rule->remote_targets[remote_index].remote_str,get_sock_error());
+		close(new_remote_fd);
+		close(new_fd);
+		return ;
+	}
 	if(ret!=0)
 	{
 		mylog(log_debug,"[tcp]connect returned %d,errno=%s\n",ret,get_sock_error());
@@ -1027,7 +1069,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	//ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, new_remote_fd, &ev);
 	//assert(ret==0);
 
-	ev_io_init (&tcp_pair.remote.ev, tcp_cb, new_remote_fd, EV_READ);
+	//建连中同时等读写，由 tcp_cb 判定建连结果
+	ev_io_init (&tcp_pair.remote.ev, tcp_cb, new_remote_fd, tcp_pair.remote.connected?EV_READ:EV_READ|EV_WRITE);
 	ev_io_start(loop, &tcp_pair.remote.ev);
 }
 

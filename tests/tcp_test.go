@@ -302,6 +302,24 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	}
 }
 
+// synSentTo 返回 /proc/net/tcp 中处于 SYN_SENT、目的端口为 port 的 socket 数。
+// 建连失败（收到 RST）的 socket 已从哈希表摘除，不再列出
+func synSentTo(t testing.TB, port int) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/net/tcp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	n := 0
+	for _, line := range strings.Split(string(data), "\n")[1:] {
+		f := strings.Fields(line)
+		if len(f) >= 4 && f[3] == "02" && strings.HasSuffix(f[2], fmt.Sprintf(":%04X", port)) {
+			n++
+		}
+	}
+	return n
+}
+
 // 上游连接建立前客户端即关闭写方向：FIN 应推迟到上游连接建立后再转发，而不是中止连接
 func TestTCPHalfCloseConnecting(t *testing.T) {
 	t.Parallel()
@@ -404,6 +422,120 @@ func TestTCPHalfCloseConnectingStream(t *testing.T) {
 	}
 }
 
+// 上游建连期间客户端发来超过 tinymapper 单个缓冲（16 KiB）的请求：数据应留在缓冲中，连上后完整转发
+func TestTCPConnectingData(t *testing.T) {
+	t.Parallel()
+	ln, release := listenFull(t)
+	listen := loopback4(t)
+	forward(t, "t", listen, ln.Addr().String())
+	const size = 64 << 10
+	var req bytes.Buffer
+	sum, _ := writeStream(&req, size, size, streamSeed(1, false))
+	c := dial(t, listen)
+	c.SetDeadline(time.Now().Add(ioTimeout))
+	werr := make(chan error, 1)
+	go func() { _, err := c.Write(req.Bytes()); werr <- err }() // tinymapper 读满一个缓冲即停读，其余留在 socket 缓冲中
+	start := time.Now()
+	time.Sleep(300 * time.Millisecond) // 转发的 SYN 已被丢弃，release 后由约 1 s 时的重传建立连接
+	release()
+	go func() {
+		be, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer be.Close()
+		be.SetDeadline(time.Now().Add(ioTimeout))
+		if h, err := readStream(be, size); err == nil {
+			be.Write(h.Sum(nil))
+		}
+	}()
+	got := make([]byte, len(sum))
+	_, err := io.ReadFull(c, got)
+	elapsed := time.Since(start).Round(time.Millisecond)
+	if err != nil {
+		t.Fatalf("客户端在 %v 后未收到上游对 %d 字节请求的校验和（%v）：建连期间收到的请求没有完整转发", elapsed, size, err)
+	}
+	if err := <-werr; err != nil {
+		t.Fatalf("发送请求失败：%v", err)
+	}
+	if !bytes.Equal(got, sum) {
+		t.Fatal("上游收到的请求 SHA-256 不一致")
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("响应在 %v 后即到达：上游连接未被推迟，用例未覆盖建连期间收到数据的路径", elapsed)
+	}
+}
+
+// 同上，但上游连上后立即持续推流、直到收到请求才停：建连期间缓冲的请求不能因上游每轮都可读而一直发不出去。
+// 建连期间暂停 tinymapper，恢复时上游已同时可读可写，模拟转发器繁忙时的事件顺序
+func TestTCPConnectingDataStream(t *testing.T) {
+	t.Parallel()
+	ln, release := listenFull(t)
+	listen := loopback4(t)
+	m := forward(t, "t", listen, ln.Addr().String())
+	c := dial(t, listen)
+	req := []byte("request-while-connecting")
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // tinymapper 已读入请求，等上游连接建立后再发
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
+	release()
+	accepted := make(chan struct{})
+	var written atomic.Int64
+	reqAt := make(chan int64, 1) // 上游收到完整请求时已写出的字节数
+	go func() {
+		be, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer be.Close()
+		close(accepted)
+		be.SetDeadline(time.Now().Add(3 * ioTimeout))
+		got := make(chan struct{})
+		go func() {
+			buf := make([]byte, len(req))
+			if _, err := io.ReadFull(be, buf); err == nil && bytes.Equal(buf, req) {
+				reqAt <- written.Load()
+			}
+			close(got)
+		}()
+		buf := make([]byte, 64<<10)
+		for {
+			select {
+			case <-got:
+				return
+			default:
+			}
+			n, err := be.Write(buf)
+			written.Add(int64(n))
+			if err != nil {
+				return
+			}
+		}
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未收到转发的连接")
+	}
+	time.Sleep(200 * time.Millisecond) // 上游数据积压在 tinymapper 的上游接收缓冲中
+	before := written.Load()
+	go io.Copy(io.Discard, c) // 客户端持续读，不制造背压
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	// 实测：先发缓冲的请求时恢复后上游没有再写出数据（40/40 次 0 字节，请求发出前两侧缓冲都是满的）；
+	// 只走读分支时要等某次发往客户端的 send 偶然只发出一部分，多写 0.3–6.5 MiB，所以门槛取 256 KiB
+	select {
+	case w := <-reqAt:
+		if extra := w - before; extra > 256<<10 {
+			t.Fatalf("恢复后上游又写出 %d 字节才收到请求：建连期间缓冲的请求被持续可读的上游拖延", extra)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未收到建连期间发出的请求")
+	}
+}
+
 // 上游发 RST：客户端连接应被及时关闭
 func TestTCPUpstreamReset(t *testing.T) {
 	t.Parallel()
@@ -441,20 +573,34 @@ func TestTCPClientReset(t *testing.T) {
 	}
 }
 
-// 上游端口未监听（连接被拒绝）：客户端连接应被及时关闭，tinymapper 继续运行
+// expectConnectFailed 等待日志中出现至少 n 行 warn 级、含上游地址 remote 与 errno 的建连失败记录（日志格式为 "<errno>:<strerror>"）。
+// 只比对 errno 数值：glibc 与 musl 的 strerror 文本不同，如 ETIMEDOUT 为 Connection timed out / Operation timed out
+func expectConnectFailed(t testing.TB, m *mapper, n int, remote string, errno syscall.Errno) {
+	t.Helper()
+	code := fmt.Sprintf("%d:", int(errno))
+	eventually(t, time.Second, 20*time.Millisecond, func() error {
+		if got := m.logLines("[WARN]", "{"+remote+"}", code); got < n {
+			return fmt.Errorf("日志中有 %d 行 [WARN] 级、含 %s 的上游 {%s} 建连失败记录，期望至少 %d 行：建连失败的真实原因（%v）应以 warn 级记录", got, code, remote, n, errno)
+		}
+		return nil
+	})
+}
+
+// 上游端口未监听（连接被拒绝）：客户端连接应被及时关闭并以 warn 记录拒绝原因，tinymapper 继续运行
 func TestTCPUpstreamRefused(t *testing.T) {
 	t.Parallel()
-	listen := loopback4(t)
-	m := forward(t, "t", listen, loopback4(t))
+	listen, remote := loopback4(t), loopback4(t)
+	m := forward(t, "t", listen, remote)
 	for range 3 {
 		expectClosed(t, dial(t, listen), ioTimeout)
 	}
 	if !m.aliveAfter(200 * time.Millisecond) {
 		t.Fatal("上游拒绝连接后 tinymapper 退出")
 	}
+	expectConnectFailed(t, m, 3, remote, syscall.ECONNREFUSED)
 }
 
-// 上游不可达（无路由）：客户端连接应被及时关闭，tinymapper 继续运行
+// 上游不可达（无路由）：客户端连接应被及时关闭并以 warn 记录原因，tinymapper 继续运行
 func TestTCPUpstreamUnreachable(t *testing.T) {
 	t.Parallel()
 	for _, remote := range []string{"192.0.2.1:9", "[2001:db8::1]:9"} {
@@ -472,8 +618,85 @@ func TestTCPUpstreamUnreachable(t *testing.T) {
 			if !m.aliveAfter(200 * time.Millisecond) {
 				t.Fatal("上游不可达后 tinymapper 退出")
 			}
+			expectConnectFailed(t, m, 3, remote, syscall.ENETUNREACH)
 		})
 	}
+}
+
+// 上游建连期间客户端关闭写方向，随后上游拒绝连接：应以 warn 记录拒绝原因并关闭客户端，
+// 而不是在失败的 socket 上执行推迟的 shutdown、只记下 ENOTCONN
+func TestTCPConnectingRefusedHalfClose(t *testing.T) {
+	t.Parallel()
+	ln, _ := listenFull(t)
+	upstream := ln.Addr().String()
+	listen := loopback4(t)
+	m := forward(t, "t", listen, upstream)
+	c := dial(t, listen)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // tinymapper 已读到 EOF，转发的 SYN 已被丢弃
+	ln.Close()                         // 约 1 s 时重传的 SYN 收到 RST
+	expectClosed(t, c, ioTimeout)
+	expectConnectFailed(t, m, 1, upstream, syscall.ECONNREFUSED)
+}
+
+// 上游建连失败后、tinymapper 察觉之前客户端发来数据：不能把数据 send 给失败的上游（吞掉 SO_ERROR，
+// 随后 recv 返回 0 被误当作上游 EOF，最终 EPIPE），应以 warn 记录拒绝原因并关闭客户端。
+// 暂停 tinymapper 期间上游先收到 RST、客户端后发来数据，恢复后 epoll 依次报告两者，libev 后进先出，先回调客户端
+func TestTCPConnectingRefusedData(t *testing.T) {
+	t.Parallel()
+	ln, _ := listenFull(t)
+	upstream := ln.Addr().String()
+	listen := loopback4(t)
+	m := forward(t, "t", listen, upstream)
+	c := dial(t, listen)
+	time.Sleep(300 * time.Millisecond) // tinymapper 已接受连接并回到 epoll_wait，转发的 SYN 已被丢弃
+	if n := synSentTo(t, portOf(upstream)); n != 1 {
+		t.Fatalf("到上游的 SYN_SENT socket 有 %d 个，期望 1：用例没有测到上游建连中的路径", n)
+	}
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
+	ln.Close() // 约 1 s 时重传的 SYN 收到 RST
+	// tinymapper 已暂停，多等不影响事件顺序；放宽到 3 倍是为了全量并行运行时 VM 繁忙的情形
+	eventually(t, 3*ioTimeout, 10*time.Millisecond, func() error {
+		if n := synSentTo(t, portOf(upstream)); n != 0 {
+			return fmt.Errorf("到上游的 SYN_SENT socket 仍有 %d 个：重传的 SYN 没有收到 RST", n)
+		}
+		return nil
+	})
+	if _, err := c.Write([]byte("request")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(50 * time.Millisecond) // 环回上数据随 write 送达，tinymapper 一侧的客户端 socket 晚于上游就绪
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	expectClosed(t, c, ioTimeout)
+	expectConnectFailed(t, m, 1, upstream, syscall.ECONNREFUSED)
+	if n := m.logLines("Broken pipe"); n > 0 {
+		t.Fatalf("日志中有 %d 行 Broken pipe：客户端数据被发给了建连失败的上游", n)
+	}
+}
+
+// 上游的 SYN 一直被丢弃：内核按 tcp_syn_retries（加 tcp_syn_linear_timeouts）重传后约 130 s 放弃，
+// 客户端连接随之关闭并以 warn 记录超时（tinymapper 没有用户态的建连超时）
+func TestTCPConnectTimeout(t *testing.T) {
+	t.Parallel()
+	slow(t)
+	ln, _ := listenFull(t)
+	upstream := ln.Addr().String()
+	listen := loopback4(t)
+	m := forward(t, "t", listen, upstream)
+	start := time.Now()
+	c := dial(t, listen)
+	if err := closedWithin(c, 180*time.Second); err != nil {
+		t.Fatalf("上游 SYN 一直被丢弃：%v", err)
+	}
+	elapsed := time.Since(start)
+	t.Logf("客户端连接在 %v 后被关闭", elapsed.Round(time.Second))
+	if elapsed < 100*time.Second {
+		t.Fatalf("客户端连接在 %v 后即被关闭，期望在内核放弃建连（约 130 s）之后", elapsed.Round(time.Second))
+	}
+	expectConnectFailed(t, m, 1, upstream, syscall.ETIMEDOUT)
 }
 
 // 上游先发言（SSH 式 banner）：客户端不发送任何数据也能收到 banner

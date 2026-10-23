@@ -140,7 +140,7 @@ struct tcp_info_t:not_copy_able_t
 	char * begin;
 	int data_len;
 	int eof;//本侧 recv 已返回 0：不再读本侧，对另一侧发 shutdown(SHUT_WR)
-	int connected;//已确认连接建立（accept 得到、connect 返回 0、send 成功或触发过 EV_WRITE）；对建连中的 socket 调 shutdown 会中止 connect
+	int connected;//已确认连接建立（accept 得到、connect 返回 0，或建连中可写且无错误）；为 0 时 watcher 同时等读写、不收发，对建连中的 socket 调 shutdown 会中止 connect
 	tcp_info_t()
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
