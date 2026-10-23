@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"os"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -711,6 +712,106 @@ func TestTCPServerSpeaksFirst(t *testing.T) {
 		t.Fatalf("banner = %q，期望 %q", got, banner)
 	}
 	mustEcho(t, c, "client-hello")
+}
+
+const nagleGap = 5 * time.Millisecond
+
+// writeGapWrite 先写一小段，停顿 nagleGap 后再写一小段
+func writeGapWrite(c net.Conn, seg []byte) error {
+	if _, err := c.Write(seg); err != nil {
+		return err
+	}
+	time.Sleep(nagleGap)
+	_, err := c.Write(seg)
+	return err
+}
+
+// nagleMedian 测 20 轮"写-停顿-写"的往返用时，返回中位数。toUpstream 为真时由客户端分两次写、
+// 上游收齐后回 1 字节；否则客户端发 1 字节，上游分两次写回。tinymapper 的发送侧开着 Nagle 时，
+// 第二段要等第一段被确认才发出；对端进入延迟确认后，每轮要多等一个延迟 ACK（≥ 40 ms）。
+func nagleMedian(t testing.TB, toUpstream bool, extra ...string) time.Duration {
+	t.Helper()
+	seg := []byte("01234567")
+	be := serveTCP(t, loopback4(t), func(c net.Conn) {
+		req := make([]byte, 1)
+		if toUpstream {
+			req = make([]byte, 2*len(seg))
+		}
+		for {
+			if _, err := io.ReadFull(c, req); err != nil {
+				return
+			}
+			var err error
+			if toUpstream {
+				_, err = c.Write(req[:1])
+			} else {
+				err = writeGapWrite(c, seg)
+			}
+			if err != nil {
+				return
+			}
+		}
+	})
+	listen := loopback4(t)
+	startMapper(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-t"}, extra...)...)
+	c := dial(t, listen)
+	c.SetDeadline(time.Now().Add(4 * ioTimeout))
+	resp := make([]byte, 2*len(seg))
+	if toUpstream {
+		resp = resp[:1]
+	}
+	rounds := make([]time.Duration, 20)
+	for i := range rounds {
+		t0 := time.Now()
+		var err error
+		if toUpstream {
+			err = writeGapWrite(c, seg)
+		} else {
+			_, err = c.Write(seg[:1])
+		}
+		if err == nil {
+			_, err = io.ReadFull(c, resp)
+		}
+		if err != nil {
+			t.Fatalf("第 %d 轮：%v", i, err)
+		}
+		rounds[i] = time.Since(t0)
+	}
+	t.Logf("各轮用时：%v", rounds)
+	slices.Sort(rounds)
+	return rounds[len(rounds)/2]
+}
+
+// TCP_NODELAY（T1）：两侧默认关闭 Nagle，小段数据不等对端的延迟 ACK；--disable-tcp-nodelay 时恢复 Nagle。
+// disabled 子用例断言停顿确实出现，用来证明本用例能区分两种行为，同时检验回滚开关。停顿要求对端每轮都处于
+// pingpong（延迟确认）模式，即 tcp_pingpong_thresh 为 1：v5.19 起的主线与 5.10.y/5.15.y 默认如此，v5.1–v5.18 与 5.4.y 为 3。
+// 延迟 ACK 是 TCP_DELACK_MIN（40 ms），按 HZ 取整后最短约 30 ms
+func TestTCPNoDelay(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name       string
+		toUpstream bool
+		extra      []string
+	}{
+		{"upstream", true, nil},
+		{"client", false, nil},
+		{"disabled/upstream", true, []string{"--disable-tcp-nodelay"}},
+		{"disabled/client", false, []string{"--disable-tcp-nodelay"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if b, err := os.ReadFile("/proc/sys/net/ipv4/tcp_pingpong_thresh"); c.extra != nil && err == nil && strings.TrimSpace(string(b)) != "1" {
+				t.Skipf("tcp_pingpong_thresh=%s，对端不会每轮延迟确认，测不出 Nagle 停顿", strings.TrimSpace(string(b)))
+			}
+			med := nagleMedian(t, c.toUpstream, c.extra...)
+			if c.extra == nil && med >= nagleGap+15*time.Millisecond {
+				t.Fatalf("每轮用时中位数 %v，期望 < %v：小段数据被 Nagle 扣住，等到了对端的延迟 ACK", med, nagleGap+15*time.Millisecond)
+			}
+			if c.extra != nil && med < 25*time.Millisecond {
+				t.Fatalf("每轮用时中位数 %v，期望 ≥ 25 ms：关闭 TCP_NODELAY 后应出现 Nagle 与延迟 ACK 叠加的停顿", med)
+			}
+		})
+	}
 }
 
 // 达到 max_conn_num（20000）后新连接被立即关闭，已有连接不受影响，释放后可再建立

@@ -5,6 +5,7 @@
 #include "config.h"
 
 #include <sys/stat.h>
+#include <netinet/tcp.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -19,6 +20,7 @@ typedef unsigned int u32_t;
 typedef int i32_t;
 
 int disable_conn_clear=0;
+int disable_tcp_nodelay=0;
 
 int max_pending_packet=0;
 
@@ -1006,6 +1008,11 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 	set_buf_size(new_remote_fd,socket_buf_size);
 	setnonblocking(new_remote_fd);
+	if(!disable_tcp_nodelay)
+	{
+		int yes=1;
+		setsockopt(new_remote_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+	}
 
 	ret=connect(new_remote_fd,(struct sockaddr*) &remote_addr.inner,remote_addr.get_len());
 	if(ret!=0&&errno!=EINPROGRESS)
@@ -1312,6 +1319,9 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 		}
 
 		setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+		//accept 得到的 socket 继承监听 socket 的 TCP_NODELAY，客户端一侧不必每个连接再设一次
+		if(!disable_tcp_nodelay)
+			setsockopt(rule.local_listen_fd_tcp, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
 		set_buf_size(rule.local_listen_fd_tcp,listen_fd_buf_size);
 		setnonblocking(rule.local_listen_fd_tcp);
 
@@ -1473,6 +1483,7 @@ void print_help()
 
 	printf("other options:\n");
 	printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024\n");
+	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
 	printf("    --log-position                        enable file name, function name, line number in log\n");
@@ -1497,6 +1508,7 @@ void process_arg(int argc, char *argv[])
 		{"disable-color", no_argument,    0, 1},
 		{"enable-color", no_argument,    0, 1},
 		{"sock-buf", required_argument,    0, 1},
+		{"disable-tcp-nodelay", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
     int option_index = 0;
@@ -1633,6 +1645,10 @@ void process_arg(int argc, char *argv[])
 					mylog(log_fatal,"sock-buf value must be between 1 and 10240 (kbyte) \n");
 					myexit(-1);
 				}
+			}
+			else if(strcmp(long_options[option_index].name,"disable-tcp-nodelay")==0)
+			{
+				disable_tcp_nodelay=1;
 			}
 			else
 			{

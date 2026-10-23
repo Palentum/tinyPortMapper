@@ -103,6 +103,7 @@ main options:
 
 other options:
     --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024
+    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)
     --log-level           <number>        0: never    1: fatal   2: error   3: warn
                                           4: info (default)      5: debug   6: trace
     --log-position                        enable file name, function name, line number in log
