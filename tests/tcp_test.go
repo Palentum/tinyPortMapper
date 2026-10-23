@@ -6,7 +6,11 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"os"
+	"strconv"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -120,34 +124,284 @@ func parallelFor(n, workers int, f func(i int)) {
 	wg.Wait()
 }
 
-// 半关闭：客户端关闭写方向后仍应收完后端的响应（已知缺陷 C3：一侧 EOF 即整对关闭）
+// 半关闭：客户端关闭写方向后仍应收完后端的响应
 func TestTCPHalfClose(t *testing.T) {
 	t.Parallel()
-	xfail(t, "C3", func(t testing.TB) {
-		resp := bytes.Repeat([]byte("response-"), 32<<10)
-		be := serveTCP(t, loopback4(t), func(c net.Conn) {
-			req, err := io.ReadAll(c) // 读到客户端的 FIN 才响应
+	resp := bytes.Repeat([]byte("response-"), 32<<10)
+	be := serveTCP(t, loopback4(t), func(c net.Conn) {
+		req, err := io.ReadAll(c) // 读到客户端的 FIN 才响应
+		if err != nil {
+			return
+		}
+		c.Write(append(req, resp...))
+	})
+	listen := loopback4(t)
+	forward(t, "t", listen, be.addr)
+	c := dial(t, listen)
+	req := []byte("request-body")
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(ioTimeout))
+	got, err := io.ReadAll(c)
+	if want := append(req, resp...); err != nil || !bytes.Equal(got, want) {
+		t.Fatalf("关闭写方向后收到 %d/%d 字节响应（%v），期望随后读到 EOF", len(got), len(want), err)
+	}
+}
+
+// 上游先半关闭：客户端应收到 banner 与 EOF 且仍能向上游发送请求，两端都 EOF 后连接对被释放
+func TestTCPHalfCloseUpstream(t *testing.T) {
+	t.Parallel()
+	banner := bytes.Repeat([]byte("server-done\n"), 512)
+	got := make(chan []byte, 1)
+	be := serveTCP(t, loopback4(t), func(c net.Conn) {
+		if _, err := c.Write(banner); err != nil {
+			return
+		}
+		c.(*net.TCPConn).CloseWrite()
+		req, _ := io.ReadAll(c)
+		got <- req
+	})
+	listen := loopback4(t)
+	m := forward(t, "t", listen, be.addr)
+	fds := fdCount(t, m.pid()) // 尚无连接时的基线
+	c := dial(t, listen)
+	c.SetDeadline(time.Now().Add(ioTimeout))
+	resp, err := io.ReadAll(c)
+	if err != nil || !bytes.Equal(resp, banner) {
+		t.Fatalf("上游关闭写方向后客户端收到 %d/%d 字节 banner（%v），期望随后读到 EOF", len(resp), len(banner), err)
+	}
+	req := bytes.Repeat([]byte("request-"), 100<<10/8)
+	if _, err := c.Write(req); err != nil {
+		t.Fatalf("上游半关闭后发送请求失败：%v", err)
+	}
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case r := <-got:
+		if !bytes.Equal(r, req) {
+			t.Fatalf("上游收到 %d/%d 字节请求", len(r), len(req))
+		}
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未收到请求与 FIN")
+	}
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if n := fdCount(t, m.pid()); n != fds {
+			return fmt.Errorf("tinymapper 打开 %d 个 fd，无连接时为 %d：连接对未释放", n, fds)
+		}
+		return nil
+	})
+}
+
+// 半关闭排空：客户端关闭写方向时反方向仍有大量积压，积压应完整送达，FIN 随后到达上游
+func TestTCPHalfCloseDrain(t *testing.T) {
+	t.Parallel()
+	// 32 MiB 远超环回上的在途容量（客户端接收缓冲 + tinymapper 两侧 socket 缓冲 + 后端发送缓冲），
+	// 一侧 EOF 即整对关闭时必然丢失积压
+	const size, chunk = 32 << 20, 64 << 10
+	seed := streamSeed(1, true)
+	got := make(chan []byte, 1)
+	be := serveTCP(t, loopback4(t), func(c net.Conn) {
+		if _, err := writeStream(c, size, chunk, seed); err != nil {
+			return
+		}
+		req, _ := io.ReadAll(c)
+		got <- req
+	})
+	listen := loopback4(t)
+	forward(t, "t", listen, be.addr)
+	c := dial(t, listen)
+	req := []byte("drain-request")
+	if _, err := c.Write(req); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(200 * time.Millisecond) // 不读取，让下行各级缓冲区积满
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	c.SetReadDeadline(time.Now().Add(transferTimeout(size)))
+	h, err := readStream(c, size)
+	if err != nil {
+		t.Fatalf("关闭写方向后下行数据不完整：%v", err)
+	}
+	if n, err := io.Copy(io.Discard, c); n != 0 || err != nil {
+		t.Fatalf("下行 %d 字节之后期望 EOF，却又收到 %d 字节（%v）", size, n, err)
+	}
+	want, _ := writeStream(io.Discard, size, chunk, seed)
+	if !bytes.Equal(h.Sum(nil), want) {
+		t.Fatal("下行数据 SHA-256 不一致")
+	}
+	select {
+	case r := <-got:
+		if !bytes.Equal(r, req) {
+			t.Fatalf("上游收到 %q，期望 %q", r, req)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未收到请求与 FIN")
+	}
+}
+
+// listenFull 在 127.0.0.1 上以 backlog=1 监听，并用 2 个不 accept 的占位连接占满 accept 队列：
+// Linux 在 sk_ack_backlog > backlog 时判满，此后到达的 SYN 被直接丢弃，由对端约 1 s 后重传。
+// 不用 backlog=0：其首个连接会因 SYN 队列判满而依赖 tcp_syncookies。
+// 返回的 release 取走并关闭占位连接，使之后重传的 SYN 能建立连接。
+func listenFull(t testing.TB) (ln net.Listener, release func()) {
+	t.Helper()
+	port := freePort(t)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_STREAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	file := os.NewFile(uintptr(fd), "listen-full")
+	defer file.Close()
+	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Listen(fd, 1); err != nil {
+		t.Fatal(err)
+	}
+	if ln, err = net.FileListener(file); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { ln.Close() })
+	const fillers = 2
+	for range fillers {
+		dial(t, ln.Addr().String())
+	}
+	// LISTEN 状态的 socket 在 /proc/net/tcp 中的 rx_queue 即当前 accept 队列长度
+	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+		data, err := os.ReadFile("/proc/net/tcp")
+		if err != nil {
+			return err
+		}
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			f := strings.Fields(line)
+			if len(f) < 5 || f[3] != "0A" || !strings.HasSuffix(f[1], fmt.Sprintf(":%04X", port)) {
+				continue
+			}
+			_, rx, _ := strings.Cut(f[4], ":")
+			if n, _ := strconv.ParseUint(rx, 16, 32); n < fillers {
+				return fmt.Errorf("accept 队列长度为 %d，期望 %d", n, fillers)
+			}
+			return nil
+		}
+		return fmt.Errorf("/proc/net/tcp 中没有端口 %d 的监听", port)
+	})
+	return ln, func() {
+		for range fillers {
+			c, err := ln.Accept()
+			if err != nil {
+				t.Fatal(err)
+			}
+			c.Close()
+		}
+	}
+}
+
+// 上游连接建立前客户端即关闭写方向：FIN 应推迟到上游连接建立后再转发，而不是中止连接
+func TestTCPHalfCloseConnecting(t *testing.T) {
+	t.Parallel()
+	ln, release := listenFull(t)
+	listen := loopback4(t)
+	forward(t, "t", listen, ln.Addr().String())
+	c := dial(t, listen)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	start := time.Now()
+	time.Sleep(300 * time.Millisecond) // 转发的 SYN 已被丢弃，release 后由约 1 s 时的重传建立连接
+	release()
+	const resp = "late-response"
+	go func() {
+		be, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer be.Close()
+		be.SetDeadline(time.Now().Add(ioTimeout))
+		// 读到延迟转发的 FIN（0 字节即 EOF）才响应
+		if req, err := io.ReadAll(be); err == nil && len(req) == 0 {
+			io.WriteString(be, resp)
+		}
+	}()
+	c.SetReadDeadline(time.Now().Add(ioTimeout))
+	got, err := io.ReadAll(c)
+	elapsed := time.Since(start).Round(time.Millisecond)
+	if err != nil || string(got) != resp {
+		t.Fatalf("客户端在 %v 后收到 %q（%v），期望 %q：上游应在连接建立后收到 FIN 并响应", elapsed, got, err, resp)
+	}
+	if elapsed < 500*time.Millisecond {
+		t.Fatalf("响应在 %v 后即到达：上游连接未被推迟，用例未覆盖连接建立前收到 FIN 的路径", elapsed)
+	}
+}
+
+// 同上，但上游连上后立即持续推流、直到读到 EOF 才停：推迟的 FIN 不能因上游每轮都可读而一直发不出去。
+// 建连期间暂停 tinymapper，恢复时上游已同时可读可写，模拟转发器繁忙时的事件顺序
+func TestTCPHalfCloseConnectingStream(t *testing.T) {
+	t.Parallel()
+	ln, release := listenFull(t)
+	listen := loopback4(t)
+	m := forward(t, "t", listen, ln.Addr().String())
+	c := dial(t, listen)
+	if err := c.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(300 * time.Millisecond) // tinymapper 已读到 EOF，shutdown 推迟到上游连接建立
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
+	release()
+	accepted := make(chan struct{})
+	var written atomic.Int64
+	eofAt := make(chan int64, 1) // 上游读到 EOF 时已写出的字节数
+	go func() {
+		be, err := ln.Accept()
+		if err != nil {
+			return
+		}
+		defer be.Close()
+		close(accepted)
+		be.SetDeadline(time.Now().Add(3 * ioTimeout))
+		eof := make(chan struct{})
+		go func() { io.Copy(io.Discard, be); eofAt <- written.Load(); close(eof) }()
+		buf := make([]byte, 64<<10)
+		for {
+			select {
+			case <-eof:
+				return
+			default:
+			}
+			n, err := be.Write(buf)
+			written.Add(int64(n))
 			if err != nil {
 				return
 			}
-			c.Write(append(req, resp...))
-		})
-		listen := loopback4(t)
-		forward(t, "t", listen, be.addr)
-		c := dial(t, listen)
-		req := []byte("request-body")
-		if _, err := c.Write(req); err != nil {
-			t.Fatal(err)
 		}
-		if err := c.CloseWrite(); err != nil {
-			t.Fatal(err)
+	}()
+	select {
+	case <-accepted:
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未收到转发的连接")
+	}
+	time.Sleep(200 * time.Millisecond) // 上游数据积压在 tinymapper 的上游接收缓冲中
+	before := written.Load()
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	c.SetReadDeadline(time.Now().Add(ioTimeout))
+	if n, err := io.Copy(io.Discard, c); err != nil {
+		t.Fatalf("客户端读了 %d 字节仍未读到 EOF（%v）：推迟的 FIN 没有转发给上游", n, err)
+	}
+	// 实测：FIN 先于读处理时恢复后上游没有再写出数据（0 字节）；只走读分支时要等客户端偶然背压，多写 1.9–4.6 MiB
+	select {
+	case w := <-eofAt:
+		if extra := w - before; extra > 1<<20 {
+			t.Fatalf("恢复后上游又写出 %d 字节才收到 FIN：推迟的 shutdown 被持续可读的上游拖延", extra)
 		}
-		c.SetReadDeadline(time.Now().Add(ioTimeout))
-		got, err := io.ReadAll(c)
-		if want := append(req, resp...); !bytes.Equal(got, want) {
-			t.Fatalf("关闭写方向后只收到 %d/%d 字节响应（%v）", len(got), len(want), err)
-		}
-	})
+	case <-time.After(ioTimeout):
+		t.Fatal("上游未读到 EOF")
+	}
 }
 
 // 上游发 RST：客户端连接应被及时关闭

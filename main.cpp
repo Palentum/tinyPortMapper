@@ -723,6 +723,24 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	//zdmylog(log_info,"[tcp]my_fd=%d,other_fd=%d \n",my_fd,other_fd);
 
+	//推迟的 shutdown：只有它会在没有待发数据时挂 EV_WRITE。先于读处理，否则本侧每轮都可读时下面的 if/else if 永远轮不到写
+	if( (revents & EV_WRITE) !=0 && (my_info.ev.events&EV_WRITE) !=0 && other_info.data_len==0 )
+	{
+		assert(other_info.eof);
+		ev_io_stop(loop, &my_info.ev);
+		my_info.ev.events&=~EV_WRITE;
+		ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
+		ev_io_start(loop, &my_info.ev);
+		if(shutdown(my_fd,SHUT_WR)!=0)
+		{
+			mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr_s,get_sock_error());
+			conn_manager_tcp.erase_closed(tcp_pair.it);
+			return;
+		}
+		revents&=~EV_WRITE;
+		if( (revents & EV_READ) ==0) return;
+	}
+
 	if( (revents & EV_READ) !=0  )
 	{
 		mylog(log_trace,"[tcp]events[idx].events & EPOLLIN !=0 \n");
@@ -736,8 +754,37 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
 		{
-			mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr_s);
-			conn_manager_tcp.erase_closed(tcp_pair.it);
+			if(other_info.eof)
+			{
+				mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr_s);
+				conn_manager_tcp.erase_closed(tcp_pair.it);
+				return;
+			}
+			//半关闭：只有缓冲为空时才 recv，所以本方向没有待发数据，直接把 EOF 转给另一侧；反方向照常转发
+			conn_manager_tcp.lru.update(&(*tcp_pair.it));
+			my_info.eof=1;
+			ev_io_stop(loop, &my_info.ev);
+			my_info.ev.events&=~EV_READ;
+			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
+			ev_io_start(loop, &my_info.ev);
+			if(other_info.connected)
+			{
+				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d\n",tcp_pair.addr_s,my_fd);
+				if(shutdown(other_fd,SHUT_WR)!=0)
+				{
+					mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr_s,get_sock_error());
+					conn_manager_tcp.erase_closed(tcp_pair.it);
+				}
+			}
+			else
+			{
+				//上游还在建连：此时 shutdown 会中止 connect，等它可写后再发
+				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d,shutdown deferred until connected\n",tcp_pair.addr_s,my_fd);
+				ev_io_stop(loop, &other_info.ev);
+				other_info.ev.events|=EV_WRITE;
+				ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
+				ev_io_start(loop, &other_info.ev);
+			}
 			return;
 		}
 		if(recv_len<0)
@@ -762,6 +809,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		else
 		{
+			other_info.connected=1;
 			my_info.data_len-=send_len;
 			my_info.begin+=send_len;
 		}
@@ -799,6 +847,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLOUT) ==0 \n");
 			return;
 		}
+		my_info.connected=1;//建连中的 socket 只有连上或出错才可写，出错由下面的 send 发现
 
 		assert(other_info.data_len!=0);
 		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
@@ -938,6 +987,9 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	strcpy(tcp_pair.addr_s,ip_addr);
 
 	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr_s,new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
+
+	tcp_pair.local.connected=1;
+	tcp_pair.remote.connected=(ret==0);
 
 	tcp_pair.local.fd64=fd_manager.create(new_fd);
 	fd_manager.get_info(tcp_pair.local.fd64).tcp_pair_p= &tcp_pair;

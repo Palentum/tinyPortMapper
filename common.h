@@ -139,12 +139,16 @@ struct tcp_info_t:not_copy_able_t
 	char data[max_data_len_tcp+200];//use a larger buffer than udp
 	char * begin;
 	int data_len;
+	int eof;//本侧 recv 已返回 0：不再读本侧，对另一侧发 shutdown(SHUT_WR)
+	int connected;//已确认连接建立（accept 得到、connect 返回 0、send 成功或触发过 EV_WRITE）；对建连中的 socket 调 shutdown 会中止 connect
 	tcp_info_t()
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
 
 		begin=data;
 		data_len=0;
+		eof=0;
+		connected=0;
 
 	}
 	~tcp_info_t()
