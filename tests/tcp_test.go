@@ -551,38 +551,36 @@ func startMapperFreeFDs(t testing.TB, free int, wait []listenPoint, args ...stri
 	return m
 }
 
-// 上游 socket() 因 EMFILE 失败时只应丢弃该连接（已知缺陷 C5：进程直接退出）
+// 上游 socket() 因 EMFILE 失败时只丢弃该连接：进程不退出，已有连接不受影响，释放 fd 后恢复
 func TestTCPNofileUpstreamSocket(t *testing.T) {
 	t.Parallel()
-	xfail(t, "C5", func(t testing.TB) {
-		const k = 4
-		be := serveTCP(t, loopback4(t), echoHandler(""))
-		listen := loopback4(t)
-		// 剩余 2k+1 个 fd：k 个连接之后，下一个连接能 accept 但无法创建上游 socket
-		m := startMapperFreeFDs(t, 2*k+1, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t")
-		var conns []*net.TCPConn
-		for range k {
-			c := dial(t, listen)
-			mustEcho(t, c, "x")
-			conns = append(conns, c)
+	const k = 4
+	be := serveTCP(t, loopback4(t), echoHandler(""))
+	listen := loopback4(t)
+	// 剩余 2k+1 个 fd：k 个连接之后，下一个连接能 accept 但无法创建上游 socket
+	m := startMapperFreeFDs(t, 2*k+1, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t")
+	var conns []*net.TCPConn
+	for range k {
+		c := dial(t, listen)
+		mustEcho(t, c, "x")
+		conns = append(conns, c)
+	}
+	expectClosed(t, dial(t, listen), ioTimeout)
+	if !m.aliveAfter(500 * time.Millisecond) {
+		m.stop(t, true)
+		t.Fatalf("创建上游 socket 失败（EMFILE）时 tinymapper 退出：%v", m.exitErr)
+	}
+	for _, c := range conns[1:] {
+		mustEcho(t, c, "y")
+	}
+	conns[0].Close()
+	eventually(t, 10*time.Second, 200*time.Millisecond, func() error {
+		c, err := net.DialTimeout("tcp", listen, ioTimeout)
+		if err != nil {
+			return err
 		}
-		expectClosed(t, dial(t, listen), ioTimeout)
-		if !m.aliveAfter(500 * time.Millisecond) {
-			m.stop(t, true)
-			t.Fatalf("创建上游 socket 失败（EMFILE）时 tinymapper 退出：%v", m.exitErr)
-		}
-		for _, c := range conns[1:] {
-			mustEcho(t, c, "y")
-		}
-		conns[0].Close()
-		eventually(t, 10*time.Second, 200*time.Millisecond, func() error {
-			c, err := net.DialTimeout("tcp", listen, ioTimeout)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			return echo(c, []byte("z"))
-		})
+		defer c.Close()
+		return echo(c, []byte("z"))
 	})
 }
 

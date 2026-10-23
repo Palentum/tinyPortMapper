@@ -959,8 +959,9 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM, 0);
 	if(new_remote_fd<0)
 	{
-		mylog(log_fatal,"[tcp]create new_remote_fd failed \n");
-		myexit(1);
+		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",ip_addr,get_sock_error());
+		close(new_fd);
+		return ;
 	}
 	set_buf_size(new_remote_fd,socket_buf_size);
 	setnonblocking(new_remote_fd);
