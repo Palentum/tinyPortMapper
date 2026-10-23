@@ -74,7 +74,7 @@ Notes:
 - `common.h` / `common.cpp`: Shared types, `address_t` parsing/formatting, time helpers, socket helpers.
 - `fd_manager.h` / `fd_manager.cpp`: Unique fd handle mapping and fd-associated connection metadata.
 - `log.h` / `log.cpp`: Logging levels, color/position flags, `mylog()` implementation.
-- `my_ev_common.h`: Embedded libev configuration (`EV_STANDALONE`, `EV_COMMON`, `EV_COMPAT3`).
+- `my_ev_common.h`: Embedded libev configuration (`EV_STANDALONE`, `EV_COMMON`, `EV_COMPAT3`) and the epoll-only backend selection (`EV_USE_EPOLL`/`EV_USE_EVENTFD` on, `EV_USE_POLL`/`EV_USE_SELECT` off) for both glibc and musl.
 - `my_ev.h` / `my_ev.cpp`: Libev include wrapper and direct `#include "ev.c"` compilation unit.
 - `makefile`: Build, cross-build, release, cleanup, and the `test` / `bench` entry points.
 - `README.md`: User-facing usage examples, options, supported platforms, and performance-test reference.
@@ -84,14 +84,14 @@ Notes:
 
 - Required language/toolchain: C++11 with `g++`/compatible compiler and GNU Make-style `makefile`.
 - No Node, Bun, Python package manager, or dependency lockfile is used for the project build. Go (tests, `bench/fwdbench`) and Python 3 (bench summaries) use only their standard libraries.
-- libev is always embedded (`my_ev.cpp` includes `ev.c`).
+- libev is always embedded (`my_ev.cpp` includes `ev.c`) and built with the epoll backend only; `event_loop()` logs the active backend (`event backend: epoll`) at startup.
 - Linux is the only supported platform (glibc distributions and OpenWRT/musl; deployed directly on hosts). Windows/macOS/FreeBSD/Cygwin targets and code paths were removed; do not add non-Linux fallbacks. On a macOS dev machine, build and test through `docker/build.sh` / `make test`.
 - Keep `libev/` treated as third-party vendored code. Prefer changing project wrapper/configuration files before modifying libev internals.
 
 ## Testing & QA
 
 - Functional tests: `make test` (= `tests/run.sh`) builds tinymapper with `docker/build.sh`, cross-compiles the Go test binary on the host (`GOOS=linux`), and runs it in `ubuntu:24.04` against the glibc build and in `alpine:3.22` against the musl build (`--network none`, loopback only). Useful knobs: `VARIANTS=glibc`, `REF=<commit>` (test a commit's build), `TPM_NO_BUILD=1`, `TPM_SLOW=1` (adds the ~6 min TCP/UDP idle-timeout tests), and test-binary flags such as `-test.run X -test.v`.
-- Coverage: TCP integrity (1 B–1 GiB, 100/5000 concurrent), TCP semantics (half-close, RST, refused/unreachable upstream, server-first), resource limits (`max_conn_num`, nofile exhaustion, idle timeout), UDP sizes/session isolation/timeouts, IPv4/IPv6/4to6/6to4, domain refresh, roundrobin/iphash, CLI vs TOML config, invalid configs, SIGTERM exit.
+- Coverage: TCP integrity (1 B–1 GiB, 100/5000 concurrent), TCP semantics (half-close, RST, refused/unreachable upstream, server-first), resource limits (`max_conn_num`, nofile exhaustion, idle timeout), UDP sizes/session isolation/timeouts, IPv4/IPv6/4to6/6to4, domain refresh, roundrobin/iphash, CLI vs TOML config, invalid configs, SIGTERM exit, epoll/eventfd event backend.
 - Known defects are wrapped in `xfail(t, "<id>", ...)` with IDs from the optimization roadmap (C3 half-close, C4 UDP timeout, C5/C6 fd exhaustion, C8 glibc SIGTERM hang with a domain remote). The body asserts the correct behavior; once a fix lands the test reports XPASS and fails until the `xfail` wrapper is removed.
 - Tests that edit `/etc/hosts` only run when `TPM_IN_CONTAINER=1` (set by `tests/run.sh`); never run them on a real host.
 - Benchmarks: `make bench` (= `bench/run.sh`) runs the loopback benchmark and syscall counts in Docker (forwarder CPU0, client CPU2-3, backends CPU4-5) and writes `bench/results/<stamp>/`. `FWDS="tinymapper@4acc876 tinymapper" bench/run.sh` compares a commit with the working tree; `QUICK=1` is a smoke run; `bench/host.sh` runs the same workloads on real client/forwarder/server hosts over ssh. Run benchmarks with the Docker VM otherwise idle. Baselines and procedures are in `bench/BASELINE.md`.

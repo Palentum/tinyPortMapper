@@ -1256,6 +1256,7 @@ int event_loop()
 {
 	struct ev_loop * loop= ev_default_loop(0);
 	assert(loop != NULL);
+	mylog(log_info,"event backend: %s\n",ev_backend(loop)==EVBACKEND_EPOLL?"epoll":"unknown");
 	unordered_map<address_t,int,address_t::hash_function> tcp_listen_rules;
 	unordered_map<address_t,int,address_t::hash_function> udp_listen_rules;
 	tcp_listen_rules.reserve(app_config.rules.size());
@@ -1643,6 +1644,11 @@ int unit_test()
 int main(int argc, char *argv[])
 {
     struct ev_loop* loop=ev_default_loop(0);
+    if(loop==NULL)
+    {
+        mylog(log_fatal,"failed to create epoll event loop\n");
+        myexit(-1);
+    }
     ev_signal signal_watcher_sigpipe;
     ev_signal_init(&signal_watcher_sigpipe, sigpipe_cb, SIGPIPE);
     ev_signal_start(loop, &signal_watcher_sigpipe);

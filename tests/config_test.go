@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strconv"
 	"strings"
 	"syscall"
 	"testing"
@@ -76,6 +77,39 @@ func TestSigtermExitDomain(t *testing.T) {
 	} else {
 		body(t)
 	}
+}
+
+// C1：libev 只编入 epoll（修复前 musl 构建回落到 poll），信号通知用 eventfd 而不是 pipe
+func TestEventBackend(t *testing.T) {
+	t.Parallel()
+	m := forward(t, "tu", loopback4(t), loopback4(t))
+	dir := fmt.Sprintf("/proc/%d/fd", m.pid())
+	ents, err := os.ReadDir(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var links []string // 跳过继承的 0-2
+	for _, e := range ents {
+		if fd, _ := strconv.Atoi(e.Name()); fd < 3 {
+			continue
+		}
+		if link, err := os.Readlink(filepath.Join(dir, e.Name())); err == nil {
+			links = append(links, link)
+		}
+	}
+	if !slices.Contains(links, "anon_inode:[eventpoll]") {
+		t.Errorf("没有 epoll 实例，fd：%v", links)
+	}
+	if slices.ContainsFunc(links, func(l string) bool { return strings.HasPrefix(l, "pipe:[") }) {
+		t.Errorf("libev 用 pipe 而不是 eventfd 通知，fd：%v", links)
+	}
+	eventually(t, 2*time.Second, 50*time.Millisecond, func() error {
+		data, _ := os.ReadFile(m.logPath)
+		if !strings.Contains(string(data), "event backend: epoll") {
+			return errors.New("日志中没有 \"event backend: epoll\"")
+		}
+		return nil
+	})
 }
 
 // 命令行与 TOML 配置的等价性
