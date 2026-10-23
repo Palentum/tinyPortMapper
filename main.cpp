@@ -914,7 +914,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int local_listen_fd_tcp=watcher->fd;
 	if((revents&EV_ERROR) !=0)
 	{
-		assert(0==1);
+		//e.g. re-adding the listen fd to epoll after a pause failed; libev has already stopped the watcher, clear_timer_cb restarts it
+		mylog(log_warn,"[tcp]accept watcher of listen fd %d got EV_ERROR\n",local_listen_fd_tcp);
 		return ;
 	}
 	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
@@ -930,7 +931,13 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int new_fd=accept(local_listen_fd_tcp, (struct sockaddr*) &tmp_sockaddr_in,&tmp_len);
 	if(new_fd<0)
 	{
+		int err=errno;
 		mylog(log_warn,"[tcp]accept failed %d %s\n", new_fd,get_sock_error());
+		if(err!=EAGAIN&&err!=EWOULDBLOCK&&err!=EINTR&&err!=ECONNABORTED)
+		{
+			//EMFILE/ENFILE/ENOMEM or an LSM denial: the connection stays in the backlog and the level-triggered watcher would fire again at once; clear_timer_cb restarts it
+			ev_io_stop(loop,watcher);
+		}
 		//continue;
 		return ;
 	}
@@ -1031,6 +1038,10 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 		it->tcp_manager.clear_inactive();
 		it->udp_manager.clear_inactive();
 		schedule_dns_refresh(*it);
+		if(it->enable_tcp&&!ev_is_active(&it->tcp_accept_watcher))
+		{
+			ev_io_start(loop,&it->tcp_accept_watcher);
+		}
 	}
 }
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)

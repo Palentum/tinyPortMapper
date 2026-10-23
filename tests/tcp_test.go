@@ -584,46 +584,56 @@ func TestTCPNofileUpstreamSocket(t *testing.T) {
 	})
 }
 
-// accept 遇到 EMFILE 时不应空转，释放 fd 后应恢复（已知缺陷 C6：水平触发下忙等）
+// accept 遇到 EMFILE 时暂停接受：不空转、不刷日志，backlog 中的连接在 fd 释放后照常转发
 func TestTCPNofileAccept(t *testing.T) {
 	t.Parallel()
-	xfail(t, "C6", func(t testing.TB) {
-		const k = 4
-		be := serveTCP(t, loopback4(t), echoHandler(""))
-		listen := loopback4(t)
-		// 剩余 2k 个 fd：k 个连接之后 accept 返回 EMFILE；日志级别调到 error，避免空转时刷满日志
-		m := startMapperFreeFDs(t, 2*k, listenPoints("t", portOf(listen)),
-			"-l", listen, "-r", be.addr, "-t", "--log-level", "2")
-		var conns []*net.TCPConn
-		for range k {
-			c := dial(t, listen)
-			mustEcho(t, c, "x")
-			conns = append(conns, c)
+	const k = 4
+	be := serveTCP(t, loopback4(t), echoHandler(""))
+	listen := loopback4(t)
+	// 剩余 2k 个 fd：k 个连接之后 accept 返回 EMFILE
+	m := startMapperFreeFDs(t, 2*k, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t")
+	acceptFailures := func() int {
+		data, _ := os.ReadFile(m.logPath)
+		return strings.Count(string(data), "accept failed")
+	}
+	var conns []*net.TCPConn
+	for range k {
+		c := dial(t, listen)
+		mustEcho(t, c, "x")
+		conns = append(conns, c)
+	}
+	pending := dial(t, listen) // 停在 backlog 中，accept 失败
+	time.Sleep(200 * time.Millisecond)
+	ticks0, failures0 := m.cpuTicks(t), acceptFailures()
+	if failures0 == 0 {
+		t.Fatal("pending 连接没有触发 accept 失败：fd 余量计算有误，用例没有测到 EMFILE")
+	}
+	time.Sleep(2 * time.Second)
+	ticks, failures := m.cpuTicks(t)-ticks0, acceptFailures()-failures0
+	if m.exited() {
+		m.stop(t, true)
+		t.Fatalf("accept 遇到 EMFILE 后 tinymapper 退出：%v", m.exitErr)
+	}
+	t.Logf("accept 返回 EMFILE 期间的 2 s：CPU %.2f s，%d 行 accept failed", float64(ticks)/100, failures)
+	// 时钟滴答为 1/100 s：2 s 内超过 40 个即 CPU 占用 >20%，空闲时应接近 0
+	if ticks > 40 {
+		t.Errorf("accept 遇到 EMFILE 时空转：2 s 内消耗 CPU %.2f s", float64(ticks)/100)
+	}
+	// 每暂停一次记一行 warn，400 ms 的定时器恢复后再试
+	if failures > 20 {
+		t.Errorf("accept 遇到 EMFILE 时刷日志：2 s 内 %d 行 accept failed", failures)
+	}
+	// 释放一个连接后，backlog 中的连接被接受并转发
+	conns[0].Close()
+	mustEcho(t, pending, "p")
+	conns[1].Close()
+	eventually(t, 10*time.Second, 200*time.Millisecond, func() error {
+		c, err := net.DialTimeout("tcp", listen, ioTimeout)
+		if err != nil {
+			return err
 		}
-		pending := dial(t, listen) // 停在 backlog 中，accept 失败
-		time.Sleep(200 * time.Millisecond)
-		before := m.cpuTicks(t)
-		time.Sleep(2 * time.Second)
-		ticks := m.cpuTicks(t) - before
-		if m.exited() {
-			m.stop(t, true)
-			t.Fatalf("accept 遇到 EMFILE 后 tinymapper 退出：%v", m.exitErr)
-		}
-		// 时钟滴答为 1/100 s：2 s 内超过 40 个即 CPU 占用 >20%，空闲时应接近 0
-		if ticks > 40 {
-			t.Errorf("accept 遇到 EMFILE 时空转：2 s 内消耗 CPU %.2f s", float64(ticks)/100)
-		}
-		pending.Close()
-		conns[0].Close()
-		conns[1].Close()
-		eventually(t, 10*time.Second, 200*time.Millisecond, func() error {
-			c, err := net.DialTimeout("tcp", listen, ioTimeout)
-			if err != nil {
-				return err
-			}
-			defer c.Close()
-			return echo(c, []byte("z"))
-		})
+		defer c.Close()
+		return echo(c, []byte("z"))
 	})
 }
 
