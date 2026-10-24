@@ -1,11 +1,16 @@
 package tests
 
 import (
+	"errors"
 	"fmt"
+	"maps"
 	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
+	"slices"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -203,5 +208,149 @@ func TestLogTTYLineFlush(t *testing.T) {
 		elapsed.Round(time.Millisecond), writes)
 	if writes < lines-1 {
 		t.Errorf("stdout 是终端，突发期间 write 类系统调用只有 %d 次，少于 %d 行减 1：日志没有逐行写出", writes, lines)
+	}
+}
+
+// T7：客户端地址只在记日志时由 address_t::to_str 格式化（tcp_pair_t 存 address_t，UDP 每包的 trace 行不再预先格式化），
+// IPv4 与端口手写。clientAddrRe 取出日志里打印客户端地址的位置：new_connection from {X}、connection {X}（EOF、half-closed、
+// closed connection、上游建连失败、空闲清理）、new connection from {X}（TCP 立即建连失败、UDP 新会话）与 UDP 每包的
+// udp_listen_fd from {X}；上游地址前是 remote {R}，不匹配
+var clientAddrRe = regexp.MustCompile(`(?:connection(?: from)?|udp_listen_fd from) \{([^}]*)\}`)
+
+// clientAddrs 按日志顺序返回含 marker 的行里打印的客户端地址，marker 为空时返回全部
+func clientAddrs(log, marker string) []string {
+	var addrs []string
+	for _, line := range strings.Split(log, "\n") {
+		if strings.Contains(line, marker) {
+			for _, sm := range clientAddrRe.FindAllStringSubmatch(line, -1) {
+				addrs = append(addrs, sm[1])
+			}
+		}
+	}
+	return addrs
+}
+
+// waitClientAddrs 等待日志中含 want 各 marker 的行依次打印 want[marker] 中的客户端地址（个数与顺序都一致），
+// 且日志中任何一处客户端地址都出现在 want 里。地址与 Go 的 LocalAddr().String() 同为 a.b.c.d:port、[v6]:port
+func waitClientAddrs(t testing.TB, m *mapper, want map[string][]string) {
+	t.Helper()
+	known := map[string]bool{}
+	for _, addrs := range want {
+		for _, a := range addrs {
+			known[a] = true
+		}
+	}
+	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+		if m.exited() {
+			return fmt.Errorf("tinymapper 已退出：%v", m.exitErr)
+		}
+		data, _ := os.ReadFile(m.logPath)
+		for _, marker := range slices.Sorted(maps.Keys(want)) {
+			if got := clientAddrs(string(data), marker); !slices.Equal(got, want[marker]) {
+				return fmt.Errorf("含 %q 的行打印的客户端地址依次为 %q，期望 %q", marker, got, want[marker])
+			}
+		}
+		for _, a := range clientAddrs(string(data), "") {
+			if !known[a] {
+				return fmt.Errorf("日志中出现了不属于任何客户端的地址 {%s}", a)
+			}
+		}
+		return nil
+	})
+}
+
+// T7：TCP 连接各行日志里的客户端地址。debug 级下每个连接依次记 new_connection、half-closed（客户端先关闭写方向）、
+// closed bc of EOF（后端读到转发的 FIN 后也关闭）、closed connection 各一行；先后两个连接各自的源端口不同。
+// 双栈监听 [::] 上的 IPv4 客户端以 v4 映射地址出现，按 IPv6 格式化为 [::ffff:127.0.0.1]:port
+func TestLogClientAddrTCP(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name, listen, client string
+		mapped               bool
+	}{
+		{"ipv4", "127.0.0.1", "127.0.0.1", false},
+		{"ipv6", "::1", "::1", false},
+		{"dualstack_v4client", "::", "127.0.0.1", true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			be := serveTCP(t, loopback4(t), echoHandler(""))
+			lport := freePort(t)
+			m := startMapper(t, listenPoints("t", lport), "-l", hostPort(c.listen, lport), "-r", be.addr, "-t", "--log-level", "5")
+			var addrs []string
+			for range 2 {
+				conn := dial(t, hostPort(c.client, lport))
+				addr := conn.LocalAddr().String()
+				if c.mapped {
+					addr = hostPort("::ffff:"+c.client, portOf(addr))
+				}
+				addrs = append(addrs, addr)
+				mustEcho(t, conn, "x")
+				if err := conn.CloseWrite(); err != nil {
+					t.Fatal(err)
+				}
+				expectClosed(t, conn, ioTimeout)
+			}
+			waitClientAddrs(t, m, map[string][]string{"[tcp]new_connection": addrs, "half-closed by": addrs,
+				"closed bc of EOF": addrs, "[tcp]closed connection": addrs})
+		})
+	}
+}
+
+// T7：上游建连失败的 warn 行里的客户端地址。上游拒绝（异步失败）：new_connection、connect to remote {R} failed,connection {X}、
+// closed connection 各一行；上游无路由（connect 立即失败，不建连接对）：只有 new connection from {X},but connect to remote {R} 一行
+func TestLogClientAddrTCPConnectFailed(t *testing.T) {
+	t.Parallel()
+	const unreachable = "192.0.2.1:9"
+	refused := loopback4(t)
+	for _, c := range []struct {
+		name, remote string
+		markers      []string // 各恰有一行，打印该客户端的地址
+	}{
+		{"refused", refused, []string{"[tcp]new_connection", "connect to remote {" + refused + "} failed,connection", "[tcp]closed connection"}},
+		{"unreachable", unreachable, []string{"but connect to remote {" + unreachable + "} failed"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if c.remote == unreachable {
+				if _, err := net.DialTimeout("tcp", c.remote, 2*time.Second); !errors.Is(err, syscall.ENETUNREACH) {
+					t.Skipf("当前网络中 %s 并非无路由（%v），在 --network none 容器中运行", c.remote, err)
+				}
+			}
+			listen := loopback4(t)
+			m := forward(t, "t", listen, c.remote)
+			conn := dial(t, listen)
+			expectClosed(t, conn, ioTimeout)
+			want := map[string][]string{}
+			for _, marker := range c.markers {
+				want[marker] = []string{conn.LocalAddr().String()}
+			}
+			waitClientAddrs(t, m, want)
+		})
+	}
+}
+
+// T7：UDP 每个包都经过 udp_accept_cb，trace 级（--log-level 6）每包记一行 received data from udp_listen_fd from {X}。
+// 两个客户端 socket 交替各发 3 个包，每个包收到回包后才发下一个，日志顺序即发送顺序：每行必须是该包发送方的地址，
+// 而不是上一个包或已有会话的地址；new connection from 每个客户端一行
+func TestLogClientAddrUDP(t *testing.T) {
+	t.Parallel()
+	for _, host := range []string{"127.0.0.1", "::1"} {
+		t.Run(host, func(t *testing.T) {
+			t.Parallel()
+			be := serveUDP(t, hostPort(host, freePort(t)), "")
+			listen := hostPort(host, freePort(t))
+			m := startMapper(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", be.addr, "-u", "--log-level", "6")
+			clients := []*net.UDPConn{udpDial(t, "", listen), udpDial(t, "", listen)}
+			var sent []string
+			for i := range 6 {
+				c := clients[i%2]
+				if _, err := udpRoundTrip(c, []byte("x")); err != nil {
+					t.Fatal(err)
+				}
+				sent = append(sent, c.LocalAddr().String())
+			}
+			waitClientAddrs(t, m, map[string][]string{"udp_listen_fd from": sent, "[udp]new connection from": sent[:2]})
+		})
 	}
 }

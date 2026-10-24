@@ -151,7 +151,7 @@ struct conn_manager_udp_t
 		struct ev_loop * loop= ev_default_loop (0);
 		ev_io_stop(loop, &it->ev);
 
-		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",it->addr_s,(int)(udp_pair_list.size()-1));
+		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",it->adress.get_str(),(int)(udp_pair_list.size()-1));
 		mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
 
 		auto tmp_it=adress_to_info.find(it->adress);
@@ -235,7 +235,7 @@ struct conn_manager_tcp_t
 
 		fd_manager.fd64_close( it->local.fd64);
 		fd_manager.fd64_close( it->remote.fd64);
-		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",it->addr_s,(int)(tcp_pair_list.size()-1));
+		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
 		lru.erase(&*it);
 		tcp_pair_list.erase(it);
@@ -249,7 +249,7 @@ struct conn_manager_tcp_t
 
 		fd_manager.fd64_close( it->local.fd64);
 		fd_manager.fd64_close( it->remote.fd64);
-		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",it->addr_s,(int)(tcp_pair_list.size()-1));
+		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
 		lru.erase(&*it);
 		tcp_pair_list.erase(it);
@@ -740,7 +740,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			if(getsockopt(my_fd,SOL_SOCKET,SO_ERROR,&err,&err_len)!=0) err=errno;
 			if(err!=0)
 			{
-				mylog(log_warn,"[tcp]connect to remote {%s} failed,connection {%s} closed bc of %d:%s\n",tcp_pair.owner->remote_targets[tcp_pair.remote_index].remote_str,tcp_pair.addr_s,err,strerror(err));
+				mylog(log_warn,"[tcp]connect to remote {%s} failed,connection {%s} closed bc of %d:%s\n",tcp_pair.owner->remote_targets[tcp_pair.remote_index].remote_str,tcp_pair.addr.get_str(),err,strerror(err));
 				conn_manager_tcp.erase_closed(tcp_pair.it);
 				return;
 			}
@@ -772,7 +772,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		ev_io_start(loop, &my_info.ev);
 		if(shutdown(my_fd,SHUT_WR)!=0)
 		{
-			mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr_s,get_sock_error());
+			mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
 			conn_manager_tcp.erase_closed(tcp_pair.it);
 			return;
 		}
@@ -795,7 +795,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		{
 			if(other_info.eof)
 			{
-				mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr_s);
+				mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr.get_str());
 				conn_manager_tcp.erase_closed(tcp_pair.it);
 				return;
 			}
@@ -808,23 +808,23 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			ev_io_start(loop, &my_info.ev);
 			if(other_info.connected)
 			{
-				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d\n",tcp_pair.addr_s,my_fd);
+				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d\n",tcp_pair.addr.get_str(),my_fd);
 				if(shutdown(other_fd,SHUT_WR)!=0)
 				{
-					mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr_s,get_sock_error());
+					mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
 					conn_manager_tcp.erase_closed(tcp_pair.it);
 				}
 			}
 			else
 			{
 				//上游还在建连：此时 shutdown 会中止 connect。它本来就在等可写，连上后再发
-				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d,shutdown deferred until connected\n",tcp_pair.addr_s,my_fd);
+				mylog(log_debug,"[tcp]connection {%s} half-closed by fd=%d,shutdown deferred until connected\n",tcp_pair.addr.get_str(),my_fd);
 			}
 			return;
 		}
 		if(recv_len<0)
 		{
-			mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of %s,fd=%d\n",recv_len,tcp_pair.addr_s,get_sock_error(),my_fd);
+			mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of %s,fd=%d\n",recv_len,tcp_pair.addr.get_str(),get_sock_error(),my_fd);
 			conn_manager_tcp.erase_closed(tcp_pair.it);
 			return;
 		}
@@ -893,13 +893,13 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
 		if(send_len==0)
 		{
-			mylog(log_warn,"[tcp]send_len=%d,connection {%s} closed bc of send_len==0\n",send_len,tcp_pair.addr_s);
+			mylog(log_warn,"[tcp]send_len=%d,connection {%s} closed bc of send_len==0\n",send_len,tcp_pair.addr.get_str());
 			conn_manager_tcp.erase_closed(tcp_pair.it);
 			return;
 		}
 		if(send_len<0)
 		{
-			mylog(log_info,"[tcp]send_len=%d,connection {%s} closed bc of %s\n",send_len,tcp_pair.addr_s,get_sock_error());
+			mylog(log_info,"[tcp]send_len=%d,connection {%s} closed bc of %s\n",send_len,tcp_pair.addr.get_str(),get_sock_error());
 			conn_manager_tcp.erase_closed(tcp_pair.it);
 			return;
 		}
@@ -981,13 +981,9 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	address_t tmp_addr;
 	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
 
-	char ip_addr[max_addr_len];
-	tmp_addr.to_str(ip_addr);
-	//sprintf(ip_port_s,"%s:%d",my_ntoa(addr_tmp.sin_addr.s_addr),addr_tmp.sin_port);
-
 	if(int(conn_manager_tcp.tcp_pair_list.size())>=max_conn_num)
 	{
-		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",ip_addr);
+		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",tmp_addr.get_str());
 		close(new_fd);
 		return 1;
 		//continue;
@@ -999,7 +995,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
 	if(new_remote_fd<0)
 	{
-		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",ip_addr,get_sock_error());
+		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",tmp_addr.get_str(),get_sock_error());
 		close(new_fd);
 		return 1;
 	}
@@ -1015,7 +1011,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	if(ret!=0&&errno!=EINPROGRESS)
 	{
 		//立即失败（如无路由的 ENETUNREACH、本地端口耗尽的 EADDRNOTAVAIL）：不建连接对
-		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",ip_addr,rule->remote_targets[remote_index].remote_str,get_sock_error());
+		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",tmp_addr.get_str(),rule->remote_targets[remote_index].remote_str,get_sock_error());
 		close(new_remote_fd);
 		close(new_fd);
 		//EADDRNOTAVAIL 要先扫完整个临时端口范围（每次可达数 ms）：结束本轮，端口耗尽时回到每次迭代拒绝一个
@@ -1039,9 +1035,9 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair_t &tcp_pair=*it;
 	tcp_pair.owner=rule;
 	tcp_pair.remote_index=remote_index;
-	strcpy(tcp_pair.addr_s,ip_addr);
+	tcp_pair.addr=tmp_addr;
 
-	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr_s,new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
+	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr.get_str(),new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
 
 	tcp_pair.local.connected=1;
 	tcp_pair.remote.connected=(ret==0);
@@ -1147,7 +1143,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	if(data_len==max_data_len_udp+1)
 	{
-		mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",udp_pair.addr_s,max_data_len_udp);
+		mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",udp_pair.adress.get_str(),max_data_len_udp);
 		return;
 	}
 
@@ -1205,14 +1201,12 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	data[data_len] = 0; //for easier debug
 
-	char ip_addr[max_addr_len];
-	tmp_addr.to_str(ip_addr);
-
-	mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",ip_addr,data_len);
+	//每包都走这里：地址只在记日志时格式化（T7）
+	mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",tmp_addr.get_str(),data_len);
 
 	if(data_len==max_data_len_udp+1)
 	{
-		mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",ip_addr,max_data_len_udp);
+		mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
 		return;
 	}
 
@@ -1222,7 +1216,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		if(int(conn_manager_udp.udp_pair_list.size())>=max_conn_num)
 		{
-			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",ip_addr);
+			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
 			return;
 		}
 		int remote_index=select_remote_index(*rule,tmp_addr);
@@ -1230,7 +1224,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		int new_udp_fd=remote_addr.new_connected_udp_fd();
 		if(new_udp_fd==-1)
 		{
-			mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",ip_addr);
+			mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 			return;
 		}
 		fd64_t fd64=fd_manager.create(new_udp_fd);
@@ -1258,12 +1252,11 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		ev_io_start(loop, &udp_pair.ev);
 
 
-		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",ip_addr,new_udp_fd,(int)conn_manager_udp.udp_pair_list.size());
+		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,(int)conn_manager_udp.udp_pair_list.size());
 
 		udp_pair.adress=tmp_addr;
 		udp_pair.fd64=fd64;
 		//udp_pair.last_active_time=get_current_time();
-		strcpy(udp_pair.addr_s,ip_addr);
 		udp_pair.it=list_it;
 		udp_pair.local_listen_fd=local_listen_fd_udp;
 

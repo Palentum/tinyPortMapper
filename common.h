@@ -198,8 +198,8 @@ struct address_t  //TODO scope id
 
 	int from_sockaddr(sockaddr *,socklen_t);
 
-	char* get_str();
-	void to_str(char *);
+	char* get_str();//静态缓冲：一次 mylog 调用里最多用一次，且只在事件循环线程调用
+	void to_str(char *);//s 至少 max_addr_len 字节；不能改 errno：与 get_sock_error() 同在一次 mylog 时可能先求值
 
 	inline u32_t get_type()
 	{
@@ -244,13 +244,11 @@ struct udp_pair_t:not_copy_able_t
 	forward_rule_t *owner;
 	int remote_index;
 	//u64_t last_active_time;
-	char addr_s[max_addr_len];
 	list<udp_pair_t>::iterator it;
 	udp_pair_t()
 	{
 		owner=0;
 		remote_index=-1;
-		addr_s[0]=0;
 	}
 	//int not_used=0;
 };
@@ -263,13 +261,12 @@ struct tcp_pair_t:not_copy_able_t
 	list<tcp_pair_t>::iterator it;
 	forward_rule_t *owner;
 	int remote_index;
-	char addr_s[max_addr_len];
+	address_t addr;//客户端地址，记日志时才格式化（T7）
 	//int not_used=0;
 	tcp_pair_t()
 	{
 		owner=0;
 		remote_index=-1;
-		addr_s[0]=0;
 	}
 };
 

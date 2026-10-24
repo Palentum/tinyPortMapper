@@ -1073,6 +1073,13 @@ func TestTCPNofileUpstreamSocket(t *testing.T) {
 		m.stop(t, true)
 		t.Fatalf("创建上游 socket 失败（EMFILE）时 tinymapper 退出：%v", m.exitErr)
 	}
+	// warn 行的参数里 get_str() 先于 get_sock_error() 求值（T7 起两种构建都如此）：address_t::to_str 不能改动 errno
+	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+		if got := m.logLines("[WARN]", "create new_remote_fd failed,24:"); got != 1 {
+			return fmt.Errorf("日志中有 %d 行 [WARN] 级、含 create new_remote_fd failed,24: 的记录，期望 1 行：创建上游 socket 失败的原因应记为 EMFILE（24）", got)
+		}
+		return nil
+	})
 	for _, c := range conns[1:] {
 		mustEcho(t, c, "y")
 	}
