@@ -54,7 +54,8 @@ extern int enable_log_color;
 #define mylog(__first_argu__dummy_abcde__,...) printf(__VA_ARGS__)
 
 #else
-#define mylog(...) log0(__FILE__,__FUNCTION__,__LINE__,__VA_ARGS__)
+//先判断级别：被过滤掉的日志不调用 log0，也不对参数求值（如 get_sock_error()）
+#define mylog(level,...) do{ if((level)<=log_level) log0(__FILE__,__FUNCTION__,__LINE__,level,__VA_ARGS__); }while(0)
 #endif
 
 

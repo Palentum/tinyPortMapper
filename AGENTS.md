@@ -62,6 +62,7 @@ Notes:
 - Style is pragmatic C-with-classes C++11: global process state, `struct` data holders, `using namespace std`, C socket APIs, `char*`/fixed buffers, and manual lifecycle management.
 - Naming is mostly `snake_case`; types commonly end in `_t` (`address_t`, `tcp_pair_t`, `fd_manager_t`). Runtime forwarding state lives in `app_config.rules` and `forward_rules`; each `forward_rule_t` owns its listener fds and TCP/UDP managers.
 - Keep networking nonblocking: create sockets with `SOCK_NONBLOCK|SOCK_CLOEXEC` passed to `socket()` / `accept4()` instead of a follow-up `fcntl` (`setnonblocking()`). Use `set_buf_size()` (on TCP sockets only when `sock_buf_explicit`), `close()`, and `fd_manager.fd64_close()` instead of ad-hoc fd handling.
+- Logging: `mylog(level, ...)` checks the level before calling `log0()`, so arguments of filtered messages are not evaluated. `log0()` formats the whole line into a stack buffer and writes it with one `fwrite` (the timestamp is formatted once per second with `localtime_r`; glibc's `localtime()` re-checks `/etc/localtime` on every call). stdout is flushed per line only on a tty; otherwise it stays fully buffered (4 KiB with glibc, 1 KiB with musl) and is written when the buffer fills, by `clear_timer_cb()` every `timer_interval` (400 ms), and by `myexit()`, so lines written right before an abort, an unhandled signal, or SIGKILL can be lost.
 - Error handling uses `mylog(level, ...)`, `myexit()`, and `assert()` for invariants. Fatal setup errors usually log `log_fatal` then exit; runtime network errors usually log and close/erase the affected connection. `myexit()` flushes stdout and calls `_exit()`: no static destructors or `atexit` handlers run, because the detached DNS thread may still be blocked on `dns_cv` (glibc's `pthread_cond_destroy` would wait for it forever), so do not put shutdown work in destructors.
 - Async work is libev-based only: `ev_io_init/start/stop`, `ev_timer`, `ev_signal`, `EV_READ`, and `EV_WRITE`. When changing watcher events, existing code stops, mutates/re-initializes, then restarts the watcher.
 - Avoid introducing new allocation-heavy abstractions in hot paths. Existing TCP buffers are fixed arrays in `tcp_info_t`; UDP uses stack buffers in callbacks.
@@ -73,7 +74,7 @@ Notes:
 - `config.h` / `config.cpp`: Minimal TOML subset parser for `[network]` defaults and `[[endpoints]]` forwarding rules.
 - `common.h` / `common.cpp`: Shared types, `address_t` parsing/formatting, time helpers, socket helpers.
 - `fd_manager.h` / `fd_manager.cpp`: Unique fd handle mapping and fd-associated connection metadata.
-- `log.h` / `log.cpp`: Logging levels, color/position flags, `mylog()` implementation.
+- `log.h` / `log.cpp`: Logging levels, color/position flags, `mylog()` / `log0()` implementation.
 - `my_ev_common.h`: Embedded libev configuration (`EV_STANDALONE`, `EV_COMMON`, `EV_COMPAT3`) and the epoll-only backend selection (`EV_USE_EPOLL`/`EV_USE_EVENTFD` on, `EV_USE_POLL`/`EV_USE_SELECT` off) for both glibc and musl.
 - `my_ev.h` / `my_ev.cpp`: Libev include wrapper and direct `#include "ev.c"` compilation unit.
 - `makefile`: Build, cross-build, release, cleanup, and the `test` / `bench` entry points.

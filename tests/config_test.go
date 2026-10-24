@@ -50,11 +50,28 @@ func rrSequence(t testing.TB, listen string, n int) []int {
 	return got
 }
 
-// sigtermExits 断言 tinymapper 收到 SIGTERM 后 2 s 内以状态 0 退出，且日志里有退出行
-// （现在 log0 逐行刷新；T6 改为定时刷新后，防的是 myexit 的 _exit 丢掉最后几行）
-func sigtermExits(t testing.TB, remote string) {
+// sigtermExits 断言 tinymapper 收到 SIGTERM 后 2 s 内以状态 0 退出，且日志里有退出行。T6 起 stdout 是文件时日志攒在 stdio
+// 缓冲里由 400 ms 的定时器刷新，防的是 myexit 的 _exit 丢掉缓冲中的行。conns>0 时 remote 须是 TCP 回显后端：先建一个连接并等
+// 它的日志可见（缓冲为空），再依次建 conns 个连接后立即发送 SIGTERM，这些连接的日志多半还在缓冲中，退出后也必须全部在文件里。
+// conns 个连接约 285·conns B，连同退出行要小于 musl 的 1024 B 缓冲，全程写不满：写满时缓冲连同新的一行一起写出，若恰好是
+// 退出行写满，缓冲为空，去掉 myexit 的 fflush 也看不出来
+func sigtermExits(t testing.TB, remote string, conns int) {
 	t.Helper()
-	m := forward(t, "tu", loopback4(t), remote)
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, remote)
+	if conns > 0 {
+		if err := cycleConn(listen); err != nil {
+			t.Fatal(err)
+		}
+		waitConnLogs(t, m, 1)
+		for range conns {
+			if err := cycleConn(listen); err != nil {
+				t.Fatal(err)
+			}
+		}
+		// 客户端读到 EOF 时 tinymapper 正在释放连接对的回调里，SIGTERM 要等这次回调记完日志、回到事件循环后才处理
+		t.Logf("发送 SIGTERM 前已写进文件的连接日志：%v（期望最终各 %d 行）", connLogCounts(m), 1+conns)
+	}
 	m.cmd.Process.Signal(syscall.SIGTERM)
 	if m.aliveAfter(2 * time.Second) {
 		t.Fatal("SIGTERM 后 2 s 内未退出")
@@ -63,6 +80,12 @@ func sigtermExits(t testing.TB, remote string) {
 	if m.exitErr != nil {
 		t.Fatalf("SIGTERM 后退出状态异常：%v", m.exitErr)
 	}
+	if conns > 0 {
+		if got := connLogCounts(m); got[0] != 1+conns || got[1] != 1+conns || got[2] != 1+conns {
+			t.Errorf("退出后日志中 new_connection、closed bc of EOF、closed connection 分别有 %v 行，期望各 %d 行：缓冲中的日志没有在退出前写出",
+				got, 1+conns)
+		}
+	}
 	if m.logLines("got sigterm, exit") != 1 {
 		t.Fatalf("日志中没有 \"got sigterm, exit\"：\n%s", m.logTail(5))
 	}
@@ -70,13 +93,13 @@ func sigtermExits(t testing.TB, remote string) {
 
 func TestSigtermExit(t *testing.T) {
 	t.Parallel()
-	sigtermExits(t, loopback4(t))
+	sigtermExits(t, serveTCP(t, loopback4(t), echoHandler("")).addr, 2)
 }
 
 // 域名 remote 会启动 DNS 线程。C8：修复前 glibc 构建在 exit() 析构 dns_cv 时阻塞（DNS 线程仍在 wait），musl 不受影响
 func TestSigtermExitDomain(t *testing.T) {
 	t.Parallel()
-	sigtermExits(t, fmt.Sprintf("localhost:%d", freePort(t)))
+	sigtermExits(t, fmt.Sprintf("localhost:%d", freePort(t)), 0)
 }
 
 // C8：myexit 用 _exit，不经过 exit 刷新 stdio。stdout 是管道时全缓冲，约 1.6 KB 的帮助文本要靠 myexit 里的 fflush 写出

@@ -12,6 +12,7 @@ SRV_IP=${SRV_IP:-127.0.0.1}      # 转发器（direct 时为客户端）访问�
 CLI_CPUS=${CLI_CPUS:-2,3}; SRV_CPUS=${SRV_CPUS:-4,5}
 FWD_CPUS=${FWD_CPUS:-0}; FWD_CPUS2=${FWD_CPUS2:-0,1}   # 单核转发器 / realm-2c
 BIN=${BIN:-/build}               # fwd 上 tinymapper-{glibc,musl}[-后缀] 所在目录
+TM_LOG_LEVEL=${TM_LOG_LEVEL:-3}  # tinymapper 的 --log-level；4 为默认级别 info，CRR 每连接写 3 行日志
 FWDBENCH=${FWDBENCH:-fwdbench}; IPERF3=${IPERF3:-iperf3}; REALM=${REALM:-realm}; RINETD=${RINETD:-rinetd}
 PERF=${PERF:-perf}; SUDO=${SUDO:-}   # fwd 上的 perf 与提权前缀
 FPORT=20000; IPERF_PORT=5201; ECHO_PORT=9000
@@ -76,7 +77,7 @@ start_fwd() {
   l=$(hp "$FWD_IP" $FPORT); r=$(hp "$SRV_IP" "$bp")
   case $fwd in
     direct) TARGET_IP=$SRV_IP; TARGET_PORT=$bp; return 0 ;;
-    tinymapper*) c="taskset -c $FWD_CPUS $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level 3" ;;
+    tinymapper*) c="taskset -c $FWD_CPUS $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL" ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
       c="taskset -c $FWD_CPUS $RINETD -f -c $WORK/rinetd.conf" ;;

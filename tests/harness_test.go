@@ -159,6 +159,12 @@ func startMapperLimit(t testing.TB, nofile int, wait []listenPoint, args ...stri
 		cmd = exec.Command("sh", append([]string{"-c", script, mapperBin}, argv...)...)
 	}
 	cmd.Stdout, cmd.Stderr = f, f
+	return runMapper(t, cmd, logPath, wait)
+}
+
+// runMapper 启动已设好输出的 cmd（其输出最终落到 logPath），等待 wait 中的监听全部就绪；测试结束时自动停止。
+func runMapper(t testing.TB, cmd *exec.Cmd, logPath string, wait []listenPoint) *mapper {
+	t.Helper()
 	if err := cmd.Start(); err != nil {
 		t.Fatalf("启动 tinymapper 失败：%v", err)
 	}
@@ -491,6 +497,26 @@ func (m *mapper) cpuTicks(t testing.TB) int64 {
 	utime, _ := strconv.ParseInt(f[11], 10, 64)
 	stime, _ := strconv.ParseInt(f[12], 10, 64)
 	return utime + stime
+}
+
+// syscw 返回进程累计的 write 类系统调用次数（/proc/<pid>/io 的 syscw：write、writev、pwrite 等，不含 send、sendto）
+func (m *mapper) syscw(t testing.TB) int {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/io", m.pid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "syscw:"); ok {
+			n, err := strconv.Atoi(strings.TrimSpace(v))
+			if err != nil {
+				t.Fatalf("/proc/%d/io 的 syscw 无法解析：%q", m.pid(), line)
+			}
+			return n
+		}
+	}
+	t.Fatalf("/proc/%d/io 中没有 syscw：\n%s", m.pid(), data)
+	return 0
 }
 
 // pause 向 tinymapper 发送 SIGSTOP 并等到它停下（kill 返回时目标进程未必已停下），测试结束时自动 SIGCONT

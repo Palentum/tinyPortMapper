@@ -1107,6 +1107,8 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 			ev_io_start(loop,&it->tcp_accept_watcher);
 		}
 	}
+	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
+	fflush(stdout);
 }
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {

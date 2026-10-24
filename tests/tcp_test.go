@@ -589,11 +589,13 @@ func TestTCPClientReset(t *testing.T) {
 }
 
 // expectConnectFailed 等待日志中出现至少 n 行 warn 级、含上游地址 remote 与 errno 的建连失败记录（日志格式为 "<errno>:<strerror>"）。
-// 只比对 errno 数值：glibc 与 musl 的 strerror 文本不同，如 ETIMEDOUT 为 Connection timed out / Operation timed out
+// 只比对 errno 数值：glibc 与 musl 的 strerror 文本不同，如 ETIMEDOUT 为 Connection timed out / Operation timed out。
+// 调用时 tinymapper 已记下这些行（先记 warn 再关闭客户端）；T6 起 stdout 是文件时要等 400 ms 的定时器才写进文件，
+// 窗口在原来的 1 s 上加一个刷新周期再取整，保留原有的调度余量
 func expectConnectFailed(t testing.TB, m *mapper, n int, remote string, errno syscall.Errno) {
 	t.Helper()
 	code := fmt.Sprintf("%d:", int(errno))
-	eventually(t, time.Second, 20*time.Millisecond, func() error {
+	eventually(t, 2*time.Second, 20*time.Millisecond, func() error {
 		if got := m.logLines("[WARN]", "{"+remote+"}", code); got < n {
 			return fmt.Errorf("日志中有 %d 行 [WARN] 级、含 %s 的上游 {%s} 建连失败记录，期望至少 %d 行：建连失败的真实原因（%v）应以 warn 级记录", got, code, remote, n, errno)
 		}
@@ -1104,11 +1106,14 @@ func TestTCPNofileAccept(t *testing.T) {
 		conns = append(conns, c)
 	}
 	pending := dial(t, listen) // 停在 backlog 中，accept 失败
-	time.Sleep(200 * time.Millisecond)
+	// T6 起 stdout 是文件时日志由 400 ms 的定时器写出，等第一行 accept failed 出现后再开始计时
+	eventually(t, ioTimeout, 20*time.Millisecond, func() error {
+		if acceptFailures() == 0 {
+			return errors.New("pending 连接没有触发 accept 失败：fd 余量计算有误，用例没有测到 EMFILE")
+		}
+		return nil
+	})
 	ticks0, failures0 := m.cpuTicks(t), acceptFailures()
-	if failures0 == 0 {
-		t.Fatal("pending 连接没有触发 accept 失败：fd 余量计算有误，用例没有测到 EMFILE")
-	}
 	time.Sleep(2 * time.Second)
 	ticks, failures := m.cpuTicks(t)-ticks0, acceptFailures()-failures0
 	if m.exited() {
@@ -1120,7 +1125,8 @@ func TestTCPNofileAccept(t *testing.T) {
 	if ticks > 40 {
 		t.Errorf("accept 遇到 EMFILE 时空转：2 s 内消耗 CPU %.2f s", float64(ticks)/100)
 	}
-	// 每暂停一次记一行 warn，400 ms 的定时器恢复后再试
+	// 每暂停一次记一行 warn，400 ms 的定时器恢复后再试。这些行也由该定时器写出，比记下时晚一个周期，两次读数各偏移
+	// 不到 400 ms，2 s 内看到的仍约 5 行（至多 ⌊2.4 s/400 ms⌋+1=7 行）；空转时每轮都记，缓冲很快写满，远超 20 行
 	if failures > 20 {
 		t.Errorf("accept 遇到 EMFILE 时刷日志：2 s 内 %d 行 accept failed", failures)
 	}
@@ -1336,9 +1342,13 @@ func TestTCPListenBacklog(t *testing.T) {
 	if failed > 0 {
 		t.Fatalf("%d/%d 个连接回显失败：accept 队列中的连接没有全部被接受并转发", failed, n)
 	}
-	if got := m.logLines("[tcp]new_connection"); got != n {
-		t.Errorf("日志中有 %d 行 new_connection，期望 %d", got, n)
-	}
+	// T6 起 stdout 是文件时最后不满一个 stdio 缓冲的日志要等 400 ms 的定时器写出
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if got := m.logLines("[tcp]new_connection"); got != n {
+			return fmt.Errorf("日志中有 %d 行 new_connection，期望 %d", got, n)
+		}
+		return nil
+	})
 }
 
 // 空闲超过 conn_timeout_tcp（360 s）的连接被清理，期间保持活跃的连接不受影响

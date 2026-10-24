@@ -15,6 +15,7 @@
 #   SC_FWDS / SC_TESTS / SC_DUR  syscall 计数的转发器（默认 FWDS 去掉 direct、realm-2c）、负载（5 个）、秒数（8）
 #   PROF_RUNS / PROF_DUR / PHASES 剖析范围（格式见 bench/prof/prof.sh）
 #   SKIP_BUILD=1  不重新编译工作区的 tinymapper（缺失的二进制仍会编译）
+#   TM_LOG_LEVEL  tinymapper 的 --log-level（默认 3）；TM_LOG_LEVEL=4 测默认日志级别下的性能
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/bench/lib.sh"
@@ -71,7 +72,7 @@ esac
   echo "时间：$(date '+%F %T %z')"
   echo "源码：$(git -C "$ROOT" describe --always --dirty)"
   echo "Docker VM：$(docker info -f '{{.KernelVersion}} {{.Architecture}} {{.NCPU}} vCPU {{.MemTotal}} B')"
-  echo "参数：STAGES=$STAGES REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
+  echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
   echo "二进制 sha256："
   (cd "$ROOT/build" && shasum -a 256 tinymapper-* "fwdbench-linux-$ARCH" || true)
   docker run --rm $IMG sh -c 'iperf3 --version | head -1; realm --version; rinetd --version'
@@ -81,7 +82,7 @@ esac
 COMMON=(--rm --init --network none --ulimit nofile=65536:65536
   --sysctl net.ipv4.tcp_tw_reuse=1 --sysctl net.ipv4.ip_local_port_range="21000 65535"
   -v "$ROOT/build:/build:ro" -v "$ROOT/bench:/bench:ro" -v "$R:/results"
-  -e FWDBENCH="/build/fwdbench-linux-$ARCH")
+  -e FWDBENCH="/build/fwdbench-linux-$ARCH" -e TM_LOG_LEVEL="$TM_LOG_LEVEL")
 for s in $STAGES; do
   log "阶段 $s"
   case $s in
