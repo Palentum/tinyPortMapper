@@ -115,6 +115,8 @@ other options:
 
 TCP socket buffers are left to kernel autotuning by default. `--sock-buf` turns autotuning off for TCP, and the kernel caps the value at `net.core.rmem_max`/`wmem_max` (212992 before Linux 6.18), so setting it can lower throughput on high-latency paths. `--sock-buf 1024` restores the fixed TCP buffers of earlier versions.
 
+The TCP listen backlog follows `net.core.somaxconn` (4096 by default since Linux 5.4, 128 on older kernels, at most 65535); earlier tinymapper versions used a fixed 512. Raise it if bursts of new connections overflow the accept queue (`nstat -az TcpExtListenOverflows`). On routers with little memory, consider lowering it to 512–1024: connections waiting in the queue hold kernel memory until tinymapper accepts them, for example while it is out of file descriptors.
+
 # Peformance Test
 ```
 root@debian9:~# iperf3 -c 127.0.0.1 -p5202

@@ -1189,26 +1189,13 @@ func TestTCPAcceptBatch(t *testing.T) {
 	t.Parallel()
 	// 每轮上限，与 main.cpp 的 max_accept_per_round 保持一致（4–64 均适用）
 	const batch = 8
-	// 大于两轮的上限，且不是 batch 的整数倍：最后一次回调接受余下 1 个后必然遇到 EAGAIN；远小于 listen backlog（512）
+	// 大于两轮的上限，且不是 batch 的整数倍：最后一次回调接受余下 1 个后必然遇到 EAGAIN；远小于 listen backlog（截到 somaxconn，默认 4096）
 	const n = 2*batch + 1
 	be := serveTCP(t, loopback4(t), echoHandler(""))
 	listen := loopback4(t)
 	// half-closed 与 connect returned 是 debug 级日志；只开 info 级时两次回调的 new_connection 会连成一段
 	m := startMapper(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--log-level", "5")
-	m.cmd.Process.Signal(syscall.SIGSTOP)
-	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
-	// kill 返回时目标进程未必已停下
-	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", m.pid()))
-		if err != nil {
-			return err
-		}
-		s := string(data)
-		if st := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[0]; st != "T" {
-			return fmt.Errorf("tinymapper 状态为 %s，SIGSTOP 尚未生效", st)
-		}
-		return nil
-	})
+	m.pause(t)
 	conns := make([]*net.TCPConn, n)
 	for i := range conns {
 		conns[i] = dial(t, listen)
@@ -1272,6 +1259,85 @@ func TestTCPAcceptBatch(t *testing.T) {
 	if first != batch {
 		t.Errorf("恢复后第一次 accept 回调连续接受了 %d 个连接，期望 %d（max_accept_per_round）：1 表示每次回调只 accept 一个；"+
 			"%d（全部）表示一次取空 backlog，没有每轮上限或上限不小于 %d；其他值表示每轮上限与本用例的 batch 不一致", first, batch, n, n)
+	}
+}
+
+// T5：TCP 监听 socket 以 listen_backlog（65535）调用 listen，内核截到本网络命名空间的 net.core.somaxconn（5.4 起默认 4096）；
+// 修复前固定为 512。accept 队列在 sk_ack_backlog > sk_max_ack_backlog 时判满，容量为 backlog+1，判满后到达的 SYN 被
+// tcp_conn_request 丢弃（LISTENOVERFLOWS），客户端约 1 s、3 s 后重传，所以 tinymapper 来不及 accept 时，超出容量的突发建连
+// 要等队列腾出空间才能连上。
+//   - 监听 socket 的 sk_max_ack_backlog（LISTEN 状态下 sock_diag 的 idiag_wqueue）应为 min(65535, somaxconn)
+//   - 暂停 tinymapper：内核照常完成握手，把子 socket 排进 accept 队列。逐个建立 n 个连接（远大于旧容量 513、远小于 4097），
+//     应全部连上且 accept 队列长度（idiag_rqueue）达到 n；修复前第 514 个连接的 SYN 与重传全被丢弃，ioTimeout 内连不上。
+//     不并发建连：并发时队列将满之际收下的 SYN，最后的 ACK 可能因队列已满被丢弃，客户端却已连上，连上的个数不再等于容量
+//   - 恢复后每个连接都被接受并转发：各回显一次，new_connection 恰好 n 行
+func TestTCPListenBacklog(t *testing.T) {
+	t.Parallel()
+	const n = 2048
+	data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	somaxconn, err := strconv.Atoi(strings.TrimSpace(string(data)))
+	if err != nil {
+		t.Fatalf("/proc/sys/net/core/somaxconn 内容异常：%q", data)
+	}
+	backlog := min(65535, somaxconn) // main.cpp 的 listen_backlog（65535）截到 somaxconn
+	be := serveTCP(t, loopback4(t), echoHandler(""))
+	listen := loopback4(t)
+	m := forward(t, "t", listen, be.addr)
+	tcp := syscall.IPPROTO_TCP
+	lis := lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0")
+	t.Logf("somaxconn=%d；监听 socket 的 accept 队列上限 %d", somaxconn, lis.wqueue)
+	if lis.wqueue != uint32(backlog) {
+		t.Errorf("监听 socket 的 sk_max_ack_backlog 为 %d，期望 min(65535, somaxconn)=%d：listen backlog 不是 65535（512 为修复前的固定值）",
+			lis.wqueue, backlog)
+	}
+	if backlog+1 < n {
+		t.Skipf("somaxconn=%d：accept 队列容量 %d 容不下 %d 个连接，跳过突发建连", somaxconn, backlog+1, n)
+	}
+
+	m.pause(t)
+	conns := make([]net.Conn, 0, n)
+	t.Cleanup(func() { closeAll(conns) })
+	start := time.Now()
+	for len(conns) < n {
+		c, err := net.DialTimeout("tcp", listen, ioTimeout)
+		if err != nil {
+			q := lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0")
+			t.Fatalf("暂停期间只连上 %d 个，第 %d 个连接失败（%v），此时 accept 队列长度 %d、上限 %d。若是超时，即 SYN 与重传因队列已满"+
+				"被丢弃：容量为 backlog+1，连上 %d 个对应 listen backlog %d，期望 %d", len(conns), len(conns)+1, err, q.rqueue, q.wqueue,
+				len(conns), len(conns)-1, backlog)
+		}
+		conns = append(conns, c)
+	}
+	elapsed := time.Since(start)
+	// 客户端发出最后的 ACK 后 connect 即返回，服务端可能稍后才处理这个 ACK
+	var q sockBuf
+	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+		if q = lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0"); q.rqueue != n {
+			return fmt.Errorf("监听 socket 的 accept 队列长度为 %d，期望 %d：已连上的客户端没有全部作为子 socket 排在队列中", q.rqueue, n)
+		}
+		return nil
+	})
+	t.Logf("暂停期间逐个建立 %d 个连接用时 %v，accept 队列长度 %d", n, elapsed.Round(time.Millisecond), q.rqueue)
+
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	errs := make([]error, n)
+	parallelFor(n, 64, func(i int) { errs[i] = echo(conns[i], []byte(strconv.Itoa(i))) })
+	failed := 0
+	for i, err := range errs {
+		if err != nil {
+			if failed++; failed <= 5 {
+				t.Errorf("恢复后第 %d 个连接回显失败：%v", i+1, err)
+			}
+		}
+	}
+	if failed > 0 {
+		t.Fatalf("%d/%d 个连接回显失败：accept 队列中的连接没有全部被接受并转发", failed, n)
+	}
+	if got := m.logLines("[tcp]new_connection"); got != n {
+		t.Errorf("日志中有 %d 行 new_connection，期望 %d", got, n)
 	}
 }
 

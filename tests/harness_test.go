@@ -308,23 +308,25 @@ func socketInodes(pid int) map[string]bool {
 	return set
 }
 
-// sockBuf 是一个 socket 的 inode 与缓冲上限 sk_rcvbuf / sk_sndbuf（即 getsockopt SO_RCVBUF / SO_SNDBUF 的返回值）
-type sockBuf struct{ inode, rcv, snd uint32 }
+// sockBuf 是一个 socket 的 inode、缓冲上限 sk_rcvbuf / sk_sndbuf（即 getsockopt SO_RCVBUF / SO_SNDBUF 的返回值），
+// 以及 inet_diag_msg 的 idiag_rqueue / idiag_wqueue：TCP 监听 socket 上为 accept 队列的当前长度 sk_ack_backlog 与上限
+// sk_max_ack_backlog（tcp_diag_get_info）
+type sockBuf struct{ inode, rcv, snd, rqueue, wqueue uint32 }
 
 func (b sockBuf) String() string {
 	return fmt.Sprintf("rcvbuf=%d sndbuf=%d（inode %d）", b.rcv, b.snd, b.inode)
 }
 
-// sockDiag 用 NETLINK_SOCK_DIAG 按地址查找一个 IPv4 TCP/UDP socket，返回其 inode 与 INET_DIAG_SKMEMINFO 中的
-// SK_MEMINFO_RCVBUF / SK_MEMINFO_SNDBUF。请求不带 NLM_F_DUMP，内核只按四元组查一次哈希表（inet_diag_find_one_icsk、
-// udp_dump_one），不遍历全部 socket，不受并行用例里数万个 socket 的影响。local、remote 是该 socket 的本端与对端地址，
-// 监听 socket 的 remote 为 0.0.0.0:0
+// sockDiag 用 NETLINK_SOCK_DIAG 按地址查找一个 IPv4 TCP/UDP socket，返回其 inode、idiag_rqueue / idiag_wqueue 与
+// INET_DIAG_SKMEMINFO 中的 SK_MEMINFO_RCVBUF / SK_MEMINFO_SNDBUF。请求不带 NLM_F_DUMP，内核只按四元组查一次哈希表
+// （inet_diag_find_one_icsk、udp_dump_one），不遍历全部 socket，不受并行用例里数万个 socket 的影响。local、remote 是该
+// socket 的本端与对端地址，监听 socket 的 remote 为 0.0.0.0:0
 func sockDiag(proto int, local, remote string) (sockBuf, error) {
 	const (
 		netlinkSockDiag   = 4  // NETLINK_SOCK_DIAG
 		sockDiagByFamily  = 20 // SOCK_DIAG_BY_FAMILY
 		inetDiagSkmeminfo = 7  // INET_DIAG_SKMEMINFO：u32 数组，下标 1 为 RCVBUF，3 为 SNDBUF
-		inetDiagMsgLen    = 72 // struct inet_diag_msg，idiag_inode 在偏移 68
+		inetDiagMsgLen    = 72 // struct inet_diag_msg，idiag_rqueue、idiag_wqueue、idiag_inode 在偏移 56、60、68
 	)
 	src, err := netip.ParseAddrPort(local)
 	if err != nil {
@@ -386,7 +388,8 @@ func sockDiag(proto int, local, remote string) (sockBuf, error) {
 					break
 				}
 				if typ == inetDiagSkmeminfo && l >= 4+16 {
-					return sockBuf{inode: inode, rcv: ne.Uint32(a[8:]), snd: ne.Uint32(a[16:])}, nil
+					return sockBuf{inode: inode, rcv: ne.Uint32(a[8:]), snd: ne.Uint32(a[16:]),
+						rqueue: ne.Uint32(m.Data[56:]), wqueue: ne.Uint32(m.Data[60:])}, nil
 				}
 				a = a[min((l+3)&^3, len(a)):]
 			}
@@ -488,6 +491,24 @@ func (m *mapper) cpuTicks(t testing.TB) int64 {
 	utime, _ := strconv.ParseInt(f[11], 10, 64)
 	stime, _ := strconv.ParseInt(f[12], 10, 64)
 	return utime + stime
+}
+
+// pause 向 tinymapper 发送 SIGSTOP 并等到它停下（kill 返回时目标进程未必已停下），测试结束时自动 SIGCONT
+func (m *mapper) pause(t testing.TB) {
+	t.Helper()
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
+	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", m.pid()))
+		if err != nil {
+			return err
+		}
+		s := string(data)
+		if st := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[0]; st != "T" {
+			return fmt.Errorf("tinymapper 状态为 %s，SIGSTOP 尚未生效", st)
+		}
+		return nil
+	})
 }
 
 // runExpectFail 运行 tinymapper 并期望它以非零状态退出，返回其输出

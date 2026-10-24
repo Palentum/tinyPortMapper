@@ -30,6 +30,8 @@ static app_config_t app_config;
 const int listen_fd_buf_size=2*1024*1024;
 static const u32_t dns_refresh_interval=30000;
 static const int max_accept_per_round=8;
+//内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
+static const int listen_backlog=65535;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -1344,7 +1346,7 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 			myexit(1);
 		}
 
-		if(listen(rule.local_listen_fd_tcp, 512) !=0)
+		if(listen(rule.local_listen_fd_tcp, listen_backlog) !=0)
 		{
 			mylog(log_fatal,"rule %d [tcp] socket listen failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
 			myexit(1);
