@@ -293,6 +293,25 @@ func TestLogClientAddrTCP(t *testing.T) {
 			}
 			waitClientAddrs(t, m, map[string][]string{"[tcp]new_connection": addrs, "half-closed by": addrs,
 				"closed bc of EOF": addrs, "[tcp]closed connection": addrs})
+			// T9：closed connection 的下一行（debug）打印释放后的 lru.size()，应与 tcp connections 相同：
+			// LRU 自己维护的计数漏减时偏大，清理逻辑看不出来（清理条数按连接对链表的长度截断）
+			eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+				data, _ := os.ReadFile(m.logPath)
+				lines := strings.Split(string(data), "\n")
+				for i, line := range lines {
+					if _, n, ok := strings.Cut(line, "[tcp]closed connection"); ok {
+						_, n, _ = strings.Cut(n, "tcp connections=")
+						next := ""
+						if i+1 < len(lines) {
+							next = lines[i+1]
+						}
+						if !strings.HasSuffix(next, "[tcp] lru.size()="+n) {
+							return fmt.Errorf("%q 的下一行是 %q，期望以 [tcp] lru.size()=%s 结尾", line, next, n)
+						}
+					}
+				}
+				return nil
+			})
 		})
 	}
 }

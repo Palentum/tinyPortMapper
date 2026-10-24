@@ -36,87 +36,82 @@ static const my_time_t lru_move_interval=1000;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
-//template <class key_t>
+//侵入式双链表（T9）：节点就是连接对象本身（继承 lru_node_t），表头最近活动、表尾最久未活动；挂入、挪动、摘除都不分配内存、不查哈希
 struct lru_collector_t:not_copy_able_t
 {
-	typedef void* key_t;
-//#define key_t void*
-	struct lru_pair_t
+	typedef lru_node_t* key_t;
+	lru_node_t head;//哨兵：head.next 是表头，head.prev 是表尾；指向自身，所以本对象不能复制或移动
+	int cnt;
+	lru_collector_t(const lru_collector_t &)=delete;
+	lru_collector_t & operator=(const lru_collector_t &)=delete;
+	lru_collector_t()
 	{
-		key_t key;
-		my_time_t ts;
-	};
-	unordered_map<key_t,list<lru_pair_t>::iterator> mp;
-	list<lru_pair_t> q;
+		head.prev=head.next=&head;
+		cnt=0;
+	}
+	void link_front(key_t key)
+	{
+		key->prev=&head;
+		key->next=head.next;
+		head.next->prev=key;
+		head.next=key;
+	}
+	void unlink(key_t key)
+	{
+		key->prev->next=key->next;
+		key->next->prev=key->prev;
+	}
 	int update(key_t key)
 	{
-		auto mit=mp.find(key);
-		assert(mit!=mp.end());
-		auto it=mit->second;
+		assert(key->next!=0);
 
 		my_time_t value=get_current_time();
-		assert(value >=q.front().ts);
+		assert(value >=head.next->ts);
 		//距上次挪动不到 lru_move_interval 就不挪：链表仍按 ts 有序，ts 最多比实际最后活动早这么多，超时最多提前这么多（T8）
-		if(value-it->ts<lru_move_interval) return 0;
-		it->ts=value;
-		q.splice(q.begin(),q,it);
+		if(value-key->ts<lru_move_interval) return 0;
+		key->ts=value;
+		unlink(key);
+		link_front(key);
 
 		return 0;
 	}
 	int new_key(key_t key)
 	{
-		assert(mp.find(key)==mp.end());
+		assert(key->next==0);
 
 		my_time_t value=get_current_time();
-		if(!q.empty())
+		if(!empty())
 		{
-			assert(value >=q.front().ts);
+			assert(value >=head.next->ts);
 		}
-		lru_pair_t tmp; tmp.key=key; tmp.ts=value;
-		q.push_front( tmp);
-		mp[key]=q.begin();
+		key->ts=value;
+		link_front(key);
+		cnt++;
 
 		return 0;
 	}
 	int size()
 	{
-		return q.size();
+		return cnt;
 	}
 	int empty()
 	{
-		return q.empty();
-	}
-	void clear()
-	{
-		mp.clear(); q.clear();
-	}
-	my_time_t ts_of(key_t key)
-	{
-		assert(mp.find(key)!=mp.end());
-		return mp[key]->ts;
+		return cnt==0;
 	}
 
 	my_time_t peek_back(key_t &key)
 	{
-		assert(!q.empty());
-		auto it=q.end(); it--;
-		key=it->key;
-		return it->ts;
+		assert(!empty());
+		key=head.prev;
+		return key->ts;
 	}
 	void erase(key_t key)
 	{
-		assert(mp.find(key)!=mp.end());
-		q.erase(mp[key]);
-		mp.erase(key);
+		assert(key->next!=0);
+		unlink(key);
+		key->prev=key->next=0;
+		cnt--;
 	}
-	/*
-	void erase_back()
-	{
-		assert(!q.empty());
-		auto it=q.end(); it--;
-		key_t key=it->key;
-		erase(key);
-	}*/
 };
 
 struct conn_manager_udp_t
@@ -209,7 +204,7 @@ struct conn_manager_udp_t
 			my_time_t ts=lru.peek_back(key);
 			if(current_time- ts < conn_timeout_udp) break;
 
-			erase( ((udp_pair_t *) key)->it  );
+			erase( static_cast<udp_pair_t *>(key)->it  );
 
 			cnt++;
 		}
@@ -300,7 +295,7 @@ struct conn_manager_tcp_t
 			my_time_t ts=lru.peek_back(key);
 			if(current_time- ts < conn_timeout_tcp) break;
 
-			erase( ((tcp_pair_t *) key)->it  );
+			erase( static_cast<tcp_pair_t *>(key)->it  );
 
 			cnt++;
 		}

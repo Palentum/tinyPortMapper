@@ -81,7 +81,10 @@ func TestUDPSessionIsolation(t *testing.T) {
 // 空闲超过 conn_timeout_udp（180 s）的会话被清理，期间保持活跃的会话不受影响；
 // 被清理的客户端再发包时，tinymapper 为它新建会话，上游看到新的源地址。
 // 清理每轮最多关 1 条、约 1.2 s 一轮：活跃会话若也超时了（LRU 没把它挪到队首，或挪动时没刷新时间戳），
-// 可能比空闲会话晚一轮才被清理，所以空闲会话被清理后再等 5 s 才检查活跃会话
+// 可能比空闲会话晚一轮才被清理，所以空闲会话被清理后再等 5 s 才检查活跃会话。
+// 约 60 s 保活后再建一个之后不发包的会话 late：LRU 若把新会话挂在表尾，它会挡住空闲会话，直到它自己也超时（约 240 s）。
+// 建 late 之后不再保活（活跃会话检查时空闲约 125 s，仍未超时）：否则活跃会话挪到 late 前面，
+// 挪动时不刷新时间戳的错误实现里活跃会话的过期会被 late 挡住
 func TestUDPSessionTimeout(t *testing.T) {
 	t.Parallel()
 	slow(t)
@@ -104,13 +107,18 @@ func TestUDPSessionTimeout(t *testing.T) {
 	roundTrip(idle, "idle")
 	last := time.Now()
 	keepalive := last
+	var late *net.UDPConn
 	for !cleared(idle) {
 		if elapsed := time.Since(last); elapsed > 210*time.Second {
 			t.Fatalf("空闲 %v 后会话仍未被清理（超时应为 180 s）", elapsed.Round(time.Second))
 		}
-		if time.Since(keepalive) >= 30*time.Second {
+		if late == nil && time.Since(keepalive) >= 30*time.Second {
 			roundTrip(active, "keepalive")
 			keepalive = time.Now()
+			if keepalive.Sub(last) >= 60*time.Second {
+				late = udpDial(t, "", listen)
+				roundTrip(late, "late")
+			}
 		}
 		time.Sleep(time.Second)
 	}
@@ -125,7 +133,8 @@ func TestUDPSessionTimeout(t *testing.T) {
 	}
 	roundTrip(active, "after")
 	roundTrip(idle, "after")
-	if peers := be.peerList(); len(peers) != 3 {
-		t.Errorf("上游源地址 %v，期望 3 个：活跃客户端 1 个，空闲客户端清理前后各 1 个", peers)
+	roundTrip(late, "after")
+	if peers := be.peerList(); len(peers) != 4 {
+		t.Errorf("上游源地址 %v，期望 4 个：活跃客户端 1 个，空闲客户端清理前后各 1 个，后建的客户端 1 个", peers)
 	}
 }

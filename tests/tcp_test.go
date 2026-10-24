@@ -1360,7 +1360,10 @@ func TestTCPListenBacklog(t *testing.T) {
 
 // 空闲超过 conn_timeout_tcp（360 s）的连接被清理，期间保持活跃的连接不受影响。
 // 清理每轮最多关 1 条、约 1.2 s 一轮：活跃连接若也超时了（LRU 没把它挪到队首，或挪动时没刷新时间戳），
-// 会比空闲连接晚一轮才被清理，所以空闲连接被清理后再等 5 s 才检查活跃连接
+// 会比空闲连接晚一轮才被清理，所以空闲连接被清理后再等 5 s 才检查活跃连接。
+// 约 90 s 保活后再建一条之后不收发的连接 late：LRU 若把新连接挂在表尾，它会挡住空闲连接，直到它自己也超时（约 450 s）。
+// 建 late 之后不再保活（活跃连接检查时空闲约 280 s，仍未超时）：否则活跃连接挪到 late 前面，
+// 挪动时不刷新时间戳的错误实现里活跃连接的过期会被 late 挡住
 func TestTCPIdleTimeout(t *testing.T) {
 	t.Parallel()
 	slow(t)
@@ -1372,6 +1375,7 @@ func TestTCPIdleTimeout(t *testing.T) {
 	mustEcho(t, idle, "idle")
 	mustEcho(t, active, "active")
 	last := time.Now()
+	var late *net.TCPConn
 	for {
 		err := closedWithin(idle, 30*time.Second)
 		if err == nil {
@@ -1380,7 +1384,13 @@ func TestTCPIdleTimeout(t *testing.T) {
 		if elapsed := time.Since(last); elapsed > 420*time.Second {
 			t.Fatalf("空闲 %v 后连接仍未被清理", elapsed.Round(time.Second))
 		}
-		mustEcho(t, active, "keepalive")
+		if late == nil {
+			mustEcho(t, active, "keepalive")
+			if time.Since(last) >= 75*time.Second {
+				late = dial(t, listen)
+				mustEcho(t, late, "late")
+			}
+		}
 	}
 	elapsed := time.Since(last)
 	t.Logf("空闲连接在 %v 后被清理", elapsed.Round(time.Second))
@@ -1389,4 +1399,5 @@ func TestTCPIdleTimeout(t *testing.T) {
 	}
 	time.Sleep(5 * time.Second)
 	mustEcho(t, active, "after")
+	mustEcho(t, late, "after")
 }

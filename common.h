@@ -235,7 +235,18 @@ int parse_remote_target(const char *str,address_t &addr,char *remote_host,int re
 
 struct forward_rule_t;
 
-struct udp_pair_t:not_copy_able_t
+struct lru_node_t//侵入式 LRU 节点：连接对象继承它，直接挂进所属规则的 lru_collector_t，不另外分配（T9）
+{
+	lru_node_t *prev,*next;//不在链表中时都为 0
+	my_time_t ts;
+	lru_node_t()
+	{
+		prev=next=0;
+		ts=0;
+	}
+};
+
+struct udp_pair_t:not_copy_able_t,lru_node_t
 {
 	address_t adress;
 	fd64_t fd64;
@@ -253,7 +264,7 @@ struct udp_pair_t:not_copy_able_t
 	//int not_used=0;
 };
 
-struct tcp_pair_t:not_copy_able_t
+struct tcp_pair_t:not_copy_able_t,lru_node_t
 {
 	tcp_info_t local;
 	tcp_info_t remote;
