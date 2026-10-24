@@ -79,7 +79,9 @@ func TestUDPSessionIsolation(t *testing.T) {
 }
 
 // 空闲超过 conn_timeout_udp（180 s）的会话被清理，期间保持活跃的会话不受影响；
-// 被清理的客户端再发包时，tinymapper 为它新建会话，上游看到新的源地址
+// 被清理的客户端再发包时，tinymapper 为它新建会话，上游看到新的源地址。
+// 清理每轮最多关 1 条、约 1.2 s 一轮：活跃会话若也超时了（LRU 没把它挪到队首，或挪动时没刷新时间戳），
+// 可能比空闲会话晚一轮才被清理，所以空闲会话被清理后再等 5 s 才检查活跃会话
 func TestUDPSessionTimeout(t *testing.T) {
 	t.Parallel()
 	slow(t)
@@ -117,6 +119,7 @@ func TestUDPSessionTimeout(t *testing.T) {
 	if elapsed < 170*time.Second {
 		t.Errorf("空闲会话过早被清理：%v（超时应为 180 s）", elapsed.Round(time.Second))
 	}
+	time.Sleep(5 * time.Second)
 	if cleared(active) {
 		t.Error("保持活跃的会话也被清理了")
 	}

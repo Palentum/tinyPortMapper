@@ -1358,7 +1358,9 @@ func TestTCPListenBacklog(t *testing.T) {
 	})
 }
 
-// 空闲超过 conn_timeout_tcp（360 s）的连接被清理，期间保持活跃的连接不受影响
+// 空闲超过 conn_timeout_tcp（360 s）的连接被清理，期间保持活跃的连接不受影响。
+// 清理每轮最多关 1 条、约 1.2 s 一轮：活跃连接若也超时了（LRU 没把它挪到队首，或挪动时没刷新时间戳），
+// 会比空闲连接晚一轮才被清理，所以空闲连接被清理后再等 5 s 才检查活跃连接
 func TestTCPIdleTimeout(t *testing.T) {
 	t.Parallel()
 	slow(t)
@@ -1385,5 +1387,6 @@ func TestTCPIdleTimeout(t *testing.T) {
 	if elapsed < 350*time.Second {
 		t.Errorf("空闲连接过早被清理：%v（超时应为 360 s）", elapsed.Round(time.Second))
 	}
+	time.Sleep(5 * time.Second)
 	mustEcho(t, active, "after")
 }

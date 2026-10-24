@@ -14,3 +14,9 @@
 #include "ev.c"
 
 #pragma GCC diagnostic pop
+
+//libev 每轮循环在 epoll 返回后把 CLOCK_MONOTONIC 读进 mn_now（ev_timer 也按它计时），4.24 没有公开的读取接口；ev_now() 是按它插值、每 0.5 s 与墙钟对齐一次的 ev_rt_now
+ev_tstamp my_ev_mono_now(struct ev_loop *loop)
+{
+	return loop->mn_now;
+}

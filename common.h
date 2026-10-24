@@ -279,7 +279,6 @@ struct fd_info_t:not_copy_able_t
 
 
 u64_t get_current_time();
-u64_t get_current_time_us();
 u64_t pack_u64(u32_t a,u32_t b);
 u32_t get_u64_h(u64_t a);
 u32_t get_u64_l(u64_t a);

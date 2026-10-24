@@ -32,6 +32,7 @@ static const u32_t dns_refresh_interval=30000;
 static const int max_accept_per_round=8;
 //内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
 static const int listen_backlog=65535;
+static const my_time_t lru_move_interval=1000;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -49,18 +50,16 @@ struct lru_collector_t:not_copy_able_t
 	list<lru_pair_t> q;
 	int update(key_t key)
 	{
-		assert(mp.find(key)!=mp.end());
-		auto it=mp[key];
-		q.erase(it);
+		auto mit=mp.find(key);
+		assert(mit!=mp.end());
+		auto it=mit->second;
 
 		my_time_t value=get_current_time();
-		if(!q.empty())
-		{
-			assert(value >=q.front().ts);
-		}
-		lru_pair_t tmp; tmp.key=key; tmp.ts=value;
-		q.push_front( tmp);
-		mp[key]=q.begin();
+		assert(value >=q.front().ts);
+		//距上次挪动不到 lru_move_interval 就不挪：链表仍按 ts 有序，ts 最多比实际最后活动早这么多，超时最多提前这么多（T8）
+		if(value-it->ts<lru_move_interval) return 0;
+		it->ts=value;
+		q.splice(q.begin(),q,it);
 
 		return 0;
 	}
