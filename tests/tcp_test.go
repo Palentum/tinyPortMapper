@@ -1,10 +1,12 @@
 package tests
 
 import (
+	"bufio"
 	"bytes"
 	"errors"
 	"fmt"
 	"io"
+	"math/rand/v2"
 	"net"
 	"os"
 	"slices"
@@ -1272,6 +1274,219 @@ func TestTCPAcceptBatch(t *testing.T) {
 	if first != batch {
 		t.Errorf("恢复后第一次 accept 回调连续接受了 %d 个连接，期望 %d（max_accept_per_round）：1 表示每次回调只 accept 一个；"+
 			"%d（全部）表示一次取空 backlog，没有每轮上限或上限不小于 %d；其他值表示每轮上限与本用例的 batch 不一致", first, batch, n, n)
+	}
+}
+
+// T10：watcher->data 直接指向连接对象，释放顺序固定为“两侧 ev_io_stop → close → 释放对象”。libev 的 ev_io_stop 先
+// clear_pending：本轮 epoll_wait 已登记、还没回调的事件换成空 watcher，所以同一对的另一个 watcher 不会再回调到已释放的
+// 对象上，fd 号随后被本轮后面 accept 的连接复用也安全。本用例让这两件事在恢复后的第一轮里发生：
+//   - 建 nOld 个连接对，各往返一次（两侧 watcher 都只等读），然后暂停 tinymapper；
+//   - 先排进 nNew 个新连接（各已写入一行独有的数据），监听 socket 先进入 epoll 就绪链表；
+//   - 再让每个旧连接对的两个 fd 都可读：偶数对上游先写数据、客户端再发 RST；奇数对客户端先写数据、上游再发 RST。
+//     libev 按 epoll 返回的顺序登记、后进先出地回调，所以每对后变为可读的一侧（收到 RST 的那侧）先回调，recv 得到
+//     ECONNRESET 后 erase_closed 释放连接对，这时另一侧的事件还在 pending 里。漏掉哪一侧的 ev_io_stop，偶数对或奇数对
+//     就会在已释放的对象上回调：release 构建通常对已关闭的 fd 收发得到 EBADF 或堆损坏中止，ASan 构建报 heap-use-after-free；
+//   - 2×nOld+1 个就绪 fd 不超过 libev 一次 epoll_wait 取的 64 个事件，监听 socket 排在最前、最后回调，本轮 accept 的连接
+//     （每轮最多 max_accept_per_round=8 个）拿到的就是刚释放的最小 fd 号。nNew 多于两轮的上限，即使回调顺序不同，
+//     后面几轮 accept 的连接也一定复用旧连接对的 fd 号。复用的 fd 号上，libev 缓存的事件掩码还是旧连接的（READ），新
+//     watcher 必须经 ev_io_init（EV__IOFDSET）才会被重新加进 epoll，否则新连接收不到数据（T10 审查 F3）
+//
+// 恢复后：每个新连接收发自己的数据（不串线）并正常半关闭；旧连接对的另一端都被关闭；全部释放后 fd 数回到建连前（没有漏关）；
+// 日志里没有 EBADF（对已关闭的 fd 收发），每行 closed connection 的连接数与下一行的 lru.size() 相同，tinymapper 没有退出
+func TestTCPFdReuseBurst(t *testing.T) {
+	t.Parallel()
+	const nOld = 24
+	const nNew = 2*8 + 1
+	type reg struct {
+		id int
+		c  net.Conn
+	}
+	regs := make(chan reg, nOld)
+	// 旧连接对的上游一侧读到 EOF/RST：偶数对说明 tinymapper 关闭了上游 socket，奇数对是本用例自己发的 RST
+	oldDone := make(chan int, nOld)
+	be := serveTCP(t, loopback4(t), func(c net.Conn) {
+		r := bufio.NewReader(c)
+		line, err := r.ReadString('\n')
+		if err != nil {
+			return
+		}
+		if id, ok := strings.CutPrefix(strings.TrimSuffix(line, "\n"), "old-"); ok {
+			i, _ := strconv.Atoi(id)
+			if _, err := io.WriteString(c, "ack "+line); err != nil {
+				return
+			}
+			regs <- reg{i, c}
+			io.Copy(io.Discard, r)
+			oldDone <- i
+			return
+		}
+		// 新连接：先回显首行，之后照常回显，读到 EOF 后关闭写方向
+		if _, err := io.WriteString(c, line); err != nil {
+			return
+		}
+		io.Copy(c, r)
+		c.(*net.TCPConn).CloseWrite()
+	})
+	listen := loopback4(t)
+	// new_connection 带 fd1/fd2（info 级），closed connection 的下一行是 lru.size()（debug 级）
+	m := startMapper(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--log-level", "5")
+	fds0 := fdCount(t, m.pid())
+
+	clients := make([]*net.TCPConn, nOld)
+	backs := make([]net.Conn, nOld)
+	for i := range clients {
+		clients[i] = dial(t, listen)
+		if _, err := fmt.Fprintf(clients[i], "old-%d\n", i); err != nil {
+			t.Fatal(err)
+		}
+		if got, want := readLine(t, clients[i]), fmt.Sprintf("ack old-%d", i); got != want {
+			t.Fatalf("第 %d 个旧连接读到 %q，期望 %q", i+1, got, want)
+		}
+	}
+	for range nOld {
+		select {
+		case r := <-regs:
+			backs[r.id] = r.c
+		case <-time.After(ioTimeout):
+			t.Fatal("后端没有收到全部旧连接")
+		}
+	}
+
+	m.pause(t)
+	news := make([]*net.TCPConn, nNew)
+	payloads := make([]string, nNew)
+	for j := range news {
+		news[j] = dial(t, listen)
+		payloads[j] = fmt.Sprintf("new-%d-%016x\n", j, rand.Uint64())
+		if _, err := io.WriteString(news[j], payloads[j]); err != nil {
+			t.Fatal(err)
+		}
+	}
+	for i, c := range clients {
+		if i%2 == 0 {
+			if _, err := fmt.Fprintf(backs[i], "data-%d\n", i); err != nil {
+				t.Fatal(err)
+			}
+			c.SetLinger(0) // close 时发送 RST
+			c.Close()
+		} else {
+			if _, err := fmt.Fprintf(c, "data-%d\n", i); err != nil {
+				t.Fatal(err)
+			}
+			backs[i].(*net.TCPConn).SetLinger(0)
+			backs[i].Close()
+		}
+	}
+	m.cmd.Process.Signal(syscall.SIGCONT)
+
+	for j, c := range news {
+		c.SetReadDeadline(time.Now().Add(ioTimeout))
+		got := make([]byte, len(payloads[j]))
+		if _, err := io.ReadFull(c, got); err != nil || string(got) != payloads[j] {
+			t.Fatalf("第 %d 个新连接读回 %q（%v），期望 %q：新连接没有被转发，或串到了别的连接", j+1, got, err, payloads[j])
+		}
+		if err := echo(c, []byte(fmt.Sprintf("again-%d-%016x", j, rand.Uint64()))); err != nil {
+			t.Fatalf("第 %d 个新连接第二次往返：%v", j+1, err)
+		}
+		if err := c.CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+		c.SetReadDeadline(time.Now().Add(ioTimeout))
+		if b, err := io.ReadAll(c); err != nil || len(b) != 0 {
+			t.Fatalf("第 %d 个新连接半关闭后读到 %d 字节（%v），期望 EOF", j+1, len(b), err)
+		}
+	}
+	for i := 1; i < nOld; i += 2 {
+		if err := closedWithin(clients[i], ioTimeout); err != nil {
+			t.Errorf("第 %d 个旧连接（上游发 RST）的客户端一侧：%v", i+1, err)
+		}
+	}
+	done := map[int]bool{}
+	timeout := time.After(ioTimeout)
+	for len(done) < nOld {
+		select {
+		case i := <-oldDone:
+			done[i] = true
+		case <-timeout:
+			var missing []int
+			for i := 0; i < nOld; i += 2 {
+				if !done[i] {
+					missing = append(missing, i+1)
+				}
+			}
+			t.Fatalf("客户端发 RST 的旧连接中，第 %v 个的上游一侧 %v 内没有被关闭", missing, ioTimeout)
+		}
+	}
+	eventually(t, logFlushWithin, 20*time.Millisecond, func() error {
+		if got := m.logLines("[tcp]closed connection"); got != nOld+nNew {
+			return fmt.Errorf("日志中有 %d 行 closed connection，期望 %d：连接对没有全部释放", got, nOld+nNew)
+		}
+		if got := m.logLines("[tcp] lru.size()="); got != nOld+nNew {
+			return fmt.Errorf("日志中有 %d 行 lru.size()，期望 %d", got, nOld+nNew)
+		}
+		if got := fdCount(t, m.pid()); got != fds0 {
+			return fmt.Errorf("全部连接释放后 tinymapper 有 %d 个 fd，建连前为 %d：有 fd 没有关闭", got, fds0)
+		}
+		return nil
+	})
+	if m.exited() {
+		t.Fatalf("tinymapper 已退出：%v", m.exitErr)
+	}
+	if got := m.logLines("bc of 9:"); got != 0 {
+		t.Errorf("日志中有 %d 行因 EBADF（9）关闭连接：回调到了已释放的连接对，对已关闭的 fd 收发", got)
+	}
+
+	data, err := os.ReadFile(m.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	var conns [][2]int // 各 new_connection 行的 fd1、fd2，按日志顺序：前 nOld 行是旧连接对
+	firstNew, closedBefore := -1, 0
+	for i, line := range lines {
+		if _, rest, ok := strings.Cut(line, "[tcp]new_connection"); ok {
+			var fd [2]int
+			for k, key := range []string{",fd1=", ",fd2="} {
+				_, v, _ := strings.Cut(rest, key)
+				v, _, _ = strings.Cut(v, ",")
+				fd[k], _ = strconv.Atoi(v)
+			}
+			conns = append(conns, fd)
+			if len(conns) == nOld+1 {
+				firstNew = i
+			}
+		}
+		if _, n, ok := strings.Cut(line, "[tcp]closed connection"); ok {
+			if firstNew < 0 {
+				closedBefore++
+			}
+			_, n, _ = strings.Cut(n, "tcp connections=")
+			next := ""
+			if i+1 < len(lines) {
+				next = lines[i+1]
+			}
+			if !strings.HasSuffix(next, "[tcp] lru.size()="+n) {
+				t.Errorf("%q 的下一行是 %q，期望以 [tcp] lru.size()=%s 结尾", line, next, n)
+			}
+		}
+	}
+	if len(conns) != nOld+nNew {
+		t.Fatalf("日志中有 %d 行 new_connection，期望 %d", len(conns), nOld+nNew)
+	}
+	oldFDs := map[int]bool{}
+	for _, fd := range conns[:nOld] {
+		oldFDs[fd[0]], oldFDs[fd[1]] = true, true
+	}
+	reused := 0
+	for _, fd := range conns[nOld:] {
+		if oldFDs[fd[0]] || oldFDs[fd[1]] {
+			reused++
+		}
+	}
+	t.Logf("新连接对中 %d/%d 个复用了旧连接对的 fd 号；第一个新连接对之前已释放 %d 个旧连接对（%d 表示本轮先释放再 accept）",
+		reused, nNew, closedBefore, nOld)
+	if reused == 0 {
+		t.Errorf("没有一个新连接对复用旧连接对的 fd 号（旧 %v，新 %v）：用例没有覆盖 fd 复用", conns[:nOld], conns[nOld:])
 	}
 }
 

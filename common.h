@@ -109,8 +109,6 @@ extern int about_to_exit;
 
 extern int socket_buf_size;
 
-typedef u64_t fd64_t;
-
 
 
 struct not_copy_able_t
@@ -132,8 +130,8 @@ struct not_copy_able_t
 
 struct tcp_info_t:not_copy_able_t
 {
-	fd64_t fd64;
-	ev_io ev;
+	int fd;
+	ev_io ev;//ev.data 指向所属的 tcp_pair_t（T10）
 	//epoll_event ev;
 	//char * data;
 	char data[max_data_len_tcp+200];//use a larger buffer than udp
@@ -249,8 +247,8 @@ struct lru_node_t//侵入式 LRU 节点：连接对象继承它，直接挂进�
 struct udp_pair_t:not_copy_able_t,lru_node_t
 {
 	address_t adress;
-	fd64_t fd64;
-	ev_io ev;
+	int fd;
+	ev_io ev;//ev.data 指向本对象（T10）
 	int local_listen_fd;
 	forward_rule_t *owner;
 	int remote_index;
@@ -280,14 +278,6 @@ struct tcp_pair_t:not_copy_able_t,lru_node_t
 		remote_index=-1;
 	}
 };
-
-struct fd_info_t:not_copy_able_t
-{
-	int is_tcp=0;
-	tcp_pair_t *tcp_pair_p=0;
-	udp_pair_t *udp_pair_p=0;
-};
-
 
 u64_t get_current_time();
 u64_t pack_u64(u32_t a,u32_t b);

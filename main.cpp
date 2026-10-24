@@ -1,7 +1,6 @@
 #include "common.h"
 #include "log.h"
 #include "git_version.h"
-#include "fd_manager.h"
 #include "config.h"
 
 #include <sys/stat.h>
@@ -152,7 +151,7 @@ struct conn_manager_udp_t
 		assert(tmp_it!=adress_to_info.end());
 		adress_to_info.erase(tmp_it);
 
-		fd_manager.fd64_close(it->fd64);
+		close(it->fd);
 		lru.erase(&*it);
 		udp_pair_list.erase(it);
 
@@ -223,12 +222,14 @@ struct conn_manager_tcp_t
 	}
 	int erase(list<tcp_pair_t>::iterator &it)
 	{
+		//两侧都 stop 之后才能释放：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，释放后不会再有它的回调。
+		//close 后 fd 号可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10）
 		struct ev_loop * loop= ev_default_loop (0);
 		ev_io_stop(loop, &it->local.ev);
 		ev_io_stop(loop, &it->remote.ev);
 
-		fd_manager.fd64_close( it->local.fd64);
-		fd_manager.fd64_close( it->remote.fd64);
+		close(it->local.fd);
+		close(it->remote.fd);
 		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
 		lru.erase(&*it);
@@ -241,8 +242,8 @@ struct conn_manager_tcp_t
 		ev_io_stop(loop, &it->local.ev);
 		ev_io_stop(loop, &it->remote.ev);
 
-		fd_manager.fd64_close( it->local.fd64);
-		fd_manager.fd64_close( it->remote.fd64);
+		close(it->local.fd);
+		close(it->remote.fd);
 		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
 		lru.erase(&*it);
@@ -670,20 +671,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		assert(0==1);
 	}
 	//mylog(log_info,"[tcp]tcp_cb called \n");
-	fd64_t fd64=watcher->u64;
-	if(!fd_manager.exist(fd64))
-	{
-		mylog(log_warn,"[tcp]fd64 no longer exist\n");
-		return;
-	}
-
-
-	assert(fd_manager.exist_info(fd64));
-	fd_info_t & fd_info=fd_manager.get_info(fd64);
-
-	assert(fd_info.is_tcp==1);
-
-	tcp_pair_t &tcp_pair=*(fd_info.tcp_pair_p);
+	tcp_pair_t &tcp_pair=*(tcp_pair_t *)watcher->data;
 	assert(tcp_pair.owner!=0);
 	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
 
@@ -697,15 +685,15 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}*/
 
 	tcp_info_t *my_info_p,*other_info_p;
-	if(fd64==tcp_pair.local.fd64)
+	if(watcher==&tcp_pair.local.ev)
 	{
-		mylog(log_trace,"[tcp]fd64==tcp_pair.local.fd64\n");
+		mylog(log_trace,"[tcp]watcher==&tcp_pair.local.ev\n");
 		my_info_p=&tcp_pair.local;
 		other_info_p=&tcp_pair.remote;
 	}
-	else if(fd64==tcp_pair.remote.fd64)
+	else if(watcher==&tcp_pair.remote.ev)
 	{
-		mylog(log_trace,"[tcp]fd64==tcp_pair.remote.fd64\n");
+		mylog(log_trace,"[tcp]watcher==&tcp_pair.remote.ev\n");
 		my_info_p=&tcp_pair.remote;
 		other_info_p=&tcp_pair.local;
 	}
@@ -716,8 +704,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	tcp_info_t &my_info=*my_info_p;
 	tcp_info_t &other_info=*other_info_p;
 
-	int my_fd=fd_manager.to_fd(my_info.fd64);
-	int other_fd=fd_manager.to_fd(other_info.fd64);
+	int my_fd=my_info.fd;
+	int other_fd=other_info.fd;
 
 	assert(watcher->fd==my_fd);
 
@@ -1036,17 +1024,13 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair.local.connected=1;
 	tcp_pair.remote.connected=(ret==0);
 
-	tcp_pair.local.fd64=fd_manager.create(new_fd);
-	fd_manager.get_info(tcp_pair.local.fd64).tcp_pair_p= &tcp_pair;
-	fd_manager.get_info(tcp_pair.local.fd64).is_tcp=1;
+	tcp_pair.local.fd=new_fd;
 	//tcp_pair.local.ev.events=EV_READ;
-	tcp_pair.local.ev.u64=tcp_pair.local.fd64;
+	tcp_pair.local.ev.data=&tcp_pair;
 
-	tcp_pair.remote.fd64=fd_manager.create(new_remote_fd);
-	fd_manager.get_info(tcp_pair.remote.fd64).tcp_pair_p= &tcp_pair;
-	fd_manager.get_info(tcp_pair.remote.fd64).is_tcp=1;
+	tcp_pair.remote.fd=new_remote_fd;
 	//tcp_pair.remote.ev.events=EV_READ;
-	tcp_pair.remote.ev.u64=tcp_pair.remote.fd64;
+	tcp_pair.remote.ev.data=&tcp_pair;
 
 	conn_manager_tcp.lru.update(&(*it));
 	//tcp_pair.last_active_time=get_current_time();
@@ -1107,18 +1091,8 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		assert(0==1);
 	}
 	int ret;
-	fd64_t fd64=watcher->u64;
-	if(!fd_manager.exist(fd64))
-	{
-		mylog(log_warn,"[udp]fd64 no longer exist\n");
-		return;
-	}
-	assert(fd_manager.exist_info(fd64));
-	fd_info_t & fd_info=fd_manager.get_info(fd64);
-	assert(fd_info.is_tcp==0);
-
-	int udp_fd=fd_manager.to_fd(fd64);
-	udp_pair_t & udp_pair=*fd_manager.get_info(fd64).udp_pair_p;
+	udp_pair_t & udp_pair=*(udp_pair_t *)watcher->data;
+	int udp_fd=udp_pair.fd;
 	assert(udp_pair.owner!=0);
 	conn_manager_udp_t &conn_manager_udp=udp_pair.owner->udp_manager;
 	//assert(conn_manager.exist_fd(udp_fd));
@@ -1221,11 +1195,8 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 			return;
 		}
-		fd64_t fd64=fd_manager.create(new_udp_fd);
-		fd_manager.get_info(fd64);//just create the info
 
 		//struct epoll_event ev;
-		mylog(log_trace, "[udp]u64: %lld\n", fd64);
 		//ev.events = EPOLLIN;
 		//ev.data.u64 = fd64;
 
@@ -1241,7 +1212,8 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		udp_pair.owner=rule;
 		udp_pair.remote_index=remote_index;
 
-		udp_pair.ev.u64=fd64;
+		udp_pair.fd=new_udp_fd;
+		udp_pair.ev.data=&udp_pair;
 		ev_io_init (&udp_pair.ev, udp_cb, new_udp_fd, EV_READ);
 		ev_io_start(loop, &udp_pair.ev);
 
@@ -1249,12 +1221,10 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,(int)conn_manager_udp.udp_pair_list.size());
 
 		udp_pair.adress=tmp_addr;
-		udp_pair.fd64=fd64;
 		//udp_pair.last_active_time=get_current_time();
 		udp_pair.it=list_it;
 		udp_pair.local_listen_fd=local_listen_fd_udp;
 
-		fd_manager.get_info(fd64).udp_pair_p=&udp_pair;
 		conn_manager_udp.adress_to_info[tmp_addr]=&udp_pair;
 		it=conn_manager_udp.adress_to_info.find(tmp_addr);
 		//it=adress_to_info.
@@ -1263,7 +1233,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	assert(it!=conn_manager_udp.adress_to_info.end() );
 
 	udp_pair_t &udp_pair=*(it->second);
-	int udp_fd= fd_manager.to_fd(udp_pair.fd64);
+	int udp_fd=udp_pair.fd;
 	conn_manager_udp.lru.update(&udp_pair);
 	//udp_pair.last_active_time=get_current_time();
 

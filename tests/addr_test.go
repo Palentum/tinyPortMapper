@@ -104,7 +104,7 @@ func TestDomainRefresh(t *testing.T) {
 	}
 	setLast := hostsEntry(t, "127.0.0.2", name)
 	listen := loopback4(t)
-	forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
+	m := forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
 	start := time.Now()
 
 	old := dial(t, listen)
@@ -138,6 +138,40 @@ func TestDomainRefresh(t *testing.T) {
 	if got := udpReplyFrom(t, udp, "after"); got != "3" {
 		t.Fatalf("地址变化后旧 UDP 客户端仍发往后端 %q", got)
 	}
+	// T10：clear_remote_index 释放旧会话时要关掉它的 socket，此时 tinymapper 只持有 UDP 监听 socket 和新会话的 socket
+	if got := udpSockets(m.pid()); got != 2 {
+		t.Errorf("地址变化后 tinymapper 持有 %d 个 UDP socket，期望 2（监听 socket 与新会话）：被释放的旧会话没有关闭 socket", got)
+	}
+	// 被释放的连接对与会话的 fd 号随后被新 socket 复用：再建两条 TCP 连接各往返一次，旧会话的 watcher 若没有 stop，
+	// 新 socket 上的事件也会回调到已释放的会话（ASan 报 heap-use-after-free，release 构建里数据被它取走）
+	for i := 0; i < 2; i++ {
+		c := dial(t, listen)
+		if got := readLine(t, c); got != "3" {
+			t.Fatalf("地址变化后新连接连到后端 %q", got)
+		}
+		mustEcho(t, c, "reuse")
+	}
+	if got := udpReplyFrom(t, udp, "again"); got != "3" {
+		t.Fatalf("地址变化后 UDP 再次发往后端 %q", got)
+	}
+}
+
+// udpSockets 返回进程 pid 持有的 UDP socket 个数（/proc/net/udp、udp6 中 inode 属于该进程的行）
+func udpSockets(pid int) int {
+	inodes := socketInodes(pid)
+	n := 0
+	for _, name := range []string{"udp", "udp6"} {
+		data, err := os.ReadFile("/proc/net/" + name)
+		if err != nil {
+			continue
+		}
+		for _, line := range strings.Split(string(data), "\n")[1:] {
+			if f := strings.Fields(line); len(f) >= 10 && inodes[f[9]] {
+				n++
+			}
+		}
+	}
+	return n
 }
 
 // swrr 复刻 select_remote_index 的平滑加权轮询，返回前 n 次的选择
