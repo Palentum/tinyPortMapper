@@ -24,8 +24,8 @@ run_test() {
       echo "$j" | jq -c '{gbps: (.end.sum_received.bits_per_second/1e9), kpps: ((.end.sum_received.packets - .end.sum_received.lost_packets)/.end.sum_received.seconds/1e3), sent_kpps: (.end.sum_sent.packets/.end.sum_sent.seconds/1e3), lost_pct: .end.sum_received.lost_percent, err: .error}' ;;
     tcp_rr_64|tcp_rr_1000)
       on cli "$CLI $FWDBENCH rr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;
-    tcp_crr_32)
-      on cli "$CLI $FWDBENCH crr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n 32 -s 64 -d ${DUR}s -w 1s" ;;
+    tcp_crr_*)
+      on cli "$CLI $FWDBENCH crr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;
   esac
 }
 

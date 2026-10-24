@@ -15,6 +15,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func loopback4(t testing.TB) string { return hostPort("127.0.0.1", freePort(t)) }
@@ -972,6 +973,143 @@ func TestTCPNofileAccept(t *testing.T) {
 		defer c.Close()
 		return echo(c, []byte("z"))
 	})
+}
+
+// tcpState 用 TCP_INFO 读出 c 在本端的 TCP 状态（tcpi_state，取值同 /proc/net/tcp 的 st 列，如 5 为 FIN_WAIT2）
+func tcpState(c *net.TCPConn) (uint8, error) {
+	rc, err := c.SyscallConn()
+	if err != nil {
+		return 0, err
+	}
+	var info syscall.TCPInfo
+	var errno syscall.Errno
+	err = rc.Control(func(fd uintptr) {
+		n := uint32(unsafe.Sizeof(info))
+		_, _, errno = syscall.Syscall6(syscall.SYS_GETSOCKOPT, fd, syscall.IPPROTO_TCP, syscall.TCP_INFO,
+			uintptr(unsafe.Pointer(&info)), uintptr(unsafe.Pointer(&n)), 0)
+	})
+	if err == nil && errno != 0 {
+		err = errno
+	}
+	return info.State, err
+}
+
+// acceptRuns 按日志顺序把 new_connection 行分段：段内只夹着 tcp_accept_one 自己打的 connect returned 调试行，
+// 即同一次 tcp_accept_cb 回调接受的连接。返回各段长度，以及结束第一段的那一行
+func acceptRuns(log string) (runs []int, firstEnd string) {
+	in := false
+	for _, line := range strings.Split(log, "\n") {
+		switch {
+		case strings.Contains(line, "[tcp]new_connection"):
+			if !in {
+				runs = append(runs, 0)
+				in = true
+			}
+			runs[len(runs)-1]++
+		case strings.Contains(line, "[tcp]connect returned"):
+		case in:
+			if len(runs) == 1 {
+				firstEnd = line
+			}
+			in = false
+		}
+	}
+	return runs, firstEnd
+}
+
+// T3：一次 accept 回调连续接受到 backlog 取空（EAGAIN，不记日志），但最多 batch 个。暂停 tinymapper，让 n 个已半关闭
+// （FIN 已到）的连接排在 accept 队列里，恢复后第一次回调应恰好接受 batch 个。下一轮事件循环把这 batch 个客户端 socket 加进 epoll，
+// 它们已可读（EOF），排在仍然就绪的监听 socket 之后（水平触发的监听 socket 上一轮报告后被放回就绪链表尾部，新加入的就绪 fd
+// 排在它后面；libev 一次最多取 64 个事件，监听 socket 总在其中），libev 后进先出地回调，所以它们的 half-closed 日志
+// 先于第 batch+1 个 new_connection。第一段长 1：每次回调只 accept 一个（1ba64a2）；长 n：一直 accept 到 EAGAIN
+func TestTCPAcceptBatch(t *testing.T) {
+	t.Parallel()
+	// 每轮上限，与 main.cpp 的 max_accept_per_round 保持一致（4–64 均适用）
+	const batch = 8
+	// 大于两轮的上限，且不是 batch 的整数倍：最后一次回调接受余下 1 个后必然遇到 EAGAIN；远小于 listen backlog（512）
+	const n = 2*batch + 1
+	be := serveTCP(t, loopback4(t), echoHandler(""))
+	listen := loopback4(t)
+	// half-closed 与 connect returned 是 debug 级日志；只开 info 级时两次回调的 new_connection 会连成一段
+	m := startMapper(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--log-level", "5")
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
+	// kill 返回时目标进程未必已停下
+	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", m.pid()))
+		if err != nil {
+			return err
+		}
+		s := string(data)
+		if st := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[0]; st != "T" {
+			return fmt.Errorf("tinymapper 状态为 %s，SIGSTOP 尚未生效", st)
+		}
+		return nil
+	})
+	conns := make([]*net.TCPConn, n)
+	for i := range conns {
+		conns[i] = dial(t, listen)
+		if err := conns[i].CloseWrite(); err != nil {
+			t.Fatal(err)
+		}
+	}
+	// 客户端进入 FIN_WAIT2，即 accept 队列里对应的子 socket 已处理 FIN 并确认（CLOSE_WAIT），恢复后每个被 accept 的
+	// 客户端 socket 一加入 epoll 就可读。不读 /proc/net/tcp：与 TestTCPMaxConn 并行时它有 8 万行，建连期间读一遍实测 7.8 s
+	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+		for i, c := range conns {
+			st, err := tcpState(c)
+			if err != nil {
+				return err
+			}
+			if st != 5 { // TCP_FIN_WAIT2
+				return fmt.Errorf("第 %d 个客户端的 TCP 状态为 %d，期望 5（FIN_WAIT2）：tinymapper 一侧的子 socket 尚未确认 FIN", i+1, st)
+			}
+		}
+		return nil
+	})
+	if got := m.logLines("[tcp]new_connection"); got != 0 {
+		t.Fatalf("恢复前日志中已有 %d 行 new_connection：tinymapper 没有在建连前暂停", got)
+	}
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	// 上游读到转发的 FIN 后关闭写方向，两侧都 EOF 后连接对被释放，客户端读到 EOF
+	deadline := time.Now().Add(3 * ioTimeout)
+	for i, c := range conns {
+		c.SetReadDeadline(deadline)
+		if b, err := io.ReadAll(c); err != nil || len(b) != 0 {
+			t.Fatalf("第 %d 个连接读到 %d 字节（%v），期望 EOF：backlog 中的连接没有全部被接受并转发", i+1, len(b), err)
+		}
+	}
+	eventually(t, ioTimeout, 20*time.Millisecond, func() error {
+		if got := m.logLines("[tcp]closed connection"); got != n {
+			return fmt.Errorf("日志中有 %d 行 closed connection，期望 %d：连接对没有全部释放", got, n)
+		}
+		return nil
+	})
+	if got := m.logLines("[tcp]new_connection"); got != n {
+		t.Errorf("日志中有 %d 行 new_connection，期望 %d", got, n)
+	}
+	// 最后一次回调取空 backlog，以 EAGAIN 结束
+	if got := m.logLines("accept failed"); got != 0 {
+		t.Errorf("日志中有 %d 行 accept failed，期望 0：backlog 取空时的 EAGAIN 是一轮的正常结束，不应记日志", got)
+	}
+	data, err := os.ReadFile(m.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	runs, end := acceptRuns(string(data))
+	shown := fmt.Sprint(runs)
+	if len(runs) > 8 {
+		shown = fmt.Sprintf("%v…（共 %d 次）", runs[:8], len(runs))
+	}
+	t.Logf("各次 accept 回调接受的连接数：%s；结束第一段的日志：%s", shown, strings.TrimSpace(end))
+	first := 0
+	if len(runs) > 0 {
+		first = runs[0]
+	}
+	if first != batch {
+		t.Errorf("恢复后第一次 accept 回调连续接受了 %d 个连接，期望 %d（max_accept_per_round）：1 表示每次回调只 accept 一个；"+
+			"%d（全部）表示一次取空 backlog，没有每轮上限或上限不小于 %d；其他值表示每轮上限与本用例的 batch 不一致", first, batch, n, n)
+	}
 }
 
 // 空闲超过 conn_timeout_tcp（360 s）的连接被清理，期间保持活跃的连接不受影响

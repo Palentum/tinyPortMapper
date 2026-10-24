@@ -28,6 +28,7 @@ static app_config_t app_config;
 
 const int listen_fd_buf_size=2*1024*1024;
 static const u32_t dns_refresh_interval=30000;
+static const int max_accept_per_round=8;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -941,19 +942,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		myexit(-1);
 	}
 }
-void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
+//接受一个连接；返回 0 表示本轮到此为止（backlog 已空、accept 失败，或上游 connect 立即失败）
+static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 {
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
 	assert(rule!=0);
 	conn_manager_tcp_t &conn_manager_tcp=rule->tcp_manager;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
-	if((revents&EV_ERROR) !=0)
-	{
-		//e.g. re-adding the listen fd to epoll after a pause failed; libev has already stopped the watcher, clear_timer_cb restarts it
-		mylog(log_warn,"[tcp]accept watcher of listen fd %d got EV_ERROR\n",local_listen_fd_tcp);
-		return ;
-	}
 	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
 	{
 		mylog(log_error,"[tcp]EPOLLERR or EPOLLHUP from listen_fd events[idx].events=%x \n",events[idx].events);
@@ -969,14 +965,14 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	if(new_fd<0)
 	{
 		int err=errno;
+		if(err==EAGAIN||err==EWOULDBLOCK) return 0;//backlog 已取空，是一轮的正常结束，不记日志
 		mylog(log_warn,"[tcp]accept failed %d %s\n", new_fd,get_sock_error());
-		if(err!=EAGAIN&&err!=EWOULDBLOCK&&err!=EINTR&&err!=ECONNABORTED)
+		if(err!=EINTR&&err!=ECONNABORTED)
 		{
 			//EMFILE/ENFILE/ENOMEM or an LSM denial: the connection stays in the backlog and the level-triggered watcher would fire again at once; clear_timer_cb restarts it
 			ev_io_stop(loop,watcher);
 		}
-		//continue;
-		return ;
+		return 0;
 	}
 
 	address_t tmp_addr;
@@ -992,7 +988,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",ip_addr);
 		close(new_fd);
-		return ;
+		return 1;
 		//continue;
 	}
 	int remote_index=select_remote_index(*rule,tmp_addr);
@@ -1004,7 +1000,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",ip_addr,get_sock_error());
 		close(new_fd);
-		return ;
+		return 1;
 	}
 	set_buf_size(new_remote_fd,socket_buf_size);
 	if(!disable_tcp_nodelay)
@@ -1020,7 +1016,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",ip_addr,rule->remote_targets[remote_index].remote_str,get_sock_error());
 		close(new_remote_fd);
 		close(new_fd);
-		return ;
+		//EADDRNOTAVAIL 要先扫完整个临时端口范围（每次可达数 ms）：结束本轮，端口耗尽时回到每次迭代拒绝一个
+		return 0;
 	}
 	if(ret!=0)
 	{
@@ -1078,6 +1075,22 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	//建连中同时等读写，由 tcp_cb 判定建连结果
 	ev_io_init (&tcp_pair.remote.ev, tcp_cb, new_remote_fd, tcp_pair.remote.connected?EV_READ:EV_READ|EV_WRITE);
 	ev_io_start(loop, &tcp_pair.remote.ev);
+	return 1;
+}
+void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
+{
+	if((revents&EV_ERROR) !=0)
+	{
+		//e.g. re-adding the listen fd to epoll after a pause failed; libev has already stopped the watcher, clear_timer_cb restarts it
+		mylog(log_warn,"[tcp]accept watcher of listen fd %d got EV_ERROR\n",watcher->fd);
+		return ;
+	}
+	//一直 accept 到 backlog 为空，每轮循环最多 max_accept_per_round 个（D13）：其他 watcher 每轮只做一次收发，
+	//而每个新连接要做 accept、socket、connect 等十来次 syscall，上限决定建连突发时事件循环一轮停多久
+	for(int i=0;i<max_accept_per_round;i++)
+	{
+		if(!tcp_accept_one(loop,watcher)) break;
+	}
 }
 
 void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
