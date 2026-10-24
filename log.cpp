@@ -13,10 +13,13 @@ void log0(const char * file,const char * function,int line,int level,const char*
 	if(level>log_trace||level<0) return ;
 
 
-	//时间戳按秒缓存（不加锁：只有主线程写日志，DNS 线程不写）。
-	//用 localtime_r：glibc 的 localtime 每次调用都重新检查 /etc/localtime，每行多一次 stat
+	//时间戳和各级别的"颜色[时间][级别]"前缀按秒缓存（不加锁：只有主线程写日志，DNS 线程不写）。
+	//用 localtime_r：glibc 的 localtime 每次调用都重新检查 /etc/localtime，每行多一次 stat。
+	//enable_log_color 只在 process_arg 开头的预扫描里设置，之后不再改（在它之前只有 main() 里 ev_default_loop 失败会写一行，随即退出），不作为缓存的键
 	static time_t time_buf_sec=-1;
 	static char time_buf[100];
+	static char prefix_buf[log_end][sizeof(log_color[0])+sizeof(time_buf)+sizeof(log_text[0])+4];//放得下最长的前缀，snprintf 不会截断
+	static int prefix_len[log_end];//0：这一秒还没生成
 	time_t timer=time(NULL);
 	if(timer!=time_buf_sec)
 	{
@@ -24,14 +27,18 @@ void log0(const char * file,const char * function,int line,int level,const char*
 		localtime_r(&timer,&tm_info);
 		strftime(time_buf, 100, "%Y-%m-%d %H:%M:%S", &tm_info);
 		time_buf_sec=timer;
+		memset(prefix_len,0,sizeof(prefix_len));
 	}
 
 	//整行先拼进 line_buf，一次 fwrite
 	const char *color=enable_log_color?log_color[level]:"";
 	const char *reset=enable_log_color?RESET:"";
 	int reset_len=strlen(reset);
+	if(prefix_len[level]==0)
+		prefix_len[level]=snprintf(prefix_buf[level],sizeof(prefix_buf[level]),"%s[%s][%s]",color,time_buf,log_text[level]);
 	char line_buf[1024];
-	int len=snprintf(line_buf,sizeof(line_buf),"%s[%s][%s]",color,time_buf,log_text[level]);
+	int len=prefix_len[level];
+	memcpy(line_buf,prefix_buf[level],len);
 	if(enable_log_position)//file、function 是编译期常量（makefile 用相对路径，__FILE__ 如 main.cpp），合计不超过约 950 B 就不会写满 line_buf
 		len+=snprintf(line_buf+len,sizeof(line_buf)-len,"[%s,func:%s,line:%d]",file,function,line);
 
