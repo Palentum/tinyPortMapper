@@ -1153,6 +1153,180 @@ func TestTCPNofileAccept(t *testing.T) {
 	})
 }
 
+// EV_ERROR 在 fd_reify 里登记，要等本轮 epoll_wait 返回才回调：没有别的事件时最晚等一个 400 ms 的定时器周期，其余留给全量并行运行时的调度延迟
+const everrorWithin = 2 * time.Second
+
+// C9：新连接对的 fd 加进 epoll 失败（epoll_ctl ADD 返回 ENOSPC，如达到 fs.epoll.max_user_watches）时，libev 的 fd_kill 停掉该
+// watcher 并以 EV_ERROR 回调 tcp_cb，只释放这一对；修复前 assert(0==1) 使整个进程中止。启动后 tinymapper 有 n 个 fd，k 个正常
+// 连接对占 n..n+2k-1，之后的新连接对拿到 a=n+2k（客户端，accept 先于创建上游 socket）与 a+1（上游），释放后两个号空出，下一对又拿到它们。
+//   - both：fd ≥ a 的 ADD 都失败。同一次 fd_reify 里先后 fd_kill 两个 fd，libev 后进先出地先回调上游一侧，erase_closed 对客户端
+//     一侧的 ev_io_stop 清掉它还没回调的 EV_ERROR，所以每对恰好一行 warn；漏掉这一步则在已释放的连接对上再回调一次
+//   - upstream：只有上游（fd ≥ a+1）失败，客户端一侧正常加进 epoll
+//   - client：只有客户端一侧（fd a）失败，上游照常连上
+//
+// 偶数次尝试的客户端建连后立即发数据，奇数次不发：upstream 下数据已到时客户端一侧的 EV_READ 与上游的 EV_ERROR 同轮回调（前者后登记、
+// 先回调，数据留在缓冲里，客户端随后读到 EOF；客户端一侧也失败时数据没人读，close 发 RST）。每次失败的尝试：客户端在 everrorWithin
+// 内被关闭，warn 恰好多一行、fd 是失败一侧的 fd，fd 数回到 a，进程不退出（修复前在这里 assert 中止）。both、upstream 再做一次突发：
+// 暂停 tinymapper 时排进 burst 个已发数据的客户端，恢复后同一轮 accept、下一轮全部失败（upstream 下第一对的客户端一侧正常，它的
+// EV_READ 必与上游的 EV_ERROR 同轮），同样每对一行 warn。之后 k 个正常连接对仍能回显，每行 closed connection 的连接数与下一行
+// lru.size() 相同；最后关闭一个正常连接对，新连接复用它低于失败区间的 fd 号，正常转发
+func TestTCPEpollAddFail(t *testing.T) {
+	t.Parallel()
+	const k, attempts, burst = 3, 4, 3
+	for _, c := range []struct {
+		name   string
+		lo, hi int // 失败区间 [a+lo, a+hi)；hi 为 0 表示不设上限
+		burst  bool
+	}{
+		{"both", 0, 0, true},
+		{"upstream", 1, 0, true},
+		{"client", 0, 1, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			be := serveTCP(t, loopback4(t), echoHandler(""))
+			listen := loopback4(t)
+			wait := listenPoints("t", portOf(listen))
+			// closed connection 的下一行是 lru.size()（debug 级）
+			args := []string{"-l", listen, "-r", be.addr, "-t", "--log-level", "5"}
+			n := startupFDs(t, wait, args...)
+			a := n + 2*k
+			lo, hi := a+c.lo, 0
+			if c.hi != 0 {
+				hi = a + c.hi
+			}
+			m := startMapperEpollAddFail(t, lo, hi, wait, args...)
+			if got := fdCount(t, m.pid()); got != n {
+				t.Fatalf("注入故障后启动时有 %d 个 fd，探测时为 %d", got, n)
+			}
+			healthy := make([]*net.TCPConn, k)
+			for i := range healthy {
+				healthy[i] = dial(t, listen)
+				mustEcho(t, healthy[i], fmt.Sprintf("healthy-%d", i))
+			}
+			if got := fdCount(t, m.pid()); got != a {
+				t.Fatalf("%d 个正常连接对之后 tinymapper 有 %d 个 fd，期望 %d", k, got, a)
+			}
+
+			const warn = "closed bc of EV_ERROR (epoll_ctl failed),fd="
+			failed := map[string]bool{} // 失败连接对的客户端地址（日志中的 {ip:port}）
+			// expectFailed 等 conns 都被关闭，且 warn 行、closed connection 行累计 len(failed) 行，fd 数回到 a
+			expectFailed := func(what string, conns ...*net.TCPConn) {
+				t.Helper()
+				for i, cc := range conns {
+					failed["{"+cc.LocalAddr().String()+"}"] = true
+					if err := closedWithin(cc, everrorWithin); err != nil {
+						t.Fatalf("%s第 %d 个客户端：%v（EV_ERROR 没有释放连接对）", what, i+1, err)
+					}
+				}
+				eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+					m.fatalIfExited(t, "%s后", what)
+					if got := m.logLines("[WARN]", "[tcp]connection {", warn); got != len(failed) {
+						return fmt.Errorf("日志中有 %d 行 EV_ERROR 的 warn，期望 %d（每个失败的连接对一行）", got, len(failed))
+					}
+					if got := m.logLines("[tcp]closed connection"); got != len(failed) {
+						return fmt.Errorf("日志中有 %d 行 closed connection，期望 %d", got, len(failed))
+					}
+					if got := fdCount(t, m.pid()); got != a {
+						return fmt.Errorf("tinymapper 有 %d 个 fd，期望 %d：失败的连接对有 fd 没有关闭", got, a)
+					}
+					return nil
+				})
+			}
+			// 偶数次尝试建连后立即发数据，奇数次不发
+			for i := range attempts {
+				cc := dial(t, listen)
+				if i%2 == 0 {
+					if _, err := fmt.Fprintf(cc, "lost-%d\n", i); err != nil {
+						t.Fatal(err)
+					}
+				}
+				expectFailed(fmt.Sprintf("第 %d 次尝试", i+1), cc)
+			}
+			if c.burst {
+				m.pause(t)
+				conns := make([]*net.TCPConn, burst)
+				for i := range conns {
+					conns[i] = dial(t, listen)
+					if _, err := fmt.Fprintf(conns[i], "burst-%d\n", i); err != nil {
+						t.Fatal(err)
+					}
+				}
+				m.cmd.Process.Signal(syscall.SIGCONT)
+				expectFailed("突发中", conns...)
+			}
+			for i, hc := range healthy {
+				if err := echo(hc, []byte("still-alive")); err != nil {
+					t.Fatalf("第 %d 个正常连接对：%v", i+1, err)
+				}
+			}
+
+			data, err := os.ReadFile(m.logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			lines := strings.Split(string(data), "\n")
+			pairFDs := map[string][2]int{} // 客户端地址 → new_connection 行的 fd1、fd2
+			warned := map[string]int{}
+			for i, line := range lines {
+				if _, rest, ok := strings.Cut(line, "[tcp]new_connection from "); ok {
+					var fd [2]int
+					for j, key := range []string{",fd1=", ",fd2="} {
+						_, v, _ := strings.Cut(rest, key)
+						v, _, _ = strings.Cut(v, ",")
+						fd[j], _ = strconv.Atoi(v)
+					}
+					addr, _, _ := strings.Cut(rest, ",")
+					pairFDs[addr] = fd
+				}
+				if _, rest, ok := strings.Cut(line, "[tcp]connection "); ok && strings.Contains(rest, warn) {
+					addr, _, _ := strings.Cut(rest, " ")
+					_, v, _ := strings.Cut(rest, warn)
+					fd, _ := strconv.Atoi(strings.TrimSpace(v))
+					warned[addr]++
+					pf, ok := pairFDs[addr]
+					switch {
+					case !failed[addr]:
+						t.Errorf("正常连接对 %s 收到 EV_ERROR：%q", addr, line)
+					case !ok:
+						t.Errorf("%q 之前没有 %s 的 new_connection 行", line, addr)
+					case fd != pf[0] && fd != pf[1]:
+						t.Errorf("%q 的 fd 不是该连接对的 fd（fd1=%d，fd2=%d）", line, pf[0], pf[1])
+					case fd < lo || hi != 0 && fd >= hi:
+						t.Errorf("%q 的 fd 不在失败区间 [%d, %d) 内：报错的是正常加进 epoll 的一侧", line, lo, hi)
+					}
+				}
+				// 突发中的连接对逐个释放，剩余连接数从 k+burst-1 降到 k
+				if _, rest, ok := strings.Cut(line, "[tcp]closed connection"); ok {
+					_, v, _ := strings.Cut(rest, "tcp connections=")
+					next := ""
+					if i+1 < len(lines) {
+						next = lines[i+1]
+					}
+					if left, _ := strconv.Atoi(v); left < k || left >= k+burst || !strings.HasSuffix(next, "[tcp] lru.size()="+v) {
+						t.Errorf("%q 与下一行 %q：释放失败的连接对后应剩 %d–%d 个连接，lru.size() 相同", line, next, k, k+burst-1)
+					}
+				}
+			}
+			for addr := range failed {
+				if warned[addr] != 1 {
+					t.Errorf("失败的连接对 %s 有 %d 行 EV_ERROR 的 warn，期望 1", addr, warned[addr])
+				}
+			}
+
+			// 恢复：正常连接对释放后空出低于失败区间的 fd 号，新连接拿到它们
+			healthy[0].Close()
+			eventually(t, ioTimeout, 10*time.Millisecond, func() error {
+				if got := fdCount(t, m.pid()); got != a-2 {
+					return fmt.Errorf("关闭一个正常连接对后 tinymapper 有 %d 个 fd，期望 %d", got, a-2)
+				}
+				return nil
+			})
+			mustEcho(t, dial(t, listen), "recovered")
+		})
+	}
+}
+
 // tcpState 用 TCP_INFO 读出 c 在本端的 TCP 状态（tcpi_state，取值同 /proc/net/tcp 的 st 列，如 5 为 FIN_WAIT2）
 func tcpState(c *net.TCPConn) (uint8, error) {
 	rc, err := c.SyscallConn()

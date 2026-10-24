@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"net"
 	"os"
@@ -136,5 +137,134 @@ func TestUDPSessionTimeout(t *testing.T) {
 	roundTrip(late, "after")
 	if peers := be.peerList(); len(peers) != 4 {
 		t.Errorf("上游源地址 %v，期望 4 个：活跃客户端 1 个，空闲客户端清理前后各 1 个，后建的客户端 1 个", peers)
+	}
+}
+
+// C9：UDP 会话 socket 加进 epoll 失败时 udp_cb 收到 EV_ERROR，只释放这个会话；修复前 assert(0==1) 使整个进程中止。UDP 单规则
+// 启动后 tinymapper 有 n 个 fd，k 个正常会话占 n..n+k-1，让 fd ≥ n+k 的 ADD 失败：新客户端的会话 socket 拿到 n+k，首包已由
+// udp_accept_cb 发给后端，回包却没人读，客户端收不到；EV_ERROR 回调后会话被释放（inactive connection … cleared），fd 号空出。
+// 客户端的下一个包重新建会话、再次失败：每次尝试各一行 new connection、warn 与 cleared，warn 中是会话的 fd，cleared 的下一行
+// lru.size() 为 k，fd 数回到 n+k，进程不退出，k 个正常会话不受影响
+func TestUDPEpollAddFail(t *testing.T) {
+	t.Parallel()
+	const k, attempts = 3, 4
+	be := serveUDP(t, loopback4(t), "")
+	listen := loopback4(t)
+	wait := listenPoints("u", portOf(listen))
+	args := []string{"-l", listen, "-r", be.addr, "-u", "--log-level", "5"}
+	n := startupFDs(t, wait, args...)
+	m := startMapperEpollAddFail(t, n+k, 0, wait, args...)
+	healthy := make([]*net.UDPConn, k)
+	for i := range healthy {
+		healthy[i] = udpDial(t, "", listen)
+		udpReplyFrom(t, healthy[i], fmt.Sprintf("healthy-%d", i))
+	}
+	if got := fdCount(t, m.pid()); got != n+k {
+		t.Fatalf("%d 个正常会话之后 tinymapper 有 %d 个 fd，期望 %d", k, got, n+k)
+	}
+
+	bad := udpDial(t, "", listen)
+	addr := fmt.Sprintf("{%s}", bad.LocalAddr())
+	warn := fmt.Sprintf("[udp]connection %s closed bc of EV_ERROR (epoll_ctl failed),udp fd=%d", addr, n+k)
+	buf := make([]byte, 100)
+	for i := 1; i <= attempts; i++ {
+		if _, err := fmt.Fprintf(bad, "lost-%d", i); err != nil {
+			t.Fatal(err)
+		}
+		eventually(t, everrorWithin+logFlushWithin, 10*time.Millisecond, func() error {
+			m.fatalIfExited(t, "第 %d 次尝试后", i)
+			for _, s := range []string{"[udp]new connection from " + addr + ",udp fd=", warn, "[udp]inactive connection " + addr + " cleared"} {
+				if got := m.logLines(s); got != i {
+					return fmt.Errorf("日志中有 %d 行含 %q，期望 %d（每次尝试新建并释放一个会话）", got, s, i)
+				}
+			}
+			if got := fdCount(t, m.pid()); got != n+k {
+				return fmt.Errorf("tinymapper 有 %d 个 fd，期望 %d：失败的会话 fd 没有关闭", got, n+k)
+			}
+			return nil
+		})
+		// 会话已释放：后端的回包留在会话 socket 里，随 close 丢弃
+		bad.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+		if nr, err := bad.Read(buf); err == nil {
+			t.Errorf("第 %d 次尝试收到回包 %q：会话 socket 没有加进 epoll，回包不应被转发", i, buf[:nr])
+		}
+	}
+	for i, c := range healthy {
+		udpReplyFrom(t, c, fmt.Sprintf("still-alive-%d", i))
+	}
+
+	data, err := os.ReadFile(m.logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lines := strings.Split(string(data), "\n")
+	for i, line := range lines {
+		if strings.Contains(line, "[udp]inactive connection ") {
+			next := ""
+			if i+1 < len(lines) {
+				next = lines[i+1]
+			}
+			if !strings.HasSuffix(line, fmt.Sprintf("udp connections=%d", k)) || !strings.HasSuffix(next, fmt.Sprintf("[udp] lru.size()=%d", k)) {
+				t.Errorf("%q 与下一行 %q：释放失败的会话后应剩 %d 个会话，lru.size() 相同", line, next, k)
+			}
+		}
+	}
+}
+
+// C9：UDP 监听 socket 加进 epoll 失败（启动时的 ADD）时 udp_accept_cb 收到 EV_ERROR 后返回，clear_timer_cb 每 400 ms 重新 start
+// 这个 watcher（与 C6 的 TCP 监听相同），下一轮 fd_reify 再试 ADD。只让 UDP 监听 fd 的 ADD 失败：进程不退出（修复前 assert 中止），
+// 每个定时器周期一行 warn，2 s 内至少 2 行说明在重试（不重新 start 时只有启动后的 1 行），不超过 10 行、CPU 不超过 10% 说明没有
+// 空转；同一规则的 TCP 照常转发，UDP 包没有回应。这里 ADD 一直失败；ADD 恢复成功后 UDP 转发恢复，由 build/c9/ 中的 strace 脚本验证
+func TestUDPEpollAddFailListener(t *testing.T) {
+	t.Parallel()
+	remote := loopback4(t)
+	serveTCP(t, remote, echoHandler(""))
+	serveUDP(t, remote, "")
+	listen := loopback4(t)
+	wait := listenPoints("tu", portOf(listen))
+	args := []string{"-l", listen, "-r", remote, "-t", "-u"}
+	probe := startMapper(t, wait, args...)
+	fd := listenFD(probe.pid(), "udp", portOf(listen))
+	probe.stop(t, false)
+	if fd < 0 {
+		t.Fatal("探测时没有找到 UDP 监听 socket")
+	}
+	m := startMapperEpollAddFail(t, fd, fd+1, wait, args...)
+	if got := listenFD(m.pid(), "udp", portOf(listen)); got != fd {
+		t.Fatalf("注入故障后 UDP 监听 socket 的 fd 为 %d，探测时为 %d", got, fd)
+	}
+	warn := fmt.Sprintf("[udp]accept watcher of listen fd %d got EV_ERROR", fd)
+	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+		m.fatalIfExited(t, "UDP 监听 fd 加进 epoll 失败后")
+		if m.logLines("[WARN]", warn) == 0 {
+			return errors.New("日志中没有 UDP 监听 watcher 的 EV_ERROR warn：故障注入没有生效")
+		}
+		return nil
+	})
+	start := time.Now()
+	ticks0, warns0 := m.cpuTicks(t), m.logLines(warn)
+	mustEcho(t, dial(t, listen), "tcp")
+	u := udpDial(t, "", listen)
+	u.SetReadDeadline(time.Now().Add(300 * time.Millisecond))
+	if _, err := u.Write([]byte("udp")); err != nil {
+		t.Fatal(err)
+	}
+	if nr, err := u.Read(make([]byte, 100)); err == nil {
+		t.Errorf("UDP 监听 fd 不在 epoll 中，却收到 %d 字节回包", nr)
+	}
+	time.Sleep(2*time.Second - time.Since(start))
+	ticks, warns := m.cpuTicks(t)-ticks0, m.logLines(warn)-warns0
+	m.fatalIfExited(t, "UDP 监听 fd 的 ADD 失败 2 s 后")
+	t.Logf("UDP 监听 fd %d 的 ADD 一直失败的 2 s：CPU %.2f s，%d 行 warn", fd, float64(ticks)/100, warns)
+	// warn 由 400 ms 的定时器写出，两次读数各偏移不到一个周期，2 s 内约 5 行
+	if warns < 2 {
+		t.Errorf("2 s 内只有 %d 行 warn：clear_timer_cb 没有重新 start UDP 监听 watcher，ADD 不再重试", warns)
+	}
+	if warns > 10 {
+		t.Errorf("2 s 内有 %d 行 warn：UDP 监听 watcher 的重试在空转", warns)
+	}
+	// 时钟滴答为 1/100 s：2 s 内超过 20 个即 CPU 占用 >10%
+	if ticks > 20 {
+		t.Errorf("UDP 监听 fd 的 ADD 失败期间空转：2 s 内消耗 CPU %.2f s", float64(ticks)/100)
 	}
 }

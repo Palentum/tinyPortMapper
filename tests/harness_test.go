@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 var (
@@ -35,6 +36,9 @@ var (
 )
 
 func TestMain(m *testing.M) {
+	if spec := os.Getenv(epollAddFailEnv); spec != "" {
+		execEpollAddFail(spec)
+	}
 	mapperBin = os.Getenv("TINYMAPPER_BIN")
 	if mapperBin == "" || runtime.GOOS != "linux" {
 		fmt.Fprintln(os.Stderr, "需要在 Linux 上运行并设置 TINYMAPPER_BIN；在开发机上请用 tests/run.sh")
@@ -175,6 +179,127 @@ func runMapper(t testing.TB, cmd *exec.Cmd, logPath string, wait []listenPoint) 
 	return m
 }
 
+// C9 故障注入：startMapperEpollAddFail 以环境变量 epollAddFailEnv="lo hi" 重新执行测试二进制自身，TestMain 见到它就不跑测试，
+// 改由 execEpollAddFail 在当前线程上装 seccomp 过滤器后 exec tinymapper：fd 在 [lo, hi) 内的 epoll_ctl(EPOLL_CTL_ADD)
+// 返回 ENOSPC，其他系统调用不受影响。真实的 ENOSPC（达到 fs.epoll.max_user_watches）也是 ep_insert 在插入前返回，没有副作用，
+// 与过滤器直接返回错误一致；libev 的 epoll_modify 对 ENOENT/EEXIST/EPERM 以外的 errno 调 fd_kill（停掉该 fd 的 watcher 并
+// 喂 EV_ERROR）。经 MOD 的路径（MOD 得到 ENOENT 后重试 ADD）也落在 ADD 上。prctl 设的 no_new_privs 与 seccomp 过滤器都只作用于
+// 调用线程、并由 execve 保留，所以锁定线程后在同一线程上 exec；不需要特权，对静态链接的 tinymapper 同样有效。
+// 测试二进制的 fd 都带 O_CLOEXEC，exec 后 tinymapper 的 fd 布局与直接启动相同（0–2 之外从 3 起依次分配）
+const epollAddFailEnv = "TPM_EPOLL_ADD_FAIL"
+
+// seccomp_data.arch 的取值（AUDIT_ARCH_*）；其他架构上故障注入用例跳过
+var auditArch = map[string]uint32{"amd64": 0xc000003e, "arm64": 0xc00000b7}
+
+// epollAddFailFilter 返回 BPF 程序：arch 相符、nr 为 epoll_ctl、args[1] 为 EPOLL_CTL_ADD、lo ≤ args[2] < hi 时返回
+// SECCOMP_RET_ERRNO|ENOSPC，否则 SECCOMP_RET_ALLOW。参数按 32 位比较，取 u64 的低半部分（只支持小端架构）
+func epollAddFailFilter(arch, lo, hi uint32) []syscall.SockFilter {
+	const (
+		ld   = syscall.BPF_LD | syscall.BPF_W | syscall.BPF_ABS
+		jeq  = syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K
+		jge  = syscall.BPF_JMP | syscall.BPF_JGE | syscall.BPF_K
+		ret  = syscall.BPF_RET | syscall.BPF_K
+		nr   = 0      // struct seccomp_data：int nr; u32 arch; u64 instruction_pointer; u64 args[6]
+		arg1 = 16 + 8 // args[1]：op
+		arg2 = 16 + 16
+		add  = 1 // EPOLL_CTL_ADD
+	)
+	stmt := func(code uint16, k uint32) syscall.SockFilter { return syscall.SockFilter{Code: code, K: k} }
+	jump := func(code uint16, k uint32, jt, jf uint8) syscall.SockFilter {
+		return syscall.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
+	}
+	// 跳转偏移相对下一条指令；第 10 条为放行
+	return []syscall.SockFilter{
+		stmt(ld, 4),
+		jump(jeq, arch, 0, 8),
+		stmt(ld, nr),
+		jump(jeq, uint32(syscall.SYS_EPOLL_CTL), 0, 6),
+		stmt(ld, arg1),
+		jump(jeq, add, 0, 4),
+		stmt(ld, arg2),
+		jump(jge, lo, 0, 2),
+		jump(jge, hi, 1, 0),
+		stmt(ret, 0x00050000|uint32(syscall.ENOSPC)), // SECCOMP_RET_ERRNO
+		stmt(ret, 0x7fff0000),                        // SECCOMP_RET_ALLOW
+	}
+}
+
+// execEpollAddFail 在重新执行的测试二进制里运行：os.Args[1:] 是 tinymapper 的 argv。成功时不返回
+func execEpollAddFail(spec string) {
+	const (
+		prSetSeccomp      = 22
+		prSetNoNewPrivs   = 38
+		seccompModeFilter = 2
+	)
+	fail := func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, "故障注入启动失败："+format+"\n", a...)
+		os.Exit(127)
+	}
+	var lo, hi uint32
+	if _, err := fmt.Sscan(spec, &lo, &hi); err != nil || len(os.Args) < 2 {
+		fail("%s=%q 或参数 %q 无效", epollAddFailEnv, spec, os.Args)
+	}
+	arch, ok := auditArch[runtime.GOARCH]
+	if !ok {
+		fail("不支持 %s", runtime.GOARCH)
+	}
+	runtime.LockOSThread()
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0); e != 0 {
+		fail("prctl(PR_SET_NO_NEW_PRIVS)：%v", e)
+	}
+	filter := epollAddFailFilter(arch, lo, hi)
+	prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog))); e != 0 {
+		fail("prctl(PR_SET_SECCOMP)：%v", e)
+	}
+	err := syscall.Exec(os.Args[1], os.Args[1:], os.Environ())
+	fail("exec %s：%v", os.Args[1], err)
+}
+
+// startMapperEpollAddFail 同 startMapper，但 tinymapper 里 fd 在 [lo, hi) 内的 epoll_ctl(EPOLL_CTL_ADD) 都返回 ENOSPC；
+// hi 为 0 表示不设上限
+func startMapperEpollAddFail(t testing.TB, lo, hi int, wait []listenPoint, args ...string) *mapper {
+	t.Helper()
+	if _, ok := auditArch[runtime.GOARCH]; !ok {
+		t.Skipf("seccomp 故障注入只支持 amd64、arm64，当前为 %s", runtime.GOARCH)
+	}
+	if hi == 0 {
+		hi = 1<<32 - 1
+	}
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "tinymapper.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d", epollAddFailEnv, lo, hi))
+	cmd.Stdout, cmd.Stderr = f, f
+	return runMapper(t, cmd, logPath, wait)
+}
+
+// startupFDs 不注入故障启动一次 tinymapper，返回它就绪后打开的 fd 数 n，并要求这些 fd 恰好是 0..n-1：
+// 新 fd 总取最小的空闲号，之后的连接依次拿到 n、n+1……
+func startupFDs(t testing.TB, wait []listenPoint, args ...string) int {
+	t.Helper()
+	probe := startMapper(t, wait, args...)
+	defer probe.stop(t, false)
+	ents, err := os.ReadDir(fmt.Sprintf("/proc/%d/fd", probe.pid()))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, e := range ents {
+		if fd, _ := strconv.Atoi(e.Name()); fd >= len(ents) {
+			t.Fatalf("tinymapper 启动后的 fd 不连续：共 %d 个，却有 fd %d", len(ents), fd)
+		}
+	}
+	return len(ents)
+}
+
 // forward 用命令行启动单规则 tinymapper：proto 含 't' 启用 TCP、含 'u' 启用 UDP
 func forward(t testing.TB, proto, listen string, remotes ...string) *mapper {
 	t.Helper()
@@ -215,6 +340,16 @@ func (m *mapper) exited() bool {
 		return true
 	default:
 		return false
+	}
+}
+
+// fatalIfExited 在 tinymapper 已退出时让用例失败，stop 随后附上日志末尾（assert、ASan 报告等都写在这里）
+func (m *mapper) fatalIfExited(t testing.TB, format string, a ...any) {
+	t.Helper()
+	if m.exited() {
+		t.Errorf(format+" tinymapper 退出：%v", append(a, m.exitErr)...)
+		m.stop(t, true)
+		t.FailNow()
 	}
 }
 
@@ -419,8 +554,19 @@ func lookupSockBuf(t testing.TB, owner, proto int, name, local, remote string) s
 }
 
 // listening 读取 /proc/net/{tcp,tcp6,udp,udp6}，判断进程 pid 是否已在 port 上监听 proto。
-func listening(pid int, proto string, port int) bool {
-	inodes := socketInodes(pid)
+func listening(pid int, proto string, port int) bool { return listenFD(pid, proto, port) >= 0 }
+
+// listenFD 返回进程 pid 在 port 上监听 proto 的 socket 的 fd 号，没有则返回 -1
+func listenFD(pid int, proto string, port int) int {
+	fds := map[string]int{} // inode → fd
+	dir := fmt.Sprintf("/proc/%d/fd", pid)
+	ents, _ := os.ReadDir(dir)
+	for _, e := range ents {
+		link, _ := os.Readlink(filepath.Join(dir, e.Name()))
+		if inode, ok := strings.CutPrefix(link, "socket:["); ok {
+			fds[strings.TrimSuffix(inode, "]")], _ = strconv.Atoi(e.Name())
+		}
+	}
 	state := "0A" // TCP_LISTEN
 	if proto == "udp" {
 		state = "07" // 未连接的 UDP socket
@@ -432,17 +578,21 @@ func listening(pid int, proto string, port int) bool {
 		}
 		for _, line := range strings.Split(string(data), "\n")[1:] {
 			f := strings.Fields(line)
-			if len(f) < 10 || f[3] != state || !inodes[f[9]] {
+			if len(f) < 10 || f[3] != state {
+				continue
+			}
+			fd, ok := fds[f[9]]
+			if !ok {
 				continue
 			}
 			local := f[1]
 			p, err := strconv.ParseUint(local[strings.LastIndexByte(local, ':')+1:], 16, 16)
 			if err == nil && int(p) == port {
-				return true
+				return fd
 			}
 		}
 	}
-	return false
+	return -1
 }
 
 // portHolders 列出 /proc/net/{tcp,tcp6,udp,udp6} 中本地端口为 port 的 socket 及持有它的进程，用于诊断 EADDRINUSE：

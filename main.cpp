@@ -666,23 +666,19 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
-	if((revents&EV_ERROR) !=0)
-	{
-		assert(0==1);
-	}
 	//mylog(log_info,"[tcp]tcp_cb called \n");
 	tcp_pair_t &tcp_pair=*(tcp_pair_t *)watcher->data;
 	assert(tcp_pair.owner!=0);
 	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
 
-	/*if((revents&EV_ERROR) !=0)
+	//epoll_ctl 失败（如 ADD 超过 fs.epoll.max_user_watches 的 ENOSPC、ENOMEM）：libev 的 fd_kill 已停掉这个 watcher，只释放这一对（C9）。
+	//两侧都失败时，另一侧还没回调的 EV_ERROR 由 erase_closed 里的 ev_io_stop 清除
+	if((revents&EV_ERROR) !=0)
 	{
-		assert(0==1);
-		//mylog(log_info,"[tcp]connection closed, events[idx].events=%x \n",(u32_t) revents);
-		//ev_io_stop(loop, &tcp_pair.local.ev);
-		//ev_io_stop(loop, &tcp_pair.remote.ev);
+		mylog(log_warn,"[tcp]connection {%s} closed bc of EV_ERROR (epoll_ctl failed),fd=%d\n",tcp_pair.addr.get_str(),watcher->fd);
+		conn_manager_tcp.erase_closed(tcp_pair.it);
 		return;
-	}*/
+	}
 
 	tcp_info_t *my_info_p,*other_info_p;
 	if(watcher==&tcp_pair.local.ev)
@@ -1080,21 +1076,28 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 		{
 			ev_io_start(loop,&it->tcp_accept_watcher);
 		}
+		if(it->enable_udp&&!ev_is_active(&it->udp_accept_watcher))
+		{
+			ev_io_start(loop,&it->udp_accept_watcher);
+		}
 	}
 	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
-	if((revents&EV_ERROR) !=0)
-	{
-		assert(0==1);
-	}
 	int ret;
 	udp_pair_t & udp_pair=*(udp_pair_t *)watcher->data;
 	int udp_fd=udp_pair.fd;
 	assert(udp_pair.owner!=0);
 	conn_manager_udp_t &conn_manager_udp=udp_pair.owner->udp_manager;
+	//同 tcp_cb：libev 已停掉这个 watcher，只释放这个会话（C9）；客户端的下一个包会新建会话
+	if((revents&EV_ERROR) !=0)
+	{
+		mylog(log_warn,"[udp]connection {%s} closed bc of EV_ERROR (epoll_ctl failed),udp fd=%d\n",udp_pair.adress.get_str(),udp_fd);
+		conn_manager_udp.erase(udp_pair.it);
+		return;
+	}
 	//assert(conn_manager.exist_fd(udp_fd));
 	//if(!conn_manager.exist_fd(udp_fd)) continue;
 
@@ -1138,7 +1141,8 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	if((revents&EV_ERROR) !=0)
 	{
-		assert(0==1);
+		//同 tcp_accept_cb：如启动时 ADD 监听 fd 失败；libev 已停掉这个 watcher，clear_timer_cb 下一跳重新 start（C9）
+		mylog(log_warn,"[udp]accept watcher of listen fd %d got EV_ERROR\n",watcher->fd);
 		return ;
 	}
 	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
