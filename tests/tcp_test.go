@@ -828,6 +828,169 @@ func TestTCPNoDelay(t *testing.T) {
 	}
 }
 
+// setBuf 返回 setsockopt(SO_RCVBUF/SO_SNDBUF, v) 后内核保存的值，即 2×min(v, rmem_max/wmem_max)。
+// 容器的网络命名空间里没有 /proc/sys/net/core/{r,w}mem_max（只在初始命名空间注册），所以在测试自己的 socket 上设一次再读回
+func setBuf(t testing.TB, v int) sockBuf {
+	t.Helper()
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer syscall.Close(fd)
+	var got [2]int
+	for i, opt := range []int{syscall.SO_RCVBUF, syscall.SO_SNDBUF} {
+		if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, opt, v); err != nil {
+			t.Fatal(err)
+		}
+		if got[i], err = syscall.GetsockoptInt(fd, syscall.SOL_SOCKET, opt); err != nil {
+			t.Fatal(err)
+		}
+	}
+	return sockBuf{rcv: uint32(got[0]), snd: uint32(got[1])}
+}
+
+// tcpBufDefault 返回 /proc/sys/net/ipv4/<name>（tcp_rmem 或 tcp_wmem：最小值、初始值、最大值）中的初始值
+func tcpBufDefault(t testing.TB, name string) int {
+	t.Helper()
+	data, err := os.ReadFile("/proc/sys/net/ipv4/" + name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var lo, def int
+	if _, err := fmt.Sscan(string(data), &lo, &def); err != nil {
+		t.Fatalf("/proc/sys/net/ipv4/%s 内容异常：%q", name, data)
+	}
+	return def
+}
+
+// T4：TCP socket 默认不设 SO_RCVBUF/SO_SNDBUF，交给内核自动调优；修复前监听 socket 设 2 MiB、客户端与上游 socket 各设
+// 1 MiB（--sock-buf 的默认值），内核截到 rmem_max/wmem_max 后翻倍（默认 212992 → 425984）并加上锁位，自动调优随之关闭。
+// 锁位不导出到用户态，只能经 sock_diag 按值判断。客户端 socket（accept 得到）与上游 socket 分别在建连后、传数据前检查：
+//   - 发送缓冲：没锁 SNDBUF 的 socket 建连时由 tcp_sndbuf_expand 按 2×初始拥塞窗口×每段内存扩大，结果确定（loopback 上为 2626560）。
+//     用测试自己持有、从未设过缓冲的同类 socket 对照：客户端 socket（被动打开）对照后端 accept 的连接，上游 socket（主动打开）对照测试拨出的连接
+//   - 接收缓冲：建连时不变，为 tcp_rmem[1]（4.20 起；之前的 tcp_fixup_rcvbuf 建连时会扩大接收缓冲，a337531b942b 删除）。
+//     这个值看不出是否加锁（--sock-buf 64 设出的 131072 恰好相等），但传输后的增长也不能当判据：loopback 上 advmss 约 64 KiB，
+//     tcp_rcv_space_adjust 起始的 space 就是整个初始窗口（65535），tinymapper 每次只读 16 KiB，一个 RTT 估计内读走的数据
+//     只在一个窗口上下，增长与否取决于计时抖动（实测约 1/10 的连接回显 64 MiB 后仍为 131072）
+//   - --sock-buf N：两侧都是 2×min(N KiB, rmem_max/wmem_max)；双向各传 16 MiB 后不变
+//
+// 监听 socket 也要检查：accept 得到的 socket 复制监听 socket 的缓冲与锁位，SYN-ACK 的窗口、wscale 也按监听 socket 的缓冲计算，
+// 所以 --sock-buf 应设在监听 socket 上，而不是每次 accept 后再设（只看客户端 socket 分不出这两种做法）；没给 --sock-buf 时
+// 监听 socket 不能设，否则客户端 socket 继承到锁住的缓冲。
+//
+// UDP 不在 T4 范围内：监听 socket 固定 2 MiB，会话 socket 为 --sock-buf（默认 1 MiB）
+func TestTCPSockBuf(t *testing.T) {
+	t.Parallel()
+	rmemDefault, wmemDefault := tcpBufDefault(t, "tcp_rmem"), tcpBufDefault(t, "tcp_wmem")
+	t.Logf("tcp_rmem[1]=%d tcp_wmem[1]=%d；设 1 MiB 得到 %v", rmemDefault, wmemDefault, setBuf(t, 1<<20))
+	for _, mode := range []struct {
+		name  string
+		extra []string
+		kib   int // --sock-buf 的值，0 表示未给出
+	}{
+		{"default", nil, 0},
+		{"sock-buf", []string{"--sock-buf", "40"}, 40},
+	} {
+		t.Run("tcp/"+mode.name, func(t *testing.T) {
+			t.Parallel()
+			accepted := make(chan net.Conn, 1)
+			be := serveTCP(t, loopback4(t), func(c net.Conn) {
+				accepted <- c
+				streamHandler(c)
+			})
+			listen := loopback4(t)
+			m := startMapper(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-t"}, mode.extra...)...)
+			cl := dial(t, listen)
+			// 后端 accept 返回时，tinymapper 的上游 socket 已处理完 SYN-ACK（建连时的缓冲调整在回 ACK 之前）
+			var up net.Conn
+			select {
+			case up = <-accepted:
+			case <-time.After(ioTimeout):
+				t.Fatal("后端没有收到上游连接")
+			}
+			tcp := syscall.IPPROTO_TCP
+			socks := []struct{ name, local, remote, ref, refLocal, refRemote string }{
+				{"客户端 socket", listen, cl.LocalAddr().String(), "后端 accept 的连接", up.LocalAddr().String(), up.RemoteAddr().String()},
+				{"上游 socket", up.RemoteAddr().String(), up.LocalAddr().String(), "测试拨出的连接", cl.LocalAddr().String(), cl.RemoteAddr().String()},
+			}
+			var want sockBuf // --sock-buf 时监听 socket 与两侧的期望值
+			if mode.kib != 0 {
+				want = setBuf(t, mode.kib<<10)
+			}
+			// 监听 socket 不经过建连时的 tcp_init_buffer_space，没设过时为 tcp_rmem[1]、tcp_wmem[1]
+			lisWant := sockBuf{rcv: uint32(rmemDefault), snd: uint32(wmemDefault)}
+			if mode.kib != 0 {
+				lisWant = want
+			}
+			lis := lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0")
+			t.Logf("监听 socket：%v", lis)
+			if lis.rcv != lisWant.rcv || lis.snd != lisWant.snd {
+				t.Errorf("监听 socket rcvbuf=%d sndbuf=%d，期望 %d、%d", lis.rcv, lis.snd, lisWant.rcv, lisWant.snd)
+			}
+			for _, s := range socks {
+				got := lookupSockBuf(t, m.pid(), tcp, s.name, s.local, s.remote)
+				ref := lookupSockBuf(t, os.Getpid(), tcp, s.ref, s.refLocal, s.refRemote)
+				t.Logf("建连后 %s：%v；对照（%s）：%v", s.name, got, s.ref, ref)
+				if mode.kib != 0 {
+					if got.rcv != want.rcv || got.snd != want.snd {
+						t.Errorf("建连后 %s rcvbuf=%d sndbuf=%d，期望 %d、%d（2×min(%d KiB, rmem_max/wmem_max)）",
+							s.name, got.rcv, got.snd, want.rcv, want.snd, mode.kib)
+					}
+					continue
+				}
+				if got.rcv != uint32(rmemDefault) {
+					t.Errorf("建连后 %s rcvbuf=%d，期望 tcp_rmem[1]=%d：设过 SO_RCVBUF", s.name, got.rcv, rmemDefault)
+				}
+				if got.snd != ref.snd {
+					t.Errorf("建连后 %s sndbuf=%d，期望与%s相同（%d）：设过 SO_SNDBUF，建连时没有按拥塞窗口扩大发送缓冲",
+						s.name, got.snd, s.ref, ref.snd)
+				}
+			}
+			if mode.kib == 0 {
+				return
+			}
+			if err := transferOn(cl, 16<<20, 16<<20, 256<<10, 0); err != nil {
+				t.Fatalf("双向各传 16 MiB 失败：%v", err)
+			}
+			for _, s := range socks {
+				got := lookupSockBuf(t, m.pid(), tcp, s.name, s.local, s.remote)
+				t.Logf("双向各传 16 MiB 后 %s：%v", s.name, got)
+				if got.rcv != want.rcv || got.snd != want.snd {
+					t.Errorf("双向各传 16 MiB 后 %s rcvbuf=%d sndbuf=%d，期望仍为 %d、%d", s.name, got.rcv, got.snd, want.rcv, want.snd)
+				}
+			}
+		})
+		t.Run("udp/"+mode.name, func(t *testing.T) {
+			t.Parallel()
+			be := serveUDP(t, loopback4(t), "")
+			listen := loopback4(t)
+			m := startMapper(t, listenPoints("u", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-u"}, mode.extra...)...)
+			udpReplyFrom(t, udpDial(t, "", listen), "udp") // 首包创建会话 socket
+			peers := be.peerList()
+			if len(peers) != 1 {
+				t.Fatalf("后端看到的源地址为 %v，期望恰好 1 个（tinymapper 的会话 socket）", peers)
+			}
+			session := 1 << 20 // --sock-buf 的默认值
+			if mode.kib != 0 {
+				session = mode.kib << 10
+			}
+			for _, s := range []struct {
+				name, local, remote string
+				size                int
+			}{
+				{"UDP 监听 socket", listen, "0.0.0.0:0", 2 << 20},
+				{"UDP 会话 socket", peers[0], be.addr, session},
+			} {
+				got, want := lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, s.name, s.local, s.remote), setBuf(t, s.size)
+				t.Logf("%s：%v", s.name, got)
+				if got.rcv != want.rcv || got.snd != want.snd {
+					t.Errorf("%s rcvbuf=%d sndbuf=%d，期望 %d、%d（2×min(%d, rmem_max/wmem_max)）", s.name, got.rcv, got.snd, want.rcv, want.snd, s.size)
+				}
+			}
+		})
+	}
+}
+
 // 达到 max_conn_num（20000）后新连接被立即关闭，已有连接不受影响，释放后可再建立
 func TestTCPMaxConn(t *testing.T) {
 	t.Parallel()

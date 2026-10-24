@@ -9,9 +9,11 @@
 package tests
 
 import (
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
+	"net/netip"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -304,6 +306,107 @@ func socketInodes(pid int) map[string]bool {
 		}
 	}
 	return set
+}
+
+// sockBuf 是一个 socket 的 inode 与缓冲上限 sk_rcvbuf / sk_sndbuf（即 getsockopt SO_RCVBUF / SO_SNDBUF 的返回值）
+type sockBuf struct{ inode, rcv, snd uint32 }
+
+func (b sockBuf) String() string {
+	return fmt.Sprintf("rcvbuf=%d sndbuf=%d（inode %d）", b.rcv, b.snd, b.inode)
+}
+
+// sockDiag 用 NETLINK_SOCK_DIAG 按地址查找一个 IPv4 TCP/UDP socket，返回其 inode 与 INET_DIAG_SKMEMINFO 中的
+// SK_MEMINFO_RCVBUF / SK_MEMINFO_SNDBUF。请求不带 NLM_F_DUMP，内核只按四元组查一次哈希表（inet_diag_find_one_icsk、
+// udp_dump_one），不遍历全部 socket，不受并行用例里数万个 socket 的影响。local、remote 是该 socket 的本端与对端地址，
+// 监听 socket 的 remote 为 0.0.0.0:0
+func sockDiag(proto int, local, remote string) (sockBuf, error) {
+	const (
+		netlinkSockDiag   = 4  // NETLINK_SOCK_DIAG
+		sockDiagByFamily  = 20 // SOCK_DIAG_BY_FAMILY
+		inetDiagSkmeminfo = 7  // INET_DIAG_SKMEMINFO：u32 数组，下标 1 为 RCVBUF，3 为 SNDBUF
+		inetDiagMsgLen    = 72 // struct inet_diag_msg，idiag_inode 在偏移 68
+	)
+	src, err := netip.ParseAddrPort(local)
+	if err != nil {
+		return sockBuf{}, err
+	}
+	dst, err := netip.ParseAddrPort(remote)
+	if err != nil {
+		return sockBuf{}, err
+	}
+	if !src.Addr().Is4() || !dst.Addr().Is4() {
+		return sockBuf{}, fmt.Errorf("只支持 IPv4 地址：%s → %s", local, remote)
+	}
+	if proto == syscall.IPPROTO_UDP {
+		src, dst = dst, src // udp_dump_one 按收包方向查找，idiag_src 填对端（内核注释：src and dst are swapped for historical reasons）
+	}
+	ne := binary.NativeEndian
+	req := make([]byte, syscall.NLMSG_HDRLEN+56) // nlmsghdr + struct inet_diag_req_v2
+	ne.PutUint32(req[0:], uint32(len(req)))
+	ne.PutUint16(req[4:], sockDiagByFamily)
+	ne.PutUint16(req[6:], syscall.NLM_F_REQUEST)
+	r := req[syscall.NLMSG_HDRLEN:]
+	r[0], r[1], r[2] = syscall.AF_INET, byte(proto), 1<<(inetDiagSkmeminfo-1)
+	ne.PutUint32(r[4:], ^uint32(0)) // idiag_states：全部状态
+	binary.BigEndian.PutUint16(r[8:], src.Port())
+	binary.BigEndian.PutUint16(r[10:], dst.Port())
+	s4, d4 := src.Addr().As4(), dst.Addr().As4()
+	copy(r[12:], s4[:])
+	copy(r[28:], d4[:])
+	ne.PutUint64(r[48:], ^uint64(0)) // idiag_cookie 为 INET_DIAG_NOCOOKIE：不核对 cookie
+
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, netlinkSockDiag)
+	if err != nil {
+		return sockBuf{}, err
+	}
+	defer syscall.Close(fd)
+	tv := syscall.NsecToTimeval(int64(ioTimeout))
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+	if err := syscall.Sendto(fd, req, 0, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}); err != nil {
+		return sockBuf{}, err
+	}
+	buf := make([]byte, 1<<16)
+	n, _, err := syscall.Recvfrom(fd, buf, 0)
+	if err != nil {
+		return sockBuf{}, err
+	}
+	msgs, err := syscall.ParseNetlinkMessage(buf[:n])
+	if err != nil {
+		return sockBuf{}, err
+	}
+	for _, m := range msgs {
+		switch {
+		case m.Header.Type == syscall.NLMSG_ERROR && len(m.Data) >= 4:
+			return sockBuf{}, syscall.Errno(-int32(ne.Uint32(m.Data)))
+		case m.Header.Type == sockDiagByFamily && len(m.Data) >= inetDiagMsgLen:
+			inode := ne.Uint32(m.Data[68:])
+			for a := m.Data[inetDiagMsgLen:]; len(a) >= 4; {
+				l, typ := int(ne.Uint16(a)), ne.Uint16(a[2:])
+				if l < 4 || l > len(a) {
+					break
+				}
+				if typ == inetDiagSkmeminfo && l >= 4+16 {
+					return sockBuf{inode: inode, rcv: ne.Uint32(a[8:]), snd: ne.Uint32(a[16:])}, nil
+				}
+				a = a[min((l+3)&^3, len(a)):]
+			}
+			return sockBuf{}, errors.New("应答中没有 INET_DIAG_SKMEMINFO")
+		}
+	}
+	return sockBuf{}, errors.New("应答中没有 socket 信息")
+}
+
+// lookupSockBuf 用 sockDiag 查找 name 所指的 socket，并要求它是进程 owner 打开的
+func lookupSockBuf(t testing.TB, owner, proto int, name, local, remote string) sockBuf {
+	t.Helper()
+	b, err := sockDiag(proto, local, remote)
+	if err != nil {
+		t.Fatalf("sock_diag 查找%s（%s → %s）失败：%v", name, local, remote, err)
+	}
+	if !socketInodes(owner)[strconv.FormatUint(uint64(b.inode), 10)] {
+		t.Fatalf("查到的%s（%s → %s，inode %d）不是进程 %d 的 socket", name, local, remote, b.inode, owner)
+	}
+	return b
 }
 
 // listening 读取 /proc/net/{tcp,tcp6,udp,udp6}，判断进程 pid 是否已在 port 上监听 proto。

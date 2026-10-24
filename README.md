@@ -102,7 +102,9 @@ main options:
     remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s
 
 other options:
-    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024
+    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte
+                                          TCP: kernel autotuning if not set; setting it disables autotuning
+                                          and is capped by net.core.rmem_max/wmem_max; UDP sessions: default 1024
     --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)
     --log-level           <number>        0: never    1: fatal   2: error   3: warn
                                           4: info (default)      5: debug   6: trace
@@ -110,6 +112,8 @@ other options:
     --disable-color                       disable log color
     -h,--help                             print this help message
 ```
+
+TCP socket buffers are left to kernel autotuning by default. `--sock-buf` turns autotuning off for TCP, and the kernel caps the value at `net.core.rmem_max`/`wmem_max` (212992 before Linux 6.18), so setting it can lower throughput on high-latency paths. `--sock-buf 1024` restores the fixed TCP buffers of earlier versions.
 
 # Peformance Test
 ```

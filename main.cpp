@@ -21,6 +21,7 @@ typedef int i32_t;
 
 int disable_conn_clear=0;
 int disable_tcp_nodelay=0;
+int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
 
 int max_pending_packet=0;
 
@@ -978,8 +979,6 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	address_t tmp_addr;
 	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
 
-	set_buf_size(new_fd,socket_buf_size);
-
 	char ip_addr[max_addr_len];
 	tmp_addr.to_str(ip_addr);
 	//sprintf(ip_port_s,"%s:%d",my_ntoa(addr_tmp.sin_addr.s_addr),addr_tmp.sin_port);
@@ -1002,7 +1001,8 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		close(new_fd);
 		return 1;
 	}
-	set_buf_size(new_remote_fd,socket_buf_size);
+	if(sock_buf_explicit)
+		set_buf_size(new_remote_fd,socket_buf_size);
 	if(!disable_tcp_nodelay)
 	{
 		int yes=1;
@@ -1334,7 +1334,9 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 		//accept 得到的 socket 继承监听 socket 的 TCP_NODELAY，客户端一侧不必每个连接再设一次
 		if(!disable_tcp_nodelay)
 			setsockopt(rule.local_listen_fd_tcp, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-		set_buf_size(rule.local_listen_fd_tcp,listen_fd_buf_size);
+		//accept 得到的 socket 也继承缓冲大小和 SOCK_*BUF_LOCK 锁位：只有 --sock-buf 时在这里设一次
+		if(sock_buf_explicit)
+			set_buf_size(rule.local_listen_fd_tcp,socket_buf_size);
 
 		if(::bind(rule.local_listen_fd_tcp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 		{
@@ -1492,7 +1494,9 @@ void print_help()
 	printf("\n");
 
 	printf("other options:\n");
-	printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte, default: 1024\n");
+	printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte\n");
+	printf("                                          TCP: kernel autotuning if not set; setting it disables autotuning\n");
+	printf("                                          and is capped by net.core.rmem_max/wmem_max; UDP sessions: default 1024\n");
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
@@ -1649,6 +1653,7 @@ void process_arg(int argc, char *argv[])
 				if(10<=tmp&&tmp<=10*1024)
 				{
 					socket_buf_size=tmp*1024;
+					sock_buf_explicit=1;
 				}
 				else
 				{
