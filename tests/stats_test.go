@@ -249,6 +249,8 @@ func TestStatsTCPHalfClose(t *testing.T) {
 		if !m.aliveAfter(100 * time.Millisecond) {
 			t.Fatal("发送 SIGUSR1 后进程退出")
 		}
+		// 客户端一侧读到 EOF 后去掉了 READ，客户端一侧一直可读
+		m.expectIdleCPU(t, "客户端半关闭后（S3：EOF 去 READ）")
 	})
 	t.Run("upstream", func(t *testing.T) {
 		t.Parallel()
@@ -275,6 +277,9 @@ func TestStatsTCPHalfClose(t *testing.T) {
 		if !m.aliveAfter(100 * time.Millisecond) {
 			t.Fatal("发送 SIGUSR1 后进程退出")
 		}
+		// 上游的 FIN 常与建连完成同一次回调读到：那时 S1 的 stop/start 已把 fd 排进 fd_reify，S3 去掉的 READ 随之进 epoll，
+		// 所以这里不一定能抓到 S3 漏 stop/start（客户端子用例与 TestTCPHalfCloseConnecting 总能抓到），但仍检查这一状态不空转
+		m.expectIdleCPU(t, "上游半关闭后（S3：EOF 去 READ）")
 	})
 }
 

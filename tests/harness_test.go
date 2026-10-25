@@ -555,43 +555,88 @@ func lookupSockBuf(t testing.TB, owner, proto int, name, local, remote string) s
 	return b
 }
 
-// listening 读取 /proc/net/{tcp,tcp6,udp,udp6}，判断进程 pid 是否已在 port 上监听 proto。
+// sockDiagDump 用 NETLINK_SOCK_DIAG 的 dump 请求列出 family（AF_INET 或 AF_INET6）中协议为 proto、状态在 states 位图里的 socket，
+// 对每个 socket 调 f(本端端口, 对端端口, inode)。请求不带端口过滤，由调用方筛选（udp_dump 按主机字节序比较端口，与 TCP 不一致）。
+// 只请求 LISTEN 状态时 inet_diag_dump_icsk 只遍历监听哈希表、不碰已建立连接的 ehash；其他状态在内核里逐个比较状态，只回符合的
+// socket，不像 /proc/net/tcp 那样把每个连接都格式化成文本；UDP 只遍历 UDP 哈希表
+func sockDiagDump(family, proto int, states uint32, f func(sport, dport uint16, inode uint32)) error {
+	const (
+		netlinkSockDiag  = 4  // NETLINK_SOCK_DIAG
+		sockDiagByFamily = 20 // SOCK_DIAG_BY_FAMILY
+		inetDiagMsgLen   = 72 // struct inet_diag_msg：idiag_sport、idiag_dport 在偏移 4、6（网络字节序），idiag_inode 在偏移 68
+	)
+	ne := binary.NativeEndian
+	req := make([]byte, syscall.NLMSG_HDRLEN+56) // nlmsghdr + struct inet_diag_req_v2
+	ne.PutUint32(req[0:], uint32(len(req)))
+	ne.PutUint16(req[4:], sockDiagByFamily)
+	ne.PutUint16(req[6:], syscall.NLM_F_REQUEST|syscall.NLM_F_DUMP)
+	r := req[syscall.NLMSG_HDRLEN:]
+	r[0], r[1] = byte(family), byte(proto)
+	ne.PutUint32(r[4:], states)
+
+	fd, err := syscall.Socket(syscall.AF_NETLINK, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, netlinkSockDiag)
+	if err != nil {
+		return err
+	}
+	defer syscall.Close(fd)
+	tv := syscall.NsecToTimeval(int64(ioTimeout))
+	syscall.SetsockoptTimeval(fd, syscall.SOL_SOCKET, syscall.SO_RCVTIMEO, &tv)
+	if err := syscall.Sendto(fd, req, 0, &syscall.SockaddrNetlink{Family: syscall.AF_NETLINK}); err != nil {
+		return err
+	}
+	buf := make([]byte, 1<<16)
+	for {
+		n, _, err := syscall.Recvfrom(fd, buf, 0)
+		if err != nil {
+			return err
+		}
+		msgs, err := syscall.ParseNetlinkMessage(buf[:n])
+		if err != nil {
+			return err
+		}
+		for _, m := range msgs {
+			switch {
+			case m.Header.Type == syscall.NLMSG_DONE:
+				return nil
+			case m.Header.Type == syscall.NLMSG_ERROR && len(m.Data) >= 4:
+				return syscall.Errno(-int32(ne.Uint32(m.Data)))
+			case m.Header.Type == sockDiagByFamily && len(m.Data) >= inetDiagMsgLen:
+				f(binary.BigEndian.Uint16(m.Data[4:]), binary.BigEndian.Uint16(m.Data[6:]), ne.Uint32(m.Data[68:]))
+			}
+		}
+	}
+}
+
+// listening 判断进程 pid 是否已在 port 上监听 proto（IPv4 或 IPv6）。
 func listening(pid int, proto string, port int) bool { return listenFD(pid, proto, port) >= 0 }
 
-// listenFD 返回进程 pid 在 port 上监听 proto 的 socket 的 fd 号，没有则返回 -1
+// listenFD 返回进程 pid 在 port 上监听 proto 的 socket 的 fd 号，没有则返回 -1：TCP 为 LISTEN 状态，UDP 为未连接的 socket
+// （TCP_CLOSE，即 /proc/net/udp 的 st=07），IPv4、IPv6 都算。原来每次整表读 /proc/net/{tcp,tcp6}：与 TestTCPMaxConn 并行时
+// 两张表各有约 8 万行，读一遍要数秒，waitListen 的 10 s 里只试得了几次，就绪超时（两份套件并行时 27 次全量里 10 次）。
+// 改用 sockDiagDump 只列监听 socket，耗时与系统里已建立的连接数无关
 func listenFD(pid int, proto string, port int) int {
-	fds := map[string]int{} // inode → fd
+	ipproto, states := syscall.IPPROTO_TCP, uint32(1)<<10 // TCP_LISTEN
+	if proto == "udp" {
+		ipproto, states = syscall.IPPROTO_UDP, uint32(1)<<7 // TCP_CLOSE
+	}
+	inodes := map[string]bool{}
+	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
+		sockDiagDump(family, ipproto, states, func(p, _ uint16, inode uint32) {
+			if int(p) == port {
+				inodes[strconv.FormatUint(uint64(inode), 10)] = true
+			}
+		})
+	}
+	if len(inodes) == 0 {
+		return -1
+	}
 	dir := fmt.Sprintf("/proc/%d/fd", pid)
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		link, _ := os.Readlink(filepath.Join(dir, e.Name()))
-		if inode, ok := strings.CutPrefix(link, "socket:["); ok {
-			fds[strings.TrimSuffix(inode, "]")], _ = strconv.Atoi(e.Name())
-		}
-	}
-	state := "0A" // TCP_LISTEN
-	if proto == "udp" {
-		state = "07" // 未连接的 UDP socket
-	}
-	for _, name := range []string{proto, proto + "6"} {
-		data, err := os.ReadFile("/proc/net/" + name)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n")[1:] {
-			f := strings.Fields(line)
-			if len(f) < 10 || f[3] != state {
-				continue
-			}
-			fd, ok := fds[f[9]]
-			if !ok {
-				continue
-			}
-			local := f[1]
-			p, err := strconv.ParseUint(local[strings.LastIndexByte(local, ':')+1:], 16, 16)
-			if err == nil && int(p) == port {
-				return fd
-			}
+		if inode, ok := strings.CutPrefix(link, "socket:["); ok && inodes[strings.TrimSuffix(inode, "]")] {
+			fd, _ := strconv.Atoi(e.Name())
+			return fd
 		}
 	}
 	return -1
@@ -649,6 +694,30 @@ func (m *mapper) cpuTicks(t testing.TB) int64 {
 	utime, _ := strconv.ParseInt(f[11], 10, 64)
 	stime, _ := strconv.ParseInt(f[12], 10, 64)
 	return utime + stime
+}
+
+// expectIdleCPU 的采样窗口与上限：时钟滴答为 1/100 s，1 s 内超过 10 个即 CPU 占用 >10%。状态静止时正确实现接近 0，
+// 负载下全量运行实测最多 0.01 s；空转的变异在 4 份全量套件并行时实测 0.24–1.00 s（空转只分到 CPU 的一部分）
+const (
+	idleCPUWindow   = time.Second
+	idleCPUMaxTicks = 10
+)
+
+// expectIdleCPU 在 tinymapper 无事可做的状态下采样它 idleCPUWindow 内消耗的 CPU 时间，超过上限即失败。量的是进程自己的
+// utime+stime：并行负载只会拉长墙钟，不会把空闲进程的 CPU 时间推高。用于 tcp_cb 去掉某个事件位之后的状态：去位时漏掉
+// ev_io_stop/ev_io_start，w->events 已去位，epoll 里的掩码却还留着这一位，fd 一直就绪，libev 的 fd_event 把事件过滤掉，
+// 功能上看不出来，唯一的后果是事件循环空转（build/t13/tests-report.md §4）。state 说明当前状态与对应的切换点
+func (m *mapper) expectIdleCPU(t testing.TB, state string) {
+	t.Helper()
+	m.fatalIfExited(t, "%s：", state)
+	ticks0 := m.cpuTicks(t)
+	time.Sleep(idleCPUWindow)
+	ticks := m.cpuTicks(t) - ticks0
+	t.Logf("%s：%v 内 tinymapper 消耗 CPU %.2f s", state, idleCPUWindow, float64(ticks)/100)
+	if ticks > idleCPUMaxTicks {
+		t.Errorf("%s：tinymapper 空转，%v 内消耗 CPU %.2f s（上限 %.2f s）：去掉的事件位没有经 ev_io_stop/ev_io_start 更新到 epoll",
+			state, idleCPUWindow, float64(ticks)/100, float64(idleCPUMaxTicks)/100)
+	}
 }
 
 // syscw 返回进程累计的 write 类系统调用次数（/proc/<pid>/io 的 syscw：write、writev、pwrite 等，不含 send、sendto）

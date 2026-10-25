@@ -209,21 +209,27 @@ func TestTCPHalfCloseDrain(t *testing.T) {
 	const size, chunk = 32 << 20, 64 << 10
 	seed := streamSeed(1, true)
 	got := make(chan []byte, 1)
+	hold := make(chan struct{}) // 上游读完请求后先不关闭，连接对保持到排空后的 CPU 采样之后
 	be := serveTCP(t, loopback4(t), func(c net.Conn) {
 		if _, err := writeStream(c, size, chunk, seed); err != nil {
 			return
 		}
 		req, _ := io.ReadAll(c)
 		got <- req
+		<-hold
 	})
+	releaseHold := sync.OnceFunc(func() { close(hold) })
+	t.Cleanup(releaseHold) // 在 serveTCP 之后注册，清理时先于它执行
 	listen := loopback4(t)
-	forward(t, "t", listen, be.addr)
+	m := forward(t, "t", listen, be.addr)
 	c := dial(t, listen)
 	req := []byte("drain-request")
 	if _, err := c.Write(req); err != nil {
 		t.Fatal(err)
 	}
 	time.Sleep(200 * time.Millisecond) // 不读取，让下行各级缓冲区积满
+	// 下行背压：tinymapper 持有发不完的块、停读上游一侧，上游一侧的接收队列一直非空
+	m.expectIdleCPU(t, "下行背压中（S5：停本侧 READ）")
 	if err := c.CloseWrite(); err != nil {
 		t.Fatal(err)
 	}
@@ -232,6 +238,9 @@ func TestTCPHalfCloseDrain(t *testing.T) {
 	if err != nil {
 		t.Fatalf("关闭写方向后下行数据不完整：%v", err)
 	}
+	// 下行已排空、上游还没关闭：客户端一侧的 watcher 去掉了 WRITE，客户端一侧一直可写
+	m.expectIdleCPU(t, "下行排空后（S6：去 WRITE）")
+	releaseHold()
 	if n, err := io.Copy(io.Discard, c); n != 0 || err != nil {
 		t.Fatalf("下行 %d 字节之后期望 EOF，却又收到 %d 字节（%v）", size, n, err)
 	}
@@ -262,6 +271,11 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	}
 	file := os.NewFile(uintptr(fd), "listen-full")
 	defer file.Close()
+	// 同 net.Listen（portFree 用它探测）设 SO_REUSEADDR：否则该端口上还有 TIME_WAIT 连接（如同一网络命名空间里上一个测试进程
+	// 用过这个端口）时 portFree 认为空闲，这里的 bind 却返回 EADDRINUSE
+	if err := syscall.SetsockoptInt(fd, syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1); err != nil {
+		t.Fatal(err)
+	}
 	if err := syscall.Bind(fd, &syscall.SockaddrInet4{Port: port, Addr: [4]byte{127, 0, 0, 1}}); err != nil {
 		t.Fatalf("bind 127.0.0.1:%d 失败：%v；该端口上的 socket：%s", port, err, portHolders(port))
 	}
@@ -276,24 +290,17 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	for range fillers {
 		dial(t, ln.Addr().String())
 	}
-	// LISTEN 状态的 socket 在 /proc/net/tcp 中的 rx_queue 即当前 accept 队列长度
+	// LISTEN 状态的 socket 的 idiag_rqueue 即当前 accept 队列长度。用 sock_diag 精确查询，不整表读 /proc/net/tcp
+	//（与 TestTCPMaxConn 并行时读一遍要数秒）。端口由本进程独占，不再核对 inode（测试进程的 fd 表可能有数万项）
 	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
-		data, err := os.ReadFile("/proc/net/tcp")
+		q, err := sockDiag(syscall.IPPROTO_TCP, ln.Addr().String(), "0.0.0.0:0")
 		if err != nil {
-			return err
+			return fmt.Errorf("sock_diag 查找监听 socket %s：%w", ln.Addr(), err)
 		}
-		for _, line := range strings.Split(string(data), "\n")[1:] {
-			f := strings.Fields(line)
-			if len(f) < 5 || f[3] != "0A" || !strings.HasSuffix(f[1], fmt.Sprintf(":%04X", port)) {
-				continue
-			}
-			_, rx, _ := strings.Cut(f[4], ":")
-			if n, _ := strconv.ParseUint(rx, 16, 32); n < fillers {
-				return fmt.Errorf("accept 队列长度为 %d，期望 %d", n, fillers)
-			}
-			return nil
+		if q.rqueue < fillers {
+			return fmt.Errorf("accept 队列长度为 %d，期望 %d", q.rqueue, fillers)
 		}
-		return fmt.Errorf("/proc/net/tcp 中没有端口 %d 的监听", port)
+		return nil
 	})
 	return ln, func() {
 		for range fillers {
@@ -306,23 +313,21 @@ func listenFull(t testing.TB) (ln net.Listener, release func()) {
 	}
 }
 
-// synSentTo 返回 /proc/net/tcp 中处于 SYN_SENT、目的端口为 port 的 socket 数（按 inode 去重）。
-// 建连失败（收到 RST）的 socket 已从哈希表摘除，不再列出。
-// /proc/net/tcp 不是一致快照：每次 read(2) 最多一页，下一次按（桶号，桶内偏移）续读（tcp_seek_last_pos），
-// 两次 read 之间同一桶里的插入或删除会让一行重复出现或被跳过。TestTCPMaxConn 并行运行时实测同一 socket 被列出 4 次，
-// 所以这里去重，调用方再用两次扫描排除漏行
+// synSentTo 返回处于 SYN_SENT、目的端口为 port 的 IPv4 socket 数（按 inode 去重）。建连失败（收到 RST）的 socket 已从哈希表摘除，
+// 不再列出。用 sockDiagDump 只列 SYN_SENT 状态的 socket：原来整表读 /proc/net/tcp，与 TestTCPMaxConn 并行时读一遍要数秒，
+// TestTCPConnectingRefusedData 的 15 s 里只试得了一两次而超时。/proc/net/tcp 也不是一致快照：每次 read(2) 最多一页，下一次按
+// （桶号，桶内偏移）续读（tcp_seek_last_pos），两次 read 之间同一桶里的插入或删除会让一行重复出现或被跳过（TestTCPMaxConn 并行时
+// 实测同一 socket 被列出 4 次），所以调用方扫两次；dump 只回几个 socket，一次就能取完，两次扫描对它无害
 func synSentTo(t testing.TB, port int) int {
 	t.Helper()
-	data, err := os.ReadFile("/proc/net/tcp")
-	if err != nil {
-		t.Fatal(err)
-	}
-	inodes := map[string]bool{}
-	for _, line := range strings.Split(string(data), "\n")[1:] {
-		f := strings.Fields(line)
-		if len(f) >= 10 && f[3] == "02" && strings.HasSuffix(f[2], fmt.Sprintf(":%04X", port)) {
-			inodes[f[9]] = true
+	inodes := map[uint32]bool{}
+	err := sockDiagDump(syscall.AF_INET, syscall.IPPROTO_TCP, 1<<2, func(_, dport uint16, inode uint32) { // TCP_SYN_SENT
+		if int(dport) == port {
+			inodes[inode] = true
 		}
+	})
+	if err != nil {
+		t.Fatalf("sock_diag 列出 SYN_SENT socket 失败：%v", err)
 	}
 	return len(inodes)
 }
@@ -332,7 +337,7 @@ func TestTCPHalfCloseConnecting(t *testing.T) {
 	t.Parallel()
 	ln, release := listenFull(t)
 	listen := loopback4(t)
-	forward(t, "t", listen, ln.Addr().String())
+	m := forward(t, "t", listen, ln.Addr().String())
 	c := dial(t, listen)
 	if err := c.CloseWrite(); err != nil {
 		t.Fatal(err)
@@ -341,6 +346,7 @@ func TestTCPHalfCloseConnecting(t *testing.T) {
 	time.Sleep(300 * time.Millisecond) // 转发的 SYN 已被丢弃，release 后由约 1 s 时的重传建立连接
 	release()
 	const resp = "late-response"
+	finSeen, respond := make(chan struct{}), make(chan struct{})
 	go func() {
 		be, err := ln.Accept()
 		if err != nil {
@@ -350,7 +356,18 @@ func TestTCPHalfCloseConnecting(t *testing.T) {
 		be.SetDeadline(time.Now().Add(ioTimeout))
 		// 读到延迟转发的 FIN（0 字节即 EOF）才响应
 		if req, err := io.ReadAll(be); err == nil && len(req) == 0 {
+			close(finSeen)
+			<-respond
 			io.WriteString(be, resp)
+		}
+	}()
+	func() {
+		defer close(respond)
+		select {
+		case <-finSeen:
+			// 推迟的 shutdown 已发出，上游一侧的 watcher 去掉了 WRITE；上游先不响应，连接对静止
+			m.expectIdleCPU(t, "推迟的 shutdown 发出后（S2：去 WRITE）")
+		case <-time.After(ioTimeout): // 下面读响应时报告
 		}
 	}()
 	c.SetReadDeadline(time.Now().Add(ioTimeout))
@@ -644,9 +661,10 @@ func TestTCPUpstreamUnreachable(t *testing.T) {
 				t.Fatal("上游不可达后 tinymapper 退出")
 			}
 			expectConnectFailed(t, m, 3, remote, syscall.ENETUNREACH)
-			// O1：connect 立即失败时不建连接对，不计入 total，也没有从对象池取过对象
-			if d := m.statsAfterSignal(t); d.tcp[1].total != 0 || d.pool.tcpSlabs != 0 {
-				t.Errorf("统计 total=%d tcp_pairs slabs=%d，期望 0/0", d.tcp[1].total, d.pool.tcpSlabs)
+			// O1：connect 立即失败时不建连接对，不计入 total；连接对象在 socket()/connect() 之前就从池里取出（F2），失败后放回池里，
+			// 所以可能已分配过 slab，但不能有对象还在用
+			if d := m.statsAfterSignal(t); d.tcp[1].total != 0 || d.pool.tcpSlabs*objPoolSlabObjs-d.pool.tcpFree != 0 {
+				t.Errorf("统计 total=%d tcp_pairs slabs=%d free=%d，期望 total=0、在用对象 0 个", d.tcp[1].total, d.pool.tcpSlabs, d.pool.tcpFree)
 			}
 		})
 	}
@@ -1473,8 +1491,9 @@ func TestTCPAcceptBatch(t *testing.T) {
 // clear_pending：本轮 epoll_wait 已登记、还没回调的事件换成空 watcher，所以同一对的另一个 watcher 不会再回调到已释放的
 // 对象上，fd 号随后被本轮后面 accept 的连接复用也安全。本用例让这两件事在恢复后的第一轮里发生：
 //   - 建 nOld 个连接对，各往返一次（两侧 watcher 都只等读），然后暂停 tinymapper；
-//   - 先排进 nNew 个新连接（各已写入一行独有的数据），监听 socket 先进入 epoll 就绪链表；
+//   - 先排进 nNew 个新连接（各已写入一行独有的数据），等 accept 队列达到 nNew，监听 socket 先进入 epoll 就绪链表；
 //   - 再让每个旧连接对的两个 fd 都可读：偶数对上游先写数据、客户端再发 RST；奇数对客户端先写数据、上游再发 RST。
+//     恢复前用 sock_diag 确认 RST 与数据都已投递到 tinymapper 的 socket。
 //     libev 按 epoll 返回的顺序登记、后进先出地回调，所以每对后变为可读的一侧（收到 RST 的那侧）先回调，recv 得到
 //     ECONNRESET 后 erase_closed 释放连接对，这时另一侧的事件还在 pending 里。漏掉哪一侧的 ev_io_stop，偶数对或奇数对
 //     就会在已释放的对象上回调：release 构建通常对已关闭的 fd 收发得到 EBADF 或堆损坏中止，ASan 构建报 heap-use-after-free；
@@ -1544,6 +1563,19 @@ func TestTCPFdReuseBurst(t *testing.T) {
 		}
 	}
 
+	// 每对旧连接在 tinymapper 一侧的两个 socket（[0] 客户端侧、[1] 上游侧）的本端、对端地址与 inode，用于确认 RST 与数据已投递
+	type tmSock struct {
+		local, remote string
+		inode         uint32
+	}
+	tcp := syscall.IPPROTO_TCP
+	tmSocks := make([][2]tmSock, nOld)
+	for i := range clients {
+		for k, a := range [2][2]string{{listen, clients[i].LocalAddr().String()}, {backs[i].RemoteAddr().String(), be.addr}} {
+			tmSocks[i][k] = tmSock{a[0], a[1], lookupSockBuf(t, m.pid(), tcp, "旧连接对的 socket", a[0], a[1]).inode}
+		}
+	}
+
 	m.pause(t)
 	news := make([]*net.TCPConn, nNew)
 	payloads := make([]string, nNew)
@@ -1554,6 +1586,14 @@ func TestTCPFdReuseBurst(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
+	// 新连接全部排进 accept 队列后再让旧连接对可读：监听 socket 一定排在 epoll 就绪链表里旧连接对的 fd 之前，
+	// 不依赖“dial 返回 = 子 socket 已入队”（客户端发出最后的 ACK 即返回，服务端可能稍后才处理）
+	eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+		if q := lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0"); q.rqueue != nNew {
+			return fmt.Errorf("监听 socket 的 accept 队列长度为 %d，期望 %d", q.rqueue, nNew)
+		}
+		return nil
+	})
 	for i, c := range clients {
 		if i%2 == 0 {
 			if _, err := fmt.Fprintf(backs[i], "data-%d\n", i); err != nil {
@@ -1569,6 +1609,32 @@ func TestTCPFdReuseBurst(t *testing.T) {
 			backs[i].Close()
 		}
 	}
+	// SIGCONT 之前等 RST 与数据都投递到 tinymapper 的 socket：收到 RST 的一侧已从哈希表摘除（查不到，或按四元组查到的已是
+	// 别的 socket，如客户端侧摘除后查到监听 socket），另一侧接收队列非空。不等时负载下约 2% 的运行在恢复时 epoll 里只有监听
+	// socket 就绪，连续几轮 accept 都排在旧连接对释放之前，测不到 fd 复用（build/t13/tests-report.md §3.4）
+	var delivered string // 投递状态，覆盖自检失败时打印
+	eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+		gone, queued := 0, 0
+		for i, s := range tmSocks {
+			rst, data := s[0], s[1] // 偶数对客户端发 RST、上游发数据；奇数对相反
+			if i%2 == 1 {
+				rst, data = data, rst
+			}
+			if b, err := sockDiag(tcp, rst.local, rst.remote); err != nil || b.inode != rst.inode {
+				gone++
+			}
+			if b, err := sockDiag(tcp, data.local, data.remote); err == nil && b.inode == data.inode && b.rqueue > 0 {
+				queued++
+			}
+		}
+		lis := lookupSockBuf(t, m.pid(), tcp, "监听 socket", listen, "0.0.0.0:0")
+		delivered = fmt.Sprintf("SIGCONT 前 %d/%d 个旧连接对收到 RST 的一侧已摘除，%d/%d 个另一侧接收队列非空，accept 队列 %d",
+			gone, nOld, queued, nOld, lis.rqueue)
+		if gone != nOld || queued != nOld {
+			return errors.New(delivered)
+		}
+		return nil
+	})
 	m.cmd.Process.Signal(syscall.SIGCONT)
 
 	for j, c := range news {
@@ -1678,7 +1744,8 @@ func TestTCPFdReuseBurst(t *testing.T) {
 	t.Logf("新连接对中 %d/%d 个复用了旧连接对的 fd 号；第一个新连接对之前已释放 %d 个旧连接对（%d 表示本轮先释放再 accept）",
 		reused, nNew, closedBefore, nOld)
 	if reused == 0 {
-		t.Errorf("没有一个新连接对复用旧连接对的 fd 号（旧 %v，新 %v）：用例没有覆盖 fd 复用", conns[:nOld], conns[nOld:])
+		t.Errorf("没有一个新连接对复用旧连接对的 fd 号（旧 %v，新 %v；第一个新连接对之前已释放 %d 个旧连接对；%s）：用例没有覆盖 fd 复用",
+			conns[:nOld], conns[nOld:], closedBefore, delivered)
 	}
 }
 
