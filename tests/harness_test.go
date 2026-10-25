@@ -183,7 +183,9 @@ func runMapper(t testing.TB, cmd *exec.Cmd, logPath string, wait []listenPoint) 
 // 改由 execEpollAddFail 在当前线程上装 seccomp 过滤器后 exec tinymapper：fd 在 [lo, hi) 内的 epoll_ctl(EPOLL_CTL_ADD)
 // 返回 ENOSPC，其他系统调用不受影响。真实的 ENOSPC（达到 fs.epoll.max_user_watches）也是 ep_insert 在插入前返回，没有副作用，
 // 与过滤器直接返回错误一致；libev 的 epoll_modify 对 ENOENT/EEXIST/EPERM 以外的 errno 调 fd_kill（停掉该 fd 的 watcher 并
-// 喂 EV_ERROR）。经 MOD 的路径（MOD 得到 ENOENT 后重试 ADD）也落在 ADD 上。prctl 设的 no_new_privs 与 seccomp 过滤器都只作用于
+// 喂 EV_ERROR）。T13 起新 fd 一律直接 ADD（libev fd_reify 本地补丁），不再先 MOD 得到 ENOENT。过滤器让区间内的每个 ADD 都返回
+// ENOSPC，包括内核本会返回 EEXIST 的已登记 fd：将来若有代码对区间内仍已登记的 fd 重新 ev_io_set，这里会出现 EV_ERROR，生产环境
+// 则是 EEXIST 加 MOD（目前没有这样的调用点）。prctl 设的 no_new_privs 与 seccomp 过滤器都只作用于
 // 调用线程、并由 execve 保留，所以锁定线程后在同一线程上 exec；不需要特权，对静态链接的 tinymapper 同样有效。
 // 测试二进制的 fd 都带 O_CLOEXEC，exec 后 tinymapper 的 fd 布局与直接启动相同（0–2 之外从 3 起依次分配）
 const epollAddFailEnv = "TPM_EPOLL_ADD_FAIL"

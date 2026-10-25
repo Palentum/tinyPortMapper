@@ -2069,6 +2069,9 @@ ev_feed_fd_event (EV_P_ int fd, int revents) EV_THROW
     fd_event_nocheck (EV_A_ fd, revents);
 }
 
+/* tinymapper 本地补丁（T13）的标记：my_ev.cpp 检查它，补丁丢失时编译失败 */
+#define TPM_LIBEV_FD_REIFY_PATCH 1
+
 /* make sure the external fd watch events are in-sync */
 /* with the kernel/libev internal state */
 inline_size void
@@ -2109,6 +2112,13 @@ fd_reify (EV_P)
 
       unsigned char o_events = anfd->events;
       unsigned char o_reify  = anfd->reify;
+      /* tinymapper 本地补丁（T13）：本轮有 watcher 经 ev_io_set 登记（EV__IOFDSET）的 fd 按新 fd 处理，告诉 backend
+         没有旧登记，epoll 直接 ADD。fd 号在本轮早些时候被关闭又复用时，o_events 还是旧 fd 的掩码，原逻辑在掩码不同时
+         先 MOD（内核已在 close 时删掉，得到 ENOENT）再 ADD。代价：仍在 epoll 中的 fd 再次 ev_io_set 且掩码变化时，
+         要 ADD（EEXIST）再 MOD，所以同一 fd 上切换事件不要经 ev_io_set。只对 epoll 正确：poll/select（pollfd、位图）、
+         kqueue（EV_DELETE）、port（dissociate）以及 libev 4.31 起的 io_uring（POLL_REMOVE）靠 oev 撤销旧登记，置 0 会
+         留下陈旧登记；编入这些后端时 my_ev.cpp 报错 */
+      unsigned char o_fdset  = o_reify & EV__IOFDSET;
 
       anfd->reify  = 0;
 
@@ -2124,7 +2134,7 @@ fd_reify (EV_P)
         }
 
       if (o_reify & EV__IOFDSET)
-        backend_modify (EV_A_ fd, o_events, anfd->events);
+        backend_modify (EV_A_ fd, o_fdset ? 0 : o_events, anfd->events);
     }
 
   fdchangecnt = 0;

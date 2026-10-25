@@ -326,7 +326,8 @@ struct conn_manager_tcp_t
 	int erase(tcp_pair_t *pair)
 	{
 		//两侧都 stop 之后才能归还：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，归还后不会再有它的回调。
-		//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11）
+		//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11），
+		//fd_reify 对它直接 ADD，不受 libev 缓存的旧掩码影响（T13）
 		struct ev_loop * loop= ev_default_loop (0);
 		ev_io_stop(loop, &pair->local.ev);
 		ev_io_stop(loop, &pair->remote.ev);
@@ -772,6 +773,8 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 	return 0;
 }
 
+//同一 fd 上切换事件一律 stop → 改 events → start，不经 ev_io_init：EV__IOFDSET 表示新 fd，libev fd_reify 的本地补丁
+//对它直接 ADD，fd 仍在 epoll 中时就成了 ADD（EEXIST）再 MOD（T13）
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
 	//mylog(log_info,"[tcp]tcp_cb called \n");
@@ -834,7 +837,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		{
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_WRITE;
-			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 			ev_io_start(loop, &my_info.ev);
 			if( (revents & EV_READ) ==0) return;
 		}
@@ -851,7 +853,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		DEBUG_ASSERT(other_info.eof);
 		ev_io_stop(loop, &my_info.ev);
 		my_info.ev.events&=~EV_WRITE;
-		ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 		ev_io_start(loop, &my_info.ev);
 		if(shutdown(my_fd,SHUT_WR)!=0)
 		{
@@ -888,7 +889,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			my_info.eof=1;
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_READ;
-			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 			ev_io_start(loop, &my_info.ev);
 			if(other_info.connected)
 			{
@@ -951,7 +951,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			{
 				ev_io_stop(loop, &other_info.ev);
 				other_info.ev.events|=EV_WRITE;
-				ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
 				ev_io_start(loop, &other_info.ev);
 			}
 
@@ -961,7 +960,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//assert(ret==0);
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_READ;
-			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 			ev_io_start(loop, &my_info.ev);
 
 		}
@@ -1009,7 +1007,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//assert(ret==0);
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_WRITE;
-			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 			ev_io_start(loop, &my_info.ev);
 
 			DEBUG_ASSERT((other_info.ev.events & EV_READ)==0);
@@ -1021,7 +1018,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//assert(ret==0);
 			ev_io_stop(loop, &other_info.ev);
 			other_info.ev.events|=EV_READ;
-			ev_io_init (&other_info.ev, tcp_cb, other_fd, other_info.ev.events);
 			ev_io_start(loop, &other_info.ev);
 		}
 		else
