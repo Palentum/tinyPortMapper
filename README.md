@@ -117,6 +117,8 @@ TCP socket buffers are left to kernel autotuning by default. `--sock-buf` turns 
 
 The TCP listen backlog follows `net.core.somaxconn` (4096 by default since Linux 5.4, 128 on older kernels, at most 65535); earlier tinymapper versions used a fixed 512. Raise it if bursts of new connections overflow the accept queue (`nstat -az TcpExtListenOverflows`). On routers with little memory, consider lowering it to 512–1024: connections waiting in the queue hold kernel memory until tinymapper accepts them, for example while it is out of file descriptors.
 
+An idle TCP connection uses about 0.3 KB of tinymapper's memory (earlier versions reserved about 33 KB per connection). Data that the destination cannot take yet is kept in a 64 KiB buffer until it is sent, so a connection whose receiver is slower than its sender uses up to 64 KiB per direction: measured with 1000 slow clients, about 63 KB per connection when one side is slow and 109 KB when both are (earlier versions: 20 and 33 KB). On routers with little memory, account for this when many slow clients download through tinymapper. After such a burst, up to 64 free buffers (4 MiB) are kept for reuse.
+
 When stdout is not a terminal (a file, a pipe, or the journal under systemd/procd), log lines are buffered and written every 400 ms, or when the stdio buffer fills up (4 KiB with glibc, 1 KiB with musl), instead of one write per line, so a line can appear up to 400 ms late, and lines written just before a crash, an unhandled signal such as SIGHUP, or a SIGKILL can be lost; on a terminal every line is written immediately. The time zone of log timestamps is read once at startup.
 
 # Peformance Test

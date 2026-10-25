@@ -449,13 +449,15 @@ func TestTCPHalfCloseConnectingStream(t *testing.T) {
 	}
 }
 
-// 上游建连期间客户端发来超过 tinymapper 单个缓冲（16 KiB）的请求：数据应留在缓冲中，连上后完整转发
+// 上游建连期间客户端发来超过 tinymapper 单个缓冲（T11 起 64 KiB）的请求：数据应留在缓冲中，连上后完整转发。
+// 取 256 KiB 使请求明确跨多个 64 KiB 缓冲：tinymapper 建连期间读满一块就停读、把这块交给该方向（D17），连上后发出、
+// 排空再读下一块，整个请求要经过多块缓冲才转发完
 func TestTCPConnectingData(t *testing.T) {
 	t.Parallel()
 	ln, release := listenFull(t)
 	listen := loopback4(t)
 	forward(t, "t", listen, ln.Addr().String())
-	const size = 64 << 10
+	const size = 256 << 10
 	var req bytes.Buffer
 	sum, _ := writeStream(&req, size, size, streamSeed(1, false))
 	c := dial(t, listen)
@@ -874,7 +876,7 @@ func tcpBufDefault(t testing.TB, name string) int {
 //     用测试自己持有、从未设过缓冲的同类 socket 对照：客户端 socket（被动打开）对照后端 accept 的连接，上游 socket（主动打开）对照测试拨出的连接
 //   - 接收缓冲：建连时不变，为 tcp_rmem[1]（4.20 起；之前的 tcp_fixup_rcvbuf 建连时会扩大接收缓冲，a337531b942b 删除）。
 //     这个值看不出是否加锁（--sock-buf 64 设出的 131072 恰好相等），但传输后的增长也不能当判据：loopback 上 advmss 约 64 KiB，
-//     tcp_rcv_space_adjust 起始的 space 就是整个初始窗口（65535），tinymapper 每次只读 16 KiB，一个 RTT 估计内读走的数据
+//     tcp_rcv_space_adjust 起始的 space 就是整个初始窗口（65535），tinymapper 每次最多读 64 KiB（T11），一个 RTT 估计内读走的数据
 //     只在一个窗口上下，增长与否取决于计时抖动（实测约 1/10 的连接回显 64 MiB 后仍为 131072）
 //   - --sock-buf N：两侧都是 2×min(N KiB, rmem_max/wmem_max)；双向各传 16 MiB 后不变
 //

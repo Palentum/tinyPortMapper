@@ -91,7 +91,7 @@ const int dns_error_len=200;
 const int dns_max_result=16;
 
 const int max_data_len_udp=65536;
-const int max_data_len_tcp=4096*4;
+const int max_data_len_tcp=65536;//一次 recv 最多读这么多，也是 TCP 缓冲池每块的大小（T11）
 
 const u32_t conn_timeout_udp=180000;
 const u32_t conn_timeout_tcp=360000;
@@ -134,7 +134,7 @@ struct tcp_info_t:not_copy_able_t
 	ev_io ev;//ev.data 指向所属的 tcp_pair_t（T10）
 	//epoll_event ev;
 	//char * data;
-	char data[max_data_len_tcp+200];//use a larger buffer than udp
+	char *buf;//本侧读到、还没发完的数据所在的池缓冲：recv 读进 scratch，没发完就把这块整块留下（D17），排空后还回池；data_len 为 0 时为 0
 	char * begin;
 	int data_len;
 	int eof;//本侧 recv 已返回 0：不再读本侧，对另一侧发 shutdown(SHUT_WR)
@@ -143,7 +143,9 @@ struct tcp_info_t:not_copy_able_t
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
 
-		begin=data;
+		memset(&ev,0,sizeof(ev));//对 ev_io_stop 等价于 ev_init：slab 新切出的内存未初始化，ev_io_init 之前走到释放路径时 ev_io_stop 要读 active/pending（T11）
+		buf=0;
+		begin=0;
 		data_len=0;
 		eof=0;
 		connected=0;
@@ -253,9 +255,9 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	forward_rule_t *owner;
 	int remote_index;
 	//u64_t last_active_time;
-	list<udp_pair_t>::iterator it;
 	udp_pair_t()
 	{
+		memset(&ev,0,sizeof(ev));//同 tcp_info_t（T11）
 		owner=0;
 		remote_index=-1;
 	}
@@ -267,7 +269,6 @@ struct tcp_pair_t:not_copy_able_t,lru_node_t
 	tcp_info_t local;
 	tcp_info_t remote;
 	//u64_t last_active_time;
-	list<tcp_pair_t>::iterator it;
 	forward_rule_t *owner;
 	int remote_index;
 	address_t addr;//客户端地址，记日志时才格式化（T7）

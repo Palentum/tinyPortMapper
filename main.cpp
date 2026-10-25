@@ -113,11 +113,114 @@ struct lru_collector_t:not_copy_able_t
 	}
 };
 
+//ASan 构建：池里空闲的对象和缓冲标为不可访问（T11）。对象常在同一轮被下一个连接取走，漏了 ev_io_stop 时多数先触发 libev 的 corrupted watcher 断言，没被复用时才报 use-after-poison
+#ifdef __SANITIZE_ADDRESS__
+extern "C" void __asan_poison_memory_region(void const volatile *addr, size_t size);
+extern "C" void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
+extern "C" int __asan_address_is_poisoned(void const volatile *addr);
+#define pool_poison(p,n) __asan_poison_memory_region((p),(n))
+#define pool_unpoison(p,n) __asan_unpoison_memory_region((p),(n))
+#define pool_assert_not_free(p) assert(!__asan_address_is_poisoned(p))//重复归还：池满时 free 不检查用户投毒，之后的 unpoison 会让已释放的内存对 ASan 不可见
+#else
+#define pool_poison(p,n) ((void)(p),(void)(n))
+#define pool_unpoison(p,n) ((void)(p),(void)(n))
+#define pool_assert_not_free(p) ((void)(p))
+#endif
+
+//空闲链表：链接指针存在空闲块自己的开头，后进先出（刚归还的还在缓存里）
+struct free_list_t
+{
+	void *head;
+	int cnt;
+	free_list_t()
+	{
+		head=0;
+		cnt=0;
+	}
+	void push(void *p,size_t size)
+	{
+		*(void **)p=head;
+		head=p;
+		cnt++;
+		pool_poison(p,size);
+	}
+	void *pop(size_t size)
+	{
+		void *p=head;
+		pool_unpoison(p,size);
+		head=*(void **)p;
+		cnt--;
+		return p;
+	}
+};
+
+static const int obj_pool_slab_objs=64;
+//连接对象池（T11）：一次 malloc 64 个对象（slab），释放的对象进空闲链表，建连先从链表取，热路径上不调 malloc；slab 不归还，保留量为全部规则连接数的峰值向上取整到 64。
+//取出时就地重新构造，状态与新对象相同（LRU 的 prev/next 为 0，watcher 清零，对 ev_io_stop 等价于 ev_init）。归还前两个 watcher 都要 ev_io_stop：
+//它同时清除本轮还没回调的事件，归还后同一轮里后面 accept 的连接就可能取走这块内存（T10）
+template<class T> struct obj_pool_t
+{
+	free_list_t free_objs;
+	T *get()
+	{
+		if(free_objs.head==0)
+		{
+			char *slab=(char *)malloc(sizeof(T)*obj_pool_slab_objs);
+			if(slab==0)
+			{
+				mylog(log_fatal,"malloc for %d connection objects failed\n",obj_pool_slab_objs);
+				myexit(1);
+			}
+			for(int i=0;i<obj_pool_slab_objs;i++)
+				free_objs.push(slab+sizeof(T)*i,sizeof(T));
+		}
+		return new(free_objs.pop(sizeof(T))) T();
+	}
+	void put(T *obj)
+	{
+		obj->~T();
+		free_objs.push(obj,sizeof(T));
+	}
+};
+
+static const int tcp_buf_pool_max_free=64;//D19：一轮 epoll_wait 起步取 64 个事件，一轮里归还又借走的块一般不超过它；最多留 4 MiB
+//TCP 收发缓冲池（T11），每块 max_data_len_tcp：tcp_scratch 之外只有 send 没发完的方向持有一块（D17），排空后归还
+struct tcp_buf_pool_t
+{
+	free_list_t free_bufs;
+	char *get()
+	{
+		if(free_bufs.head!=0) return (char *)free_bufs.pop(max_data_len_tcp);
+		char *buf=(char *)malloc(max_data_len_tcp);
+		if(buf==0)
+		{
+			mylog(log_fatal,"malloc for a %d-byte tcp buffer failed\n",max_data_len_tcp);
+			myexit(1);
+		}
+		return buf;
+	}
+	void put(char *buf)
+	{
+		pool_assert_not_free(buf);
+		if(free_bufs.cnt>=tcp_buf_pool_max_free)
+		{
+			free(buf);
+			return;
+		}
+		free_bufs.push(buf,max_data_len_tcp);
+	}
+};
+
+//每个 worker 一份（P4 移进 worker_t）
+static obj_pool_t<tcp_pair_t> tcp_pair_pool;
+static obj_pool_t<udp_pair_t> udp_pair_pool;
+static tcp_buf_pool_t tcp_buf_pool;
+static char *tcp_scratch=0;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
+
 struct conn_manager_udp_t
 {
 	unordered_map<address_t,udp_pair_t*,address_t::hash_function> adress_to_info;
 
-	list<udp_pair_t> udp_pair_list;
 	long long last_clear_time;
 	lru_collector_t lru;
 	int reserved;
@@ -139,21 +242,21 @@ struct conn_manager_udp_t
 		return 0;
 	}
 
-	int erase(list<udp_pair_t>::iterator &it)
+	int erase(udp_pair_t *pair)
 	{
 		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &it->ev);
+		ev_io_stop(loop, &pair->ev);
 
-		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",it->adress.get_str(),(int)(udp_pair_list.size()-1));
+		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",pair->adress.get_str(),lru.size()-1);
 		mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
 
-		auto tmp_it=adress_to_info.find(it->adress);
+		auto tmp_it=adress_to_info.find(pair->adress);
 		assert(tmp_it!=adress_to_info.end());
 		adress_to_info.erase(tmp_it);
 
-		close(it->fd);
-		lru.erase(&*it);
-		udp_pair_list.erase(it);
+		close(pair->fd);
+		lru.erase(pair);
+		udp_pair_pool.put(pair);
 
 		return 0;
 	}
@@ -161,13 +264,14 @@ struct conn_manager_udp_t
 	int clear_remote_index(int remote_index)
 	{
 		int cnt=0;
-		for(auto it=udp_pair_list.begin();it!=udp_pair_list.end();)
+		//沿 LRU 遍历全部会话：先取下一个，再释放当前的
+		for(lru_node_t *node=lru.head.next;node!=&lru.head;)
 		{
-			auto current=it;
-			it++;
-			if(current->remote_index==remote_index)
+			udp_pair_t *pair=static_cast<udp_pair_t *>(node);
+			node=node->next;
+			if(pair->remote_index==remote_index)
 			{
-				erase(current);
+				erase(pair);
 				cnt++;
 			}
 		}
@@ -189,7 +293,7 @@ struct conn_manager_udp_t
 
 		int cnt=0;
 		//list<tcp_pair_t>::iterator it=clear_it,old_it;
-		int size=udp_pair_list.size();
+		int size=lru.size();
 		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
 
 		u64_t current_time=get_current_time();
@@ -203,7 +307,7 @@ struct conn_manager_udp_t
 			my_time_t ts=lru.peek_back(key);
 			if(current_time- ts < conn_timeout_udp) break;
 
-			erase( static_cast<udp_pair_t *>(key)->it  );
+			erase( static_cast<udp_pair_t *>(key) );
 
 			cnt++;
 		}
@@ -213,53 +317,57 @@ struct conn_manager_udp_t
 
 struct conn_manager_tcp_t
 {
-	list<tcp_pair_t> tcp_pair_list;
 	long long last_clear_time;
 	lru_collector_t lru;
 	conn_manager_tcp_t()
 	{
 		last_clear_time=0;
 	}
-	int erase(list<tcp_pair_t>::iterator &it)
+	int erase(tcp_pair_t *pair)
 	{
-		//两侧都 stop 之后才能释放：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，释放后不会再有它的回调。
-		//close 后 fd 号可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10）
+		//两侧都 stop 之后才能归还：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，归还后不会再有它的回调。
+		//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11）
 		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &it->local.ev);
-		ev_io_stop(loop, &it->remote.ev);
+		ev_io_stop(loop, &pair->local.ev);
+		ev_io_stop(loop, &pair->remote.ev);
 
-		close(it->local.fd);
-		close(it->remote.fd);
-		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
+		close(pair->local.fd);
+		close(pair->remote.fd);
+		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
-		lru.erase(&*it);
-		tcp_pair_list.erase(it);
+		lru.erase(pair);
+		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
+		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
+		tcp_pair_pool.put(pair);
 		return 0;
 	}
-	int erase_closed(list<tcp_pair_t>::iterator &it)//just a copy of erase()
+	int erase_closed(tcp_pair_t *pair)//just a copy of erase()
 	{
 		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &it->local.ev);
-		ev_io_stop(loop, &it->remote.ev);
+		ev_io_stop(loop, &pair->local.ev);
+		ev_io_stop(loop, &pair->remote.ev);
 
-		close(it->local.fd);
-		close(it->remote.fd);
-		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",it->addr.get_str(),(int)(tcp_pair_list.size()-1));
+		close(pair->local.fd);
+		close(pair->remote.fd);
+		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
 		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
-		lru.erase(&*it);
-		tcp_pair_list.erase(it);
+		lru.erase(pair);
+		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
+		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
+		tcp_pair_pool.put(pair);
 		return 0;
 	}
 	int clear_remote_index(int remote_index)
 	{
 		int cnt=0;
-		for(auto it=tcp_pair_list.begin();it!=tcp_pair_list.end();)
+		//沿 LRU 遍历全部连接对：先取下一个，再释放当前的
+		for(lru_node_t *node=lru.head.next;node!=&lru.head;)
 		{
-			auto current=it;
-			it++;
-			if(current->remote_index==remote_index)
+			tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
+			node=node->next;
+			if(pair->remote_index==remote_index)
 			{
-				erase_closed(current);
+				erase_closed(pair);
 				cnt++;
 			}
 		}
@@ -282,7 +390,7 @@ struct conn_manager_tcp_t
 
 		int cnt=0;
 		//list<tcp_pair_t>::iterator it=clear_it,old_it;
-		int size=tcp_pair_list.size();
+		int size=lru.size();
 		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
 
 		u64_t current_time=get_current_time();
@@ -296,7 +404,7 @@ struct conn_manager_tcp_t
 			my_time_t ts=lru.peek_back(key);
 			if(current_time- ts < conn_timeout_tcp) break;
 
-			erase( static_cast<tcp_pair_t *>(key)->it  );
+			erase( static_cast<tcp_pair_t *>(key) );
 
 			cnt++;
 		}
@@ -676,7 +784,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	if((revents&EV_ERROR) !=0)
 	{
 		mylog(log_warn,"[tcp]connection {%s} closed bc of EV_ERROR (epoll_ctl failed),fd=%d\n",tcp_pair.addr.get_str(),watcher->fd);
-		conn_manager_tcp.erase_closed(tcp_pair.it);
+		conn_manager_tcp.erase_closed(&tcp_pair);
 		return;
 	}
 
@@ -719,7 +827,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			if(err!=0)
 			{
 				mylog(log_warn,"[tcp]connect to remote {%s} failed,connection {%s} closed bc of %d:%s\n",tcp_pair.owner->remote_targets[tcp_pair.remote_index].remote_str,tcp_pair.addr.get_str(),err,strerror(err));
-				conn_manager_tcp.erase_closed(tcp_pair.it);
+				conn_manager_tcp.erase_closed(&tcp_pair);
 				return;
 			}
 		}
@@ -751,7 +859,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(shutdown(my_fd,SHUT_WR)!=0)
 		{
 			mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
-			conn_manager_tcp.erase_closed(tcp_pair.it);
+			conn_manager_tcp.erase_closed(&tcp_pair);
 			return;
 		}
 		revents&=~EV_WRITE;
@@ -766,19 +874,20 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLIN) ==0 \n");
 			return;
 		}
-		assert(my_info.data_len==0);
-		int recv_len=recv(my_fd,my_info.data,max_data_len_tcp,0);//use a larger buffer than udp
+		assert(my_info.data_len==0&&my_info.buf==0);
+		if(tcp_scratch==0) tcp_scratch=tcp_buf_pool.get();
+		int recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
 		{
 			if(other_info.eof)
 			{
 				mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr.get_str());
-				conn_manager_tcp.erase_closed(tcp_pair.it);
+				conn_manager_tcp.erase_closed(&tcp_pair);
 				return;
 			}
 			//半关闭：只有缓冲为空时才 recv，所以本方向没有待发数据，直接把 EOF 转给另一侧；反方向照常转发
-			conn_manager_tcp.lru.update(&(*tcp_pair.it));
+			conn_manager_tcp.lru.update(&tcp_pair);
 			my_info.eof=1;
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_READ;
@@ -790,7 +899,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				if(shutdown(other_fd,SHUT_WR)!=0)
 				{
 					mylog(log_info,"[tcp]shutdown failed,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
-					conn_manager_tcp.erase_closed(tcp_pair.it);
+					conn_manager_tcp.erase_closed(&tcp_pair);
 				}
 			}
 			else
@@ -803,14 +912,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(recv_len<0)
 		{
 			mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of %s,fd=%d\n",recv_len,tcp_pair.addr.get_str(),get_sock_error(),my_fd);
-			conn_manager_tcp.erase_closed(tcp_pair.it);
+			conn_manager_tcp.erase_closed(&tcp_pair);
 			return;
 		}
-		conn_manager_tcp.lru.update(&(*tcp_pair.it));
+		conn_manager_tcp.lru.update(&tcp_pair);
 		//tcp_pair.last_active_time=get_current_time();
 
 		my_info.data_len=recv_len;
-		my_info.begin=my_info.data;
+		my_info.begin=tcp_scratch;
 
 		//上游建连中不发：它本来就在等可写，数据留在缓冲里、停读本侧，连上后由写分支发出
 		int send_len=0;
@@ -832,6 +941,10 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		if(my_info.data_len!=0)
 		{
+			//没发完（含上游还在建连）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
+			my_info.buf=tcp_scratch;
+			tcp_scratch=0;
+
 			//epoll_event ev;
 
 			//ev=other_info.ev;
@@ -872,16 +985,16 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(send_len==0)
 		{
 			mylog(log_warn,"[tcp]send_len=%d,connection {%s} closed bc of send_len==0\n",send_len,tcp_pair.addr.get_str());
-			conn_manager_tcp.erase_closed(tcp_pair.it);
+			conn_manager_tcp.erase_closed(&tcp_pair);
 			return;
 		}
 		if(send_len<0)
 		{
 			mylog(log_info,"[tcp]send_len=%d,connection {%s} closed bc of %s\n",send_len,tcp_pair.addr.get_str(),get_sock_error());
-			conn_manager_tcp.erase_closed(tcp_pair.it);
+			conn_manager_tcp.erase_closed(&tcp_pair);
 			return;
 		}
-		conn_manager_tcp.lru.update(&(*tcp_pair.it));
+		conn_manager_tcp.lru.update(&tcp_pair);
 
 		//tcp_pair.last_active_time=get_current_time();
 
@@ -891,6 +1004,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		if(other_info.data_len==0)
 		{
+			tcp_buf_pool.put(other_info.buf);
+			other_info.buf=0;
 
 			//ev=my_info.ev;
 			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, my_fd, &ev);
@@ -959,7 +1074,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	address_t tmp_addr;
 	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
 
-	if(int(conn_manager_tcp.tcp_pair_list.size())>=max_conn_num)
+	if(conn_manager_tcp.lru.size()>=max_conn_num)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",tmp_addr.get_str());
 		close(new_fd);
@@ -1004,18 +1119,15 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		mylog(log_debug,"[tcp]connect returned 0\n");
 	}
 
-	conn_manager_tcp.tcp_pair_list.emplace_back();
-	auto it=conn_manager_tcp.tcp_pair_list.end();
-	it--;
+	tcp_pair_t &tcp_pair=*tcp_pair_pool.get();
 
-	conn_manager_tcp.lru.new_key(&(*it));
+	conn_manager_tcp.lru.new_key(&tcp_pair);
 
-	tcp_pair_t &tcp_pair=*it;
 	tcp_pair.owner=rule;
 	tcp_pair.remote_index=remote_index;
 	tcp_pair.addr=tmp_addr;
 
-	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr.get_str(),new_fd,new_remote_fd,(int)conn_manager_tcp.tcp_pair_list.size());
+	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr.get_str(),new_fd,new_remote_fd,conn_manager_tcp.lru.size());
 
 	tcp_pair.local.connected=1;
 	tcp_pair.remote.connected=(ret==0);
@@ -1028,9 +1140,8 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	//tcp_pair.remote.ev.events=EV_READ;
 	tcp_pair.remote.ev.data=&tcp_pair;
 
-	conn_manager_tcp.lru.update(&(*it));
+	conn_manager_tcp.lru.update(&tcp_pair);
 	//tcp_pair.last_active_time=get_current_time();
-	tcp_pair.it=it;
 
 	//epoll_event ev;
 
@@ -1095,7 +1206,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	if((revents&EV_ERROR) !=0)
 	{
 		mylog(log_warn,"[udp]connection {%s} closed bc of EV_ERROR (epoll_ctl failed),udp fd=%d\n",udp_pair.adress.get_str(),udp_fd);
-		conn_manager_udp.erase(udp_pair.it);
+		conn_manager_udp.erase(&udp_pair);
 		return;
 	}
 	//assert(conn_manager.exist_fd(udp_fd));
@@ -1186,7 +1297,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	if(it==conn_manager_udp.adress_to_info.end())
 	{
 
-		if(int(conn_manager_udp.udp_pair_list.size())>=max_conn_num)
+		if(conn_manager_udp.lru.size()>=max_conn_num)
 		{
 			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
 			return;
@@ -1208,11 +1319,8 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//assert(ret==0);
 
 
-		conn_manager_udp.udp_pair_list.emplace_back();
-		auto list_it=conn_manager_udp.udp_pair_list.end();
-		list_it--;
-		conn_manager_udp.lru.new_key(&(*list_it));
-		udp_pair_t &udp_pair=*list_it;
+		udp_pair_t &udp_pair=*udp_pair_pool.get();
+		conn_manager_udp.lru.new_key(&udp_pair);
 		udp_pair.owner=rule;
 		udp_pair.remote_index=remote_index;
 
@@ -1222,11 +1330,10 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		ev_io_start(loop, &udp_pair.ev);
 
 
-		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,(int)conn_manager_udp.udp_pair_list.size());
+		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,conn_manager_udp.lru.size());
 
 		udp_pair.adress=tmp_addr;
 		//udp_pair.last_active_time=get_current_time();
-		udp_pair.it=list_it;
 		udp_pair.local_listen_fd=local_listen_fd_udp;
 
 		conn_manager_udp.adress_to_info[tmp_addr]=&udp_pair;

@@ -2,6 +2,7 @@ package tests
 
 import (
 	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/binary"
 	"errors"
@@ -29,7 +30,13 @@ type tcpServer struct {
 
 func serveTCP(t testing.TB, addr string, handle func(net.Conn)) *tcpServer {
 	t.Helper()
-	ln, err := net.Listen("tcp", addr)
+	return serveTCPConfig(t, net.ListenConfig{}, addr, handle)
+}
+
+// serveTCPConfig 同 serveTCP，监听 socket 由 lc 创建（lc.Control 可在 listen 之前设 socket 选项，accept 得到的连接继承它们）
+func serveTCPConfig(t testing.TB, lc net.ListenConfig, addr string, handle func(net.Conn)) *tcpServer {
+	t.Helper()
+	ln, err := lc.Listen(context.Background(), "tcp", addr)
 	if err != nil {
 		t.Fatalf("后端监听 %s 失败：%v；该端口上的 socket：%s", addr, err, portHolders(portOf(addr)))
 	}
