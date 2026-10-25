@@ -154,6 +154,25 @@ struct free_list_t
 	}
 };
 
+//归还连接对象时它的 watcher 必须都已 ev_io_stop（X1 常开检查，D30）。仍是 active（挂在 libev 的 anfds[fd] 链表上）或 pending（在本轮待回调队列里）时，
+//本轮后面的连接复用这块内存与 fd 号，ev_io_start 会把链表接成环：libev 的 corrupted watcher 断言只认自环，多节点环和不同 fd 号的旧 watcher
+//（活锁、串流、旧事件回调到新连接）它查不到。所以发布构建也检查，违反就记日志后中止；每次归还读 4 个（UDP 2 个）字段、一次跳转。
+//直接读 ev_io 的成员，与 ev_is_active/ev_is_pending 等价，不经它们的 ev_watcher* 强转（不新增 strict-aliasing 告警）
+static inline int pool_watchers_busy(tcp_pair_t *p)
+{
+	return p->local.ev.active|p->local.ev.pending|p->remote.ev.active|p->remote.ev.pending;
+}
+static inline int pool_watchers_busy(udp_pair_t *p)
+{
+	return p->ev.active|p->ev.pending;
+}
+static void __attribute__((noinline,cold)) pool_put_busy_abort()
+{
+	mylog(log_fatal,"connection object returned to the pool while libev still references one of its watchers (missing ev_io_stop)\n");
+	fflush(stdout);
+	abort();
+}
+
 static const int obj_pool_slab_objs=64;
 //连接对象池（T11）：一次 malloc 64 个对象（slab），释放的对象进空闲链表，建连先从链表取，热路径上不调 malloc；slab 不归还，保留量为全部规则连接数的峰值向上取整到 64。
 //取出时就地重新构造，状态与新对象相同（LRU 的 prev/next 为 0，watcher 清零，对 ev_io_stop 等价于 ev_init）。归还前两个 watcher 都要 ev_io_stop：
@@ -184,6 +203,7 @@ template<class T> struct obj_pool_t
 	}
 	void put(T *obj)
 	{
+		if(pool_watchers_busy(obj)) pool_put_busy_abort();
 		obj->~T();
 		free_objs.push(obj,sizeof(T));
 	}

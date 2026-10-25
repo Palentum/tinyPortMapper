@@ -13,6 +13,7 @@ SOURCES=${SOURCES0} my_ev.cpp -isystem libev
 NAME=tinymapper
 
 
+#发布构建（all 与发布目标）不定义 NDEBUG：libev 的断言在发布版里保留，漏 ev_io_stop 时中止而不是活锁（X1，D28）；-O3/LTO/PGO 评估后不采纳（D29）
 FLAGS= -std=c++11   -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-missing-field-initializers ${OPT} -pthread
 TARGETS=amd64 arm mips24kc_be x86  mips24kc_le
 

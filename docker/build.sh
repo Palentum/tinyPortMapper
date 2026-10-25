@@ -9,7 +9,8 @@
 #             不能再加 NDEBUG（common.h 会报错）
 #   cross  -> build/tinymapper_<target>，发布目标（amd64 x86 arm mips24kc_be mips24kc_le）
 #             用 zig 的 musl 交叉编译器编译；只做编译检查，不等同于 OpenWRT SDK。zig 在 -O2 下隐式定义 NDEBUG，
-#             这里的产物不含任何 assert（SDK 的 gcc 不定义 NDEBUG）
+#             这里的产物不含任何 assert（SDK 的 gcc 不定义 NDEBUG）。不要拿它当发布包：没有 libev 的断言时，漏 ev_io_stop
+#             表现为活锁而不是中止（X1，D28）；用 zig 出发布包要加 -UNDEBUG
 # 环境变量：
 #   REF=<git ref>  编译该提交而不是工作区；产物文件名加 "-<ref>" 后缀
 #
