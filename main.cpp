@@ -62,10 +62,10 @@ struct lru_collector_t:not_copy_able_t
 	}
 	int update(key_t key)
 	{
-		assert(key->next!=0);
+		DEBUG_ASSERT(key->next!=0);
 
 		my_time_t value=get_current_time();
-		assert(value >=head.next->ts);
+		DEBUG_ASSERT(value >=head.next->ts);
 		//距上次挪动不到 lru_move_interval 就不挪：链表仍按 ts 有序，ts 最多比实际最后活动早这么多，超时最多提前这么多（T8）
 		if(value-key->ts<lru_move_interval) return 0;
 		key->ts=value;
@@ -76,12 +76,12 @@ struct lru_collector_t:not_copy_able_t
 	}
 	int new_key(key_t key)
 	{
-		assert(key->next==0);
+		DEBUG_ASSERT(key->next==0);
 
 		my_time_t value=get_current_time();
 		if(!empty())
 		{
-			assert(value >=head.next->ts);
+			DEBUG_ASSERT(value >=head.next->ts);
 		}
 		key->ts=value;
 		link_front(key);
@@ -100,13 +100,13 @@ struct lru_collector_t:not_copy_able_t
 
 	my_time_t peek_back(key_t &key)
 	{
-		assert(!empty());
+		DEBUG_ASSERT(!empty());
 		key=head.prev;
 		return key->ts;
 	}
 	void erase(key_t key)
 	{
-		assert(key->next!=0);
+		DEBUG_ASSERT(key->next!=0);
 		unlink(key);
 		key->prev=key->next=0;
 		cnt--;
@@ -251,7 +251,7 @@ struct conn_manager_udp_t
 		mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
 
 		auto tmp_it=adress_to_info.find(pair->adress);
-		assert(tmp_it!=adress_to_info.end());
+		DEBUG_ASSERT(tmp_it!=adress_to_info.end());
 		adress_to_info.erase(tmp_it);
 
 		close(pair->fd);
@@ -697,23 +697,23 @@ static void schedule_dns_refresh(forward_rule_t &rule)
 static int select_remote_index(forward_rule_t &rule, const address_t &client_addr)
 {
 	int remote_count=(int)rule.remote_targets.size();
-	assert(remote_count>0);
+	DEBUG_ASSERT(remote_count>0);
 	if(remote_count==1||rule.balance_strategy==balance_strategy_off)
 	{
 		return 0;
 	}
-	assert((int)rule.balance_weights.size()==remote_count);
+	DEBUG_ASSERT((int)rule.balance_weights.size()==remote_count);
 
 	if(rule.balance_strategy==balance_strategy_roundrobin)
 	{
-		assert((int)rule.rr_nodes.size()==remote_count);
+		DEBUG_ASSERT((int)rule.rr_nodes.size()==remote_count);
 		int best=-1;
 		int total=0;
 		for(int i=0;i<remote_count;i++)
 		{
 			balance_rr_node_t &node=rule.rr_nodes[i];
-			assert(node.weight>0);
-			assert(node.effective_weight>0);
+			DEBUG_ASSERT(node.weight>0);
+			DEBUG_ASSERT(node.effective_weight>0);
 			node.current_weight+=node.effective_weight;
 			total+=node.effective_weight;
 			if(best==-1||node.current_weight>rule.rr_nodes[best].current_weight)
@@ -721,8 +721,8 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 				best=i;
 			}
 		}
-		assert(best>=0);
-		assert(total>0);
+		DEBUG_ASSERT(best>=0);
+		DEBUG_ASSERT(total>0);
 		rule.rr_nodes[best].current_weight-=total;
 		return best;
 	}
@@ -744,16 +744,16 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 		}
 		else
 		{
-			assert(0==1);
+			DEBUG_ASSERT(0==1);
 		}
 		u32_t hash=sdbm((unsigned char*)hash_data,hash_len);
 		int total=0;
 		for(int i=0;i<remote_count;i++)
 		{
-			assert(rule.balance_weights[i]>0);
+			DEBUG_ASSERT(rule.balance_weights[i]>0);
 			total+=rule.balance_weights[i];
 		}
-		assert(total>0);
+		DEBUG_ASSERT(total>0);
 		int bucket=(int)(hash%(u32_t)total);
 		int cursor=0;
 		for(int i=0;i<remote_count;i++)
@@ -764,11 +764,11 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 				return i;
 			}
 		}
-		assert(0==1);
+		DEBUG_ASSERT(0==1);
 		return 0;
 	}
 
-	assert(0==1);
+	DEBUG_ASSERT(0==1);
 	return 0;
 }
 
@@ -776,7 +776,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
 	//mylog(log_info,"[tcp]tcp_cb called \n");
 	tcp_pair_t &tcp_pair=*(tcp_pair_t *)watcher->data;
-	assert(tcp_pair.owner!=0);
+	DEBUG_ASSERT(tcp_pair.owner!=0);
 	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
 
 	//epoll_ctl 失败（如 ADD 超过 fs.epoll.max_user_watches 的 ENOSPC、ENOMEM）：libev 的 fd_kill 已停掉这个 watcher，只释放这一对（C9）。
@@ -795,15 +795,12 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		my_info_p=&tcp_pair.local;
 		other_info_p=&tcp_pair.remote;
 	}
-	else if(watcher==&tcp_pair.remote.ev)
+	else
 	{
+		DEBUG_ASSERT(watcher==&tcp_pair.remote.ev);
 		mylog(log_trace,"[tcp]watcher==&tcp_pair.remote.ev\n");
 		my_info_p=&tcp_pair.remote;
 		other_info_p=&tcp_pair.local;
-	}
-	else
-	{
-		assert(0==1);
 	}
 	tcp_info_t &my_info=*my_info_p;
 	tcp_info_t &other_info=*other_info_p;
@@ -811,7 +808,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int my_fd=my_info.fd;
 	int other_fd=other_info.fd;
 
-	assert(watcher->fd==my_fd);
+	DEBUG_ASSERT(watcher->fd==my_fd);
 
 	//zdmylog(log_info,"[tcp]my_fd=%d,other_fd=%d \n",my_fd,other_fd);
 
@@ -851,7 +848,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	//推迟的 shutdown：上游建连期间客户端已 EOF，连上后从上面落到这里；建连之后只有它会在没有待发数据时挂 EV_WRITE。先于读处理，否则本侧每轮都可读时下面的 if/else if 永远轮不到写
 	if( (revents & EV_WRITE) !=0 && (my_info.ev.events&EV_WRITE) !=0 && other_info.data_len==0 )
 	{
-		assert(other_info.eof);
+		DEBUG_ASSERT(other_info.eof);
 		ev_io_stop(loop, &my_info.ev);
 		my_info.ev.events&=~EV_WRITE;
 		ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
@@ -874,7 +871,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLIN) ==0 \n");
 			return;
 		}
-		assert(my_info.data_len==0&&my_info.buf==0);
+		DEBUG_ASSERT(my_info.data_len==0&&my_info.buf==0);
 		if(tcp_scratch==0) tcp_scratch=tcp_buf_pool.get();
 		int recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
@@ -925,7 +922,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		int send_len=0;
 		if(other_info.connected)
 		{
-			assert((other_info.ev.events & EV_WRITE)==0);
+			DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
 			send_len=send(other_fd,my_info.begin,my_info.data_len,0);
 		}
 
@@ -980,7 +977,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			return;
 		}
 
-		assert(other_info.data_len!=0);
+		DEBUG_ASSERT(other_info.data_len!=0);
 		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
 		if(send_len==0)
 		{
@@ -1015,7 +1012,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			ev_io_init (&my_info.ev, tcp_cb, my_fd, my_info.ev.events);
 			ev_io_start(loop, &my_info.ev);
 
-			assert((other_info.ev.events & EV_READ)==0);
+			DEBUG_ASSERT((other_info.ev.events & EV_READ)==0);
 
 
 
@@ -1042,7 +1039,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 {
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
-	assert(rule!=0);
+	DEBUG_ASSERT(rule!=0);
 	conn_manager_tcp_t &conn_manager_tcp=rule->tcp_manager;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
@@ -1200,7 +1197,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int ret;
 	udp_pair_t & udp_pair=*(udp_pair_t *)watcher->data;
 	int udp_fd=udp_pair.fd;
-	assert(udp_pair.owner!=0);
+	DEBUG_ASSERT(udp_pair.owner!=0);
 	conn_manager_udp_t &conn_manager_udp=udp_pair.owner->udp_manager;
 	//同 tcp_cb：libev 已停掉这个 watcher，只释放这个会话（C9）；客户端的下一个包会新建会话
 	if((revents&EV_ERROR) !=0)
@@ -1247,7 +1244,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
-	assert(rule!=0);
+	DEBUG_ASSERT(rule!=0);
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
 
 	if((revents&EV_ERROR) !=0)
@@ -1341,7 +1338,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//it=adress_to_info.
 	}
 
-	assert(it!=conn_manager_udp.adress_to_info.end() );
+	DEBUG_ASSERT(it!=conn_manager_udp.adress_to_info.end() );
 
 	udp_pair_t &udp_pair=*(it->second);
 	int udp_fd=udp_pair.fd;

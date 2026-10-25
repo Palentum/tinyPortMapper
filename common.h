@@ -45,6 +45,17 @@
 #include <stdarg.h>
 #include <assert.h>
 
+//热路径（每个事件、每个包、每个连接）上的不变式（T12）：只在定义了 ENABLE_DEBUG_ASSERT 的构建里检查（make test 用的 *-assert 变体，D20），
+//make all / make release 不编入。sizeof 不对表达式求值，只让其中的变量算作用到：表达式不能有副作用（发布构建里不执行），也不能含 lambda
+#ifdef ENABLE_DEBUG_ASSERT
+#ifdef NDEBUG
+#error "ENABLE_DEBUG_ASSERT 要求 assert() 生效：不要同时定义 NDEBUG（zig 在 -O1 及以上会隐式定义）"
+#endif
+#define DEBUG_ASSERT(x) assert(x)
+#else
+#define DEBUG_ASSERT(x) ((void)sizeof(!(x)))
+#endif
+
 #include <my_ev.h>
 
 #include <sys/socket.h>    //for socket ofcourse
@@ -216,7 +227,7 @@ struct address_t  //TODO scope id
 			case AF_INET6:
 				return sizeof(sockaddr_in6);
 			default:
-				assert(0==1);
+				DEBUG_ASSERT(0==1);
 		}
 		return -1;
 	}

@@ -39,13 +39,13 @@ cross3:git_version
 #targets only for debug purpose
 fast: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb -DENABLE_DEBUG_ASSERT
 debug: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -D MY_DEBUG  -ggdb
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -D MY_DEBUG  -ggdb -DENABLE_DEBUG_ASSERT
 debug2: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -ggdb
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -ggdb -DENABLE_DEBUG_ASSERT
 
 #targets only for 'make release'
 

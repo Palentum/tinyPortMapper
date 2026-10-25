@@ -738,7 +738,7 @@ void address_t::to_str(char * s)
 	}
 	else
 	{
-		assert(0==1);
+		DEBUG_ASSERT(0==1);
 	}
 	*p++=':';
 	p=put_u32(p,ntohs(port));
@@ -750,18 +750,18 @@ int address_t::from_sockaddr(sockaddr * addr,socklen_t slen)
 	memset(&inner,0,sizeof(inner));
 	if(addr->sa_family==AF_INET6)
 	{
-		assert(slen==sizeof(sockaddr_in6));
+		DEBUG_ASSERT(slen==sizeof(sockaddr_in6));
 		inner.ipv6= *( (sockaddr_in6*) addr );
 
 	}
 	else if(addr->sa_family==AF_INET)
 	{
-		assert(slen==sizeof(sockaddr_in));
+		DEBUG_ASSERT(slen==sizeof(sockaddr_in));
 		inner.ipv4= *( (sockaddr_in*) addr );
 	}
 	else
 	{
-		assert(0==1);
+		DEBUG_ASSERT(0==1);
 	}
 	return 0;
 }

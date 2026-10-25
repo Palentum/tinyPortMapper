@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
 # 在 Linux 容器里编译 tinymapper（开发机可能是 macOS），产物放在 build/。
 #
-# 用法：docker/build.sh [glibc] [musl] [cross]      （默认 glibc musl）
+# 用法：docker/build.sh [glibc] [musl] [glibc-assert] [musl-assert] [cross]      （默认 glibc musl）
 #   glibc  -> build/tinymapper-glibc   在 ubuntu:24.04 中 `make all`（静态 glibc，-O2）
 #   musl   -> build/tinymapper-musl    在 alpine:3.22 中 `make all`（静态 musl，与 OpenWRT 同类 libc）
+#   glibc-assert / musl-assert -> build/tinymapper-{glibc,musl}-assert
+#             同上，另加 -DENABLE_DEBUG_ASSERT：热路径上的 DEBUG_ASSERT 生效（T12），tests/run.sh 默认测它们；
+#             不能再加 NDEBUG（common.h 会报错）
 #   cross  -> build/tinymapper_<target>，发布目标（amd64 x86 arm mips24kc_be mips24kc_le）
-#             用 zig 的 musl 交叉编译器编译；只做编译检查，不等同于 OpenWRT SDK
+#             用 zig 的 musl 交叉编译器编译；只做编译检查，不等同于 OpenWRT SDK。zig 在 -O2 下隐式定义 NDEBUG，
+#             这里的产物不含任何 assert（SDK 的 gcc 不定义 NDEBUG）
 # 环境变量：
 #   REF=<git ref>  编译该提交而不是工作区；产物文件名加 "-<ref>" 后缀
 #
@@ -41,9 +45,12 @@ $script"
 
 for v in "$@"; do
 	case $v in
-	glibc | musl)
-		image "tinymapper-build-$v:1" "Dockerfile.build-$v"
-		run "tinymapper-build-$v:1" "make all >/tmp/make.log 2>&1 || { cat /tmp/make.log; exit 1; }
+	glibc | musl | glibc-assert | musl-assert)
+		libc=${v%-assert}
+		opt=""
+		[ "$v" = "$libc" ] || opt=-DENABLE_DEBUG_ASSERT
+		image "tinymapper-build-$libc:1" "Dockerfile.build-$libc"
+		run "tinymapper-build-$libc:1" "make all OPT='$opt' >/tmp/make.log 2>&1 || { cat /tmp/make.log; exit 1; }
 cp tinymapper /out/.tinymapper-$v\$SUFFIX.tmp && mv -f /out/.tinymapper-$v\$SUFFIX.tmp /out/tinymapper-$v\$SUFFIX"
 		echo "已编译 build/tinymapper-$v$SUFFIX"
 		;;
@@ -59,7 +66,7 @@ for t in "amd64:x86_64-linux-musl" "x86:x86-linux-musl -mcpu=pentium4" "arm:arm-
 done'
 		;;
 	*)
-		echo "未知构建类型：$v（可选 glibc、musl、cross）" >&2
+		echo "未知构建类型：$v（可选 glibc、musl、glibc-assert、musl-assert、cross）" >&2
 		exit 2
 		;;
 	esac
