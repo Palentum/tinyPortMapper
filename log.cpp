@@ -9,7 +9,7 @@ int enable_log_color=1;
 
 void log0(const char * file,const char * function,int line,int level,const char* str, ...) {
 
-	if(level>log_level) return ;
+	//级别由调用它的宏判断：mylog 按 log_level 过滤，mylog_unfiltered 只排除 log_never
 	if(level>log_trace||level<0) return ;
 
 

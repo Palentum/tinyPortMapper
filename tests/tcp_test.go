@@ -619,6 +619,10 @@ func TestTCPUpstreamRefused(t *testing.T) {
 		t.Fatal("上游拒绝连接后 tinymapper 退出")
 	}
 	expectConnectFailed(t, m, 3, remote, syscall.ECONNREFUSED)
+	// O1：异步建连失败前连接对已建立，计入 total，失败后释放
+	if s := m.statsAfterSignal(t).tcp[1]; s.total != 3 || s.conns != 0 {
+		t.Errorf("统计 total=%d conns=%d，期望 3/0", s.total, s.conns)
+	}
 }
 
 // 上游不可达（无路由）：客户端连接应被及时关闭并以 warn 记录原因，tinymapper 继续运行
@@ -640,6 +644,10 @@ func TestTCPUpstreamUnreachable(t *testing.T) {
 				t.Fatal("上游不可达后 tinymapper 退出")
 			}
 			expectConnectFailed(t, m, 3, remote, syscall.ENETUNREACH)
+			// O1：connect 立即失败时不建连接对，不计入 total，也没有从对象池取过对象
+			if d := m.statsAfterSignal(t); d.tcp[1].total != 0 || d.pool.tcpSlabs != 0 {
+				t.Errorf("统计 total=%d tcp_pairs slabs=%d，期望 0/0", d.tcp[1].total, d.pool.tcpSlabs)
+			}
 		})
 	}
 }
@@ -1004,7 +1012,7 @@ func TestTCPMaxConn(t *testing.T) {
 	const maxConn = 20000
 	be := serveTCP(t, loopback4(t), echoHandler(""))
 	listen := loopback4(t)
-	forward(t, "t", listen, be.addr)
+	m := forward(t, "t", listen, be.addr)
 
 	conns := make([]net.Conn, maxConn)
 	errs := make([]error, maxConn)
@@ -1028,6 +1036,10 @@ func TestTCPMaxConn(t *testing.T) {
 	expectClosed(t, extra, ioTimeout)
 	if n := be.accepted.Load(); n != maxConn {
 		t.Errorf("上游收到 %d 个连接，期望 %d（超限连接不应转发）", n, maxConn)
+	}
+	// O1：因 max_conn_num 被拒的客户端不计入 total
+	if s := m.statsAfterSignal(t).tcp[1]; s.total != maxConn || s.conns != maxConn {
+		t.Errorf("统计 total=%d conns=%d，期望 %d/%d", s.total, s.conns, maxConn, maxConn)
 	}
 	for _, i := range []int{0, 1, 4999, 10000, 15000, maxConn - 2, maxConn - 1} {
 		if err := echo(conns[i], []byte("still-alive")); err != nil {
@@ -1076,6 +1088,10 @@ func TestTCPNofileUpstreamSocket(t *testing.T) {
 	if !m.aliveAfter(500 * time.Millisecond) {
 		m.stop(t, true)
 		t.Fatalf("创建上游 socket 失败（EMFILE）时 tinymapper 退出：%v", m.exitErr)
+	}
+	// O1：上游 socket() 失败的客户端在建连接对之前就被丢弃，不计入 total
+	if s := m.statsAfterSignal(t).tcp[1]; s.total != k || s.conns != k {
+		t.Errorf("统计 total=%d conns=%d，期望 %d/%d", s.total, s.conns, k, k)
 	}
 	// warn 行的参数里 get_str() 先于 get_sock_error() 求值（T7 起两种构建都如此）：address_t::to_str 不能改动 errno
 	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {

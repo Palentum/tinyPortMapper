@@ -52,10 +52,13 @@ extern int enable_log_color;
 
 #ifdef MY_DEBUG
 #define mylog(__first_argu__dummy_abcde__,...) printf(__VA_ARGS__)
+#define mylog_unfiltered(__first_argu__dummy_abcde__,...) printf(__VA_ARGS__)
 
 #else
 //先判断级别：被过滤掉的日志不调用 log0，也不对参数求值（如 get_sock_error()）
 #define mylog(level,...) do{ if((level)<=log_level) log0(__FILE__,__FUNCTION__,__LINE__,level,__VA_ARGS__); }while(0)
+//不受 --log-level 过滤，只有 log_never 时不写：SIGUSR1 请求的统计（D26）
+#define mylog_unfiltered(level,...) do{ if(log_level>log_never) log0(__FILE__,__FUNCTION__,__LINE__,level,__VA_ARGS__); }while(0)
 #endif
 
 

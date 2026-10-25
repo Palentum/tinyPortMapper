@@ -154,6 +154,10 @@ func TestDomainRefresh(t *testing.T) {
 	if got := udpReplyFrom(t, udp, "again"); got != "3" {
 		t.Fatalf("地址变化后 UDP 再次发往后端 %q", got)
 	}
+	// O1：clear_remote_index 释放的旧会话与连接对都要归还对象池（statsAfterSignal 复核池不变式）；旧会话释放后同一客户端新建一个
+	if s := m.statsAfterSignal(t).udp[1]; s.sessions != 1 || s.total != 2 {
+		t.Errorf("统计 udp sessions=%d total=%d，期望 1/2", s.sessions, s.total)
+	}
 }
 
 // udpSockets 返回进程 pid 持有的 UDP socket 个数（/proc/net/udp、udp6 中 inode 属于该进程的行）

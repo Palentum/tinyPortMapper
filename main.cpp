@@ -161,6 +161,11 @@ static const int obj_pool_slab_objs=64;
 template<class T> struct obj_pool_t
 {
 	free_list_t free_objs;
+	int slabs;//已分配的 slab 数（O1）：在用对象数 = slabs*obj_pool_slab_objs-free_objs.cnt
+	obj_pool_t()
+	{
+		slabs=0;
+	}
 	T *get()
 	{
 		if(free_objs.head==0)
@@ -171,6 +176,7 @@ template<class T> struct obj_pool_t
 				mylog(log_fatal,"malloc for %d connection objects failed\n",obj_pool_slab_objs);
 				myexit(1);
 			}
+			slabs++;
 			for(int i=0;i<obj_pool_slab_objs;i++)
 				free_objs.push(slab+sizeof(T)*i,sizeof(T));
 		}
@@ -188,6 +194,11 @@ static const int tcp_buf_pool_max_free=64;//D19：一轮 epoll_wait 起步取 64
 struct tcp_buf_pool_t
 {
 	free_list_t free_bufs;
+	int alloc;//已 malloc 还没 free 的块数（O1）：每块要么是 tcp_scratch，要么属于某个方向，要么在空闲链表里
+	tcp_buf_pool_t()
+	{
+		alloc=0;
+	}
 	char *get()
 	{
 		if(free_bufs.head!=0) return (char *)free_bufs.pop(max_data_len_tcp);
@@ -197,6 +208,7 @@ struct tcp_buf_pool_t
 			mylog(log_fatal,"malloc for a %d-byte tcp buffer failed\n",max_data_len_tcp);
 			myexit(1);
 		}
+		alloc++;
 		return buf;
 	}
 	void put(char *buf)
@@ -205,6 +217,7 @@ struct tcp_buf_pool_t
 		if(free_bufs.cnt>=tcp_buf_pool_max_free)
 		{
 			free(buf);
+			alloc--;
 			return;
 		}
 		free_bufs.push(buf,max_data_len_tcp);
@@ -225,12 +238,19 @@ struct conn_manager_udp_t
 	lru_collector_t lru;
 	int reserved;
 	//list<udp_pair_t>::iterator clear_it;
+	//O1 累计计数，SIGUSR1 时输出：total 新建的会话数；pkts/bytes 发送成功的包数与字节数，drop 发送失败（含 EAGAIN）丢掉的包数。[0] 客户端→上游，[1] 上游→客户端
+	u64_t total;
+	u64_t pkts[2],bytes[2],drop[2];
 
 	conn_manager_udp_t()
 	{
 		last_clear_time=0;
 		reserved=0;
 		//clear_it=udp_pair_list.begin();
+		total=0;
+		memset(pkts,0,sizeof(pkts));
+		memset(bytes,0,sizeof(bytes));
+		memset(drop,0,sizeof(drop));
 	}
 	int reserve()
 	{
@@ -319,9 +339,14 @@ struct conn_manager_tcp_t
 {
 	long long last_clear_time;
 	lru_collector_t lru;
+	//O1 累计计数，SIGUSR1 时输出：total 建立的连接对数；bytes 发送成功的字节数，[0] 客户端→上游（从 local 读、发往 remote），[1] 上游→客户端
+	u64_t total;
+	u64_t bytes[2];
 	conn_manager_tcp_t()
 	{
 		last_clear_time=0;
+		total=0;
+		memset(bytes,0,sizeof(bytes));
 	}
 	int erase(tcp_pair_t *pair)
 	{
@@ -934,6 +959,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		{
 			my_info.data_len-=send_len;
 			my_info.begin+=send_len;
+			conn_manager_tcp.bytes[my_info_p==&tcp_pair.remote]+=send_len;
 		}
 
 		if(my_info.data_len!=0)
@@ -996,6 +1022,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_trace,"[tcp]fd=%d send len=%d\n",my_fd,send_len);
 		other_info.data_len-=send_len;
 		other_info.begin+=send_len;
+		conn_manager_tcp.bytes[other_info_p==&tcp_pair.remote]+=send_len;
 
 		if(other_info.data_len==0)
 		{
@@ -1115,6 +1142,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair_t &tcp_pair=*tcp_pair_pool.get();
 
 	conn_manager_tcp.lru.new_key(&tcp_pair);
+	conn_manager_tcp.total++;
 
 	tcp_pair.owner=rule;
 	tcp_pair.remote_index=remote_index;
@@ -1233,8 +1261,14 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int local_listen_fd_udp=udp_pair.local_listen_fd;
 	ret = sendto(local_listen_fd_udp, data,data_len,0, (struct sockaddr *)&udp_pair.adress.inner,udp_pair.adress.get_len());
 	if (ret < 0) {
+		conn_manager_udp.drop[1]++;
 		mylog(log_warn, "[udp]sento returned %d,%s\n", ret,get_sock_error());
 		//perror("ret<0");
+	}
+	else
+	{
+		conn_manager_udp.pkts[1]++;
+		conn_manager_udp.bytes[1]+=ret;
 	}
 }
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -1314,6 +1348,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		udp_pair_t &udp_pair=*udp_pair_pool.get();
 		conn_manager_udp.lru.new_key(&udp_pair);
+		conn_manager_udp.total++;
 		udp_pair.owner=rule;
 		udp_pair.remote_index=remote_index;
 
@@ -1344,10 +1379,55 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int ret;
 	ret = send(udp_fd, data,data_len, 0);
 	if (ret < 0) {
+		conn_manager_udp.drop[0]++;
 		mylog(log_warn, "[udp]send returned %d,%s\n", ret,get_sock_error() );
+	}
+	else
+	{
+		conn_manager_udp.pkts[0]++;
+		conn_manager_udp.bytes[0]+=ret;
 	}
 
 }
+//SIGUSR1 输出统计（O1，D25–D27）：每条规则的 TCP、UDP 各一行，再加一行进程级的池。当前连接数、半关闭对数、
+//持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上
+void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
+{
+	int held=0,tcp_conns=0,udp_conns=0;
+	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	{
+		forward_rule_t &rule=*it;
+		conn_manager_tcp_t &tcp=rule.tcp_manager;
+		conn_manager_udp_t &udp=rule.udp_manager;
+		int half_closed=0;
+		for(lru_node_t *node=tcp.lru.head.next;node!=&tcp.lru.head;node=node->next)
+		{
+			tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
+			half_closed+=(pair->local.eof||pair->remote.eof);
+			held+=(pair->local.buf!=0)+(pair->remote.buf!=0);
+		}
+		tcp_conns+=tcp.lru.size();
+		udp_conns+=udp.lru.size();
+		if(rule.enable_tcp)
+			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu\n",
+				rule.index,tcp.lru.size(),tcp.total,half_closed,tcp.bytes[0],tcp.bytes[1]);
+		if(rule.enable_udp)
+			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu\n",
+				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1]);
+	}
+	int scratch=(tcp_scratch!=0);
+	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d\n",
+		tcp_buf_pool.alloc,held,tcp_buf_pool.free_bufs.cnt,scratch,
+		tcp_pair_pool.slabs,tcp_pair_pool.free_objs.cnt,udp_pair_pool.slabs,udp_pair_pool.free_objs.cnt);
+	//先写出再检查：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
+	fflush(stdout);
+	DEBUG_ASSERT(tcp_buf_pool.alloc==held+tcp_buf_pool.free_bufs.cnt+scratch);
+	DEBUG_ASSERT(tcp_pair_pool.slabs*obj_pool_slab_objs-tcp_pair_pool.free_objs.cnt==tcp_conns);
+	DEBUG_ASSERT(udp_pair_pool.slabs*obj_pool_slab_objs-udp_pair_pool.free_objs.cnt==udp_conns);
+	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+		DEBUG_ASSERT((int)it->udp_manager.adress_to_info.size()==it->udp_manager.lru.size());
+}
+
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
 	mylog(log_info, "got sigpipe, ignored");
@@ -1864,6 +1944,10 @@ int main(int argc, char *argv[])
     ev_signal signal_watcher_sigint;
     ev_signal_init(&signal_watcher_sigint, sigint_cb, SIGINT);
     ev_signal_start(loop, &signal_watcher_sigint);
+
+    ev_signal signal_watcher_sigusr1;
+    ev_signal_init(&signal_watcher_sigusr1, sigusr1_cb, SIGUSR1);
+    ev_signal_start(loop, &signal_watcher_sigusr1);
 
 	//unit_test();
 	assert(sizeof(u64_t)==8);

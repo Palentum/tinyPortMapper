@@ -121,6 +121,14 @@ An idle TCP connection uses about 0.3 KB of tinymapper's memory (earlier version
 
 When stdout is not a terminal (a file, a pipe, or the journal under systemd/procd), log lines are buffered and written every 400 ms, or when the stdio buffer fills up (4 KiB with glibc, 1 KiB with musl), instead of one write per line, so a line can appear up to 400 ms late, and lines written just before a crash, an unhandled signal such as SIGHUP, or a SIGKILL can be lost; on a terminal every line is written immediately. The time zone of log timestamps is read once at startup.
 
+Send `SIGUSR1` (`kill -USR1 <pid>`) to write counters to the log; earlier versions exited on SIGUSR1. The lines are written at every `--log-level` except 0 and flushed at once:
+```
+stats rule 1 tcp: conns=12 total=34567 half_closed=1 up_bytes=123456789 down_bytes=987654321
+stats rule 1 udp: sessions=3 total=120 up_pkts=5000 up_bytes=320000 down_pkts=4990 down_bytes=319360 up_drop=0 down_drop=10
+stats pool: bufs alloc=13 held=2 free=10 scratch=1 tcp_pairs slabs=1 free=52 udp_pairs slabs=1 free=61
+```
+Each rule gets a `tcp` and/or a `udp` line: current connections or sessions, the number created since startup, TCP connections that one side has half-closed, and the bytes (UDP: packets and bytes) sent client→remote (`up_`) and remote→client (`down_`) since startup. `up_drop`/`down_drop` count UDP packets dropped because sending failed, e.g. with EAGAIN when the socket buffer was full. An unreachable UDP remote is not counted there: the packets are sent, the ICMP error is reported as a `recv failed` warning, and `up_pkts` grows while `down_pkts` does not. The `pool` line shows the 64 KiB TCP buffers (`alloc` = `held` by connections with unsent data + `free` for reuse + the shared receive buffer `scratch`) and the slabs of 64 connection objects, which are never freed.
+
 # Peformance Test
 ```
 root@debian9:~# iperf3 -c 127.0.0.1 -p5202
