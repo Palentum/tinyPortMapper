@@ -190,11 +190,7 @@ template<class T> struct obj_pool_t
 		if(free_objs.head==0)
 		{
 			char *slab=(char *)malloc(sizeof(T)*obj_pool_slab_objs);
-			if(slab==0)
-			{
-				mylog(log_fatal,"malloc for %d connection objects failed\n",obj_pool_slab_objs);
-				myexit(1);
-			}
+			if(slab==0) return 0;//调用方只拒这个客户端，不退出进程（T11 审查 F2）
 			slabs++;
 			for(int i=0;i<obj_pool_slab_objs;i++)
 				free_objs.push(slab+sizeof(T)*i,sizeof(T));
@@ -223,11 +219,7 @@ struct tcp_buf_pool_t
 	{
 		if(free_bufs.head!=0) return (char *)free_bufs.pop(max_data_len_tcp);
 		char *buf=(char *)malloc(max_data_len_tcp);
-		if(buf==0)
-		{
-			mylog(log_fatal,"malloc for a %d-byte tcp buffer failed\n",max_data_len_tcp);
-			myexit(1);
-		}
+		if(buf==0) return 0;//调用方只关这一对，不退出进程（T11 审查 F2）
 		alloc++;
 		return buf;
 	}
@@ -918,7 +910,16 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			return;
 		}
 		DEBUG_ASSERT(my_info.data_len==0&&my_info.buf==0);
-		if(tcp_scratch==0) tcp_scratch=tcp_buf_pool.get();
+		if(tcp_scratch==0)
+		{
+			tcp_scratch=tcp_buf_pool.get();
+			if(tcp_scratch==0)
+			{
+				mylog(log_warn,"[tcp]connection {%s} closed bc of malloc for a %d-byte buffer failed\n",tcp_pair.addr.get_str(),max_data_len_tcp);
+				conn_manager_tcp.erase_closed(&tcp_pair);
+				return;
+			}
+		}
 		int recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
@@ -1121,6 +1122,14 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		return 1;
 		//continue;
 	}
+	//先取对象再建上游 socket：分配失败时上游看不到这次连接，也不推进 roundrobin
+	tcp_pair_t *new_pair=tcp_pair_pool.get();
+	if(new_pair==0)
+	{
+		mylog(log_warn,"[tcp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+		close(new_fd);
+		return 1;
+	}
 	int remote_index=select_remote_index(*rule,tmp_addr);
 	address_t &remote_addr=rule->remote_targets[remote_index].addr;
 
@@ -1129,6 +1138,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	if(new_remote_fd<0)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",tmp_addr.get_str(),get_sock_error());
+		tcp_pair_pool.put(new_pair);
 		close(new_fd);
 		return 1;
 	}
@@ -1145,6 +1155,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	{
 		//立即失败（如无路由的 ENETUNREACH、本地端口耗尽的 EADDRNOTAVAIL）：不建连接对
 		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",tmp_addr.get_str(),rule->remote_targets[remote_index].remote_str,get_sock_error());
+		tcp_pair_pool.put(new_pair);
 		close(new_remote_fd);
 		close(new_fd);
 		//EADDRNOTAVAIL 要先扫完整个临时端口范围（每次可达数 ms）：结束本轮，端口耗尽时回到每次迭代拒绝一个
@@ -1159,7 +1170,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		mylog(log_debug,"[tcp]connect returned 0\n");
 	}
 
-	tcp_pair_t &tcp_pair=*tcp_pair_pool.get();
+	tcp_pair_t &tcp_pair=*new_pair;
 
 	conn_manager_tcp.lru.new_key(&tcp_pair);
 	conn_manager_tcp.total++;
@@ -1366,7 +1377,14 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//assert(ret==0);
 
 
-		udp_pair_t &udp_pair=*udp_pair_pool.get();
+		udp_pair_t *new_pair=udp_pair_pool.get();
+		if(new_pair==0)
+		{
+			mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+			close(new_udp_fd);
+			return;
+		}
+		udp_pair_t &udp_pair=*new_pair;
 		conn_manager_udp.lru.new_key(&udp_pair);
 		conn_manager_udp.total++;
 		udp_pair.owner=rule;
