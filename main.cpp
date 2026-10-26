@@ -32,6 +32,10 @@ static const int max_accept_per_round=8;
 //内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
 static const int listen_backlog=65535;
 static const my_time_t lru_move_interval=1000;
+//上游第一次 send 不超过这么多字节时才不设 TCP_NODELAY（T15）。536 是 TCP_MSS_DEFAULT：对端初始窗口比它大时，这么多数据整段落在窗口内；
+//比它小时内核把 MSS 截到窗口（tcp_bound_to_half_wnd），也不会在窗口边沿切出小段。更大的第一次写入可能被没对齐 MSS 的窗口边沿
+//切出一个小段（如后端接收缓冲 8 KiB 时初始窗口 7240、路径 MSS 1388），尾段就要等这个小段的 ACK
+static const int nodelay_first_max=536;
 
 int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
@@ -810,6 +814,22 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 	return 0;
 }
 
+//每次 send 之前调用，info 是接收这次 send 的一侧（T15）：上游的 TCP_NODELAY 推迟到第二次 send 之前才设。
+//Nagle（Linux 用 Minshall 变体）只扣"前面还有没确认的小段"时的小段，第一次 send 的那一小段不会被扣；
+//只往上游写一次的短连接（CRR、小的 RPC 请求）省一次 setsockopt。客户端一侧的 nodelay_wait 总是 0
+static inline void nodelay_before_send(tcp_info_t &info,int len)
+{
+	if(info.nodelay_wait==0) return;
+	if(info.nodelay_wait==1&&len<=nodelay_first_max)
+	{
+		info.nodelay_wait=2;
+		return;
+	}
+	int yes=1;
+	setsockopt(info.fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+	info.nodelay_wait=0;
+}
+
 //同一 fd 上切换事件一律 stop → 改 events → start，不经 ev_io_init：EV__IOFDSET 表示新 fd，libev fd_reify 的本地补丁
 //对它直接 ADD，fd 仍在 epoll 中时就成了 ADD（EEXIST）再 MOD（T13）
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -969,6 +989,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(other_info.connected)
 		{
 			DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
+			nodelay_before_send(other_info,my_info.data_len);
 			send_len=send(other_fd,my_info.begin,my_info.data_len,0);
 		}
 
@@ -1023,6 +1044,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 
 		DEBUG_ASSERT(other_info.data_len!=0);
+		nodelay_before_send(my_info,other_info.data_len);
 		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
 		if(send_len==0)
 		{
@@ -1144,11 +1166,6 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	}
 	if(sock_buf_explicit)
 		set_buf_size(new_remote_fd,socket_buf_size);
-	if(!disable_tcp_nodelay)
-	{
-		int yes=1;
-		setsockopt(new_remote_fd, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-	}
 
 	ret=connect(new_remote_fd,(struct sockaddr*) &remote_addr.inner,remote_addr.get_len());
 	if(ret!=0&&errno!=EINPROGRESS)
@@ -1191,6 +1208,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair.remote.fd=new_remote_fd;
 	//tcp_pair.remote.ev.events=EV_READ;
 	tcp_pair.remote.ev.data=&tcp_pair;
+	tcp_pair.remote.nodelay_wait=!disable_tcp_nodelay;//TCP_NODELAY 由 nodelay_before_send 在 send 之前设（T15）
 
 	conn_manager_tcp.lru.update(&tcp_pair);
 	//tcp_pair.last_active_time=get_current_time();

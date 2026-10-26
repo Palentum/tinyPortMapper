@@ -150,6 +150,7 @@ struct tcp_info_t:not_copy_able_t
 	int data_len;
 	int eof;//本侧 recv 已返回 0：不再读本侧，对另一侧发 shutdown(SHUT_WR)
 	int connected;//已确认连接建立（accept 得到、connect 返回 0，或建连中可写且无错误）；为 0 时 watcher 同时等读写、不收发，对建连中的 socket 调 shutdown 会中止 connect
+	int nodelay_wait;//只用于上游（T15）：TCP_NODELAY 还没设时为 1（还没 send 过）或 2（已 send 过一次，下次 send 前要设）；已设或 --disable-tcp-nodelay 时为 0
 	tcp_info_t()
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
@@ -160,6 +161,7 @@ struct tcp_info_t:not_copy_able_t
 		data_len=0;
 		eof=0;
 		connected=0;
+		nodelay_wait=0;
 
 	}
 	~tcp_info_t()
