@@ -79,6 +79,35 @@ func TestUDPSessionIsolation(t *testing.T) {
 	}
 }
 
+// 上游端口无人监听（T14）：会话 socket 是 connect 过的 UDP socket，收到 ICMP 端口不可达后内核置 sk_err，epoll 只报 EPOLLERR（会话只登记了读，
+// 接收队列为空，没有 EPOLLIN）。libev 的 epoll_poll 要把它当作 fd 想要的读事件交给 udp_cb，由 recv 取走错误；丢了 ERR/HUP 的映射时回调不会
+// 被调用，水平触发的 EPOLLERR 每轮都报，事件循环空转到下一次 sendto 取走错误为止（那个包随之丢掉）。TCP 测不出这一映射：tcp_done 把
+// sk_shutdown 置为 SHUTDOWN_MASK，此后 tcp_poll 报 ERR/HUP 时总同时报 EPOLLIN 与 EPOLLOUT，登记过的那一位照常到达。
+// 之后上游开始监听，同一会话照常转发
+func TestUDPRemoteRefused(t *testing.T) {
+	t.Parallel()
+	remote, listen := loopback4(t), loopback4(t)
+	m := forward(t, "u", listen, remote)
+	c := udpDial(t, "", listen)
+	probe := []byte("to-closed-port")
+	if _, err := c.Write(probe); err != nil {
+		t.Fatal(err)
+	}
+	// 日志最多晚一个 timer_interval（400 ms）写出；每次没查到就再发一个（ICMP 有全局限速，偶尔会被丢）
+	eventually(t, ioTimeout, 500*time.Millisecond, func() error {
+		if m.logLines("[udp]recv failed", "Connection refused") != 0 {
+			return nil
+		}
+		c.Write(probe)
+		return errors.New("日志里没有会话 socket 的 recv 失败（ECONNREFUSED）：EPOLLERR 没有交给 udp_cb")
+	})
+	m.expectIdleCPU(t, "会话 socket 收到 ICMP 端口不可达之后（EPOLLERR）")
+	serveUDP(t, remote, "late:")
+	if prefix := udpReplyFrom(t, c, "after-listen"); prefix != "late:" {
+		t.Fatalf("回包前缀 %q，期望 %q", prefix, "late:")
+	}
+}
+
 // 空闲超过 conn_timeout_udp（180 s）的会话被清理，期间保持活跃的会话不受影响；
 // 被清理的客户端再发包时，tinymapper 为它新建会话，上游看到新的源地址。
 // 清理每轮最多关 1 条、约 1.2 s 一轮：活跃会话若也超时了（LRU 没把它挪到队首，或挪动时没刷新时间戳），

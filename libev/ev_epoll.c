@@ -67,6 +67,9 @@
 
 #define EV_EMASK_EPERM 0x80
 
+/* tinymapper 本地补丁（T14，epoll_poll 里 ERR/HUP 的映射）的标记：my_ev.cpp 检查它，补丁丢失时编译失败 */
+#define TPM_LIBEV_EPOLL_HUP_PATCH 1
+
 static void
 epoll_modify (EV_P_ int fd, int oev, int nev)
 {
@@ -167,8 +170,15 @@ epoll_poll (EV_P_ ev_tstamp timeout)
 
       int fd = (uint32_t)ev->data.u64; /* mask out the lower 32 bits */
       int want = anfds [fd].events;
-      int got  = (ev->events & (EPOLLOUT | EPOLLERR | EPOLLHUP) ? EV_WRITE : 0)
-               | (ev->events & (EPOLLIN  | EPOLLERR | EPOLLHUP) ? EV_READ  : 0);
+      int got  = (ev->events & EPOLLOUT ? EV_WRITE : 0)
+               | (ev->events & EPOLLIN  ? EV_READ  : 0);
+
+      /* tinymapper 本地补丁（T14）：ERR/HUP 只算作 fd 想要的事件。原逻辑把它们当成读写都到，只等读的 fd 收到 HUP
+         （如我方 SHUT_WR 后对端也关闭）就走下面的分支，MOD 成内核里本来就是的掩码。want 非 0 时内核登记的就是 want，
+         内核也只报登记过的 IN/OUT，所以多出的位只可能来自这个映射；want 为 0（惰性删除）时仍按读写都到，照常 DEL：
+         TCP 报 ERR/HUP 时总带着 IN 和 OUT，但只报 ERR 的 fd（如收到 ICMP 错误的 UDP socket）不这样就会每轮都报、空转 */
+      if (ev->events & (EPOLLERR | EPOLLHUP))
+        got |= want ? want : EV_READ | EV_WRITE;
 
       /*
        * check for spurious notification.
