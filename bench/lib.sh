@@ -59,7 +59,18 @@ start_backends() {
 
 stop_backends() { local p; for p in $SRV_PIDS; do stop_pid srv "$p"; done; SRV_PIDS=""; }
 
-backend_for() { case $1 in tcp_bw_*|udp_*) echo $IPERF_PORT ;; *) echo $ECHO_PORT ;; esac; }
+backend_for() { case $1 in udp_rr_*) echo $ECHO_PORT ;; tcp_bw_*|udp_*) echo $IPERF_PORT ;; *) echo $ECHO_PORT ;; esac; }
+
+# iperf_udp <负载>：udp_{bw,pps}_<包长>[_p<N>][_r] 的 iperf3 参数。_p<N> 为 N 条流（iperf3 -P N），每条流是转发器里的一个会话；
+# _r 为反向（-R）：后端发、客户端收，数据走转发器的回程。iperf3 3.16 加 -R 时 end.sum_sent 仍是发送方（后端）、
+# end.sum_received 仍是接收方（客户端），所以各指标与正向含义相同
+iperf_udp() {
+  local w=${1%_r} len par=1 r=""
+  [ "$w" = "$1" ] || r=" -R"
+  len=${w#udp_*_}
+  case $w in *_p[0-9]*) par=${w##*_p}; len=${len%_p*} ;; esac
+  echo "-u -b 0 -l $len -P $par$r"
+}
 
 # 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀] | rinetd | realm-1c | realm-2c
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物
@@ -107,10 +118,10 @@ client() {
   case $w in
     tcp_rr_*)  on cli "$c $FWDBENCH rr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     tcp_crr_*) on cli "$c $FWDBENCH crr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
+    udp_rr_*)  on cli "$c $FWDBENCH udp-rr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     udp_*)
-      local len=${w#udp_*_} par=1 #udp_pps_64_p<N>：N 条流，见 bench.sh
-      case $w in *_p[0-9]*) par=${w##*_p}; len=${len%_p*} ;; esac
-      on cli "$c $IPERF3 -c $TARGET_IP -p $TARGET_PORT -u -b 0 -l $len -P $par -t $d -J" | jq -c '{sent_pkts: .end.sum_sent.packets,
+      # sent_pkts 是发送方的发包数：正向为客户端，_r 为后端
+      on cli "$c $IPERF3 -c $TARGET_IP -p $TARGET_PORT $(iperf_udp "$w") -t $d -J" | jq -c '{sent_pkts: .end.sum_sent.packets,
         recv_pkts: (.end.sum_received.packets - .end.sum_received.lost_packets), seconds: .end.sum_received.seconds,
         recv_kpps: ((.end.sum_received.packets - .end.sum_received.lost_packets) / .end.sum_received.seconds / 1e3),
         lost_pct: .end.sum_received.lost_percent, err: .error}' ;;
@@ -120,7 +131,12 @@ client() {
   esac
 }
 
-snmp_udp() { [ "$CLI_HOST" = "$FWD_HOST" ] && echo "# cli_on_fwd=1" || echo "# cli_on_fwd=0"; on fwd "grep '^Udp:' /proc/net/snmp"; }
+# snmp_udp：fwd 上 /proc/net/snmp 的 Udp 计数，前面两行标记客户端、后端是否与转发器同机（同机时它们的发包也计入 OutDatagrams）
+snmp_udp() {
+  [ "$CLI_HOST" = "$FWD_HOST" ] && echo "# cli_on_fwd=1" || echo "# cli_on_fwd=0"
+  [ "$SRV_HOST" = "$FWD_HOST" ] && echo "# srv_on_fwd=1" || echo "# srv_on_fwd=0"
+  on fwd "grep '^Udp:' /proc/net/snmp"
+}
 
 # count_phase <阶段名> <perf 事件参数> <输出前缀> <负载> <秒数>：perf stat 计数 fwd 进程，窗口覆盖客户端整个生命周期
 # 输出 <前缀>.<阶段>.csv / .client.json / .snmp.txt；UDP 的计数单位取 fwd 上 /proc/net/snmp 的 OutDatagrams 增量

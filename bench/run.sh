@@ -12,6 +12,12 @@
 #   FWDS     转发器，默认 "direct tinymapper tinymapper-musl rinetd realm-1c realm-2c"；
 #            tinymapper[-musl]@<后缀> 使用 build/tinymapper-{glibc,musl}-<后缀>，缺失时以 REF=<后缀> 自动编译
 #   TESTS    测试项，默认全部 8 项；REPS 轮数（3）；DUR 每项秒数（10）
+#            另有不在默认列表里的 UDP 负载（TESTS / SC_TESTS 里显式指定）：
+#              udp_pps_64_p<N>  N 条流（iperf3 -P N），每条流是转发器里的一个会话
+#              <UDP 负载>_r     反向（iperf3 -R）：后端发、客户端收，数据走转发器回程；udp_pps_64_r、udp_pps_64_p<N>_r、udp_bw_1400_r
+#              udp_rr_<N>       fwdbench udp-rr：N 个会话各一个 64 B 请求在途，后端是 fwdbench server 的 UDP 回显；
+#                               udp_rr_1 测低负载延迟，udp_rr_64 测多会话回程；超时 200 ms 未回记为丢失
+#            syscall 计数单位：udp_rr 为每个往返，_r 为转发器发出的每个包
 #   SC_FWDS / SC_TESTS / SC_DUR  syscall 计数的转发器（默认 FWDS 去掉 direct、realm-2c）、负载（5 个）、秒数（8）
 #   PROF_RUNS / PROF_DUR / PHASES 剖析范围（格式见 bench/prof/prof.sh）
 #   SKIP_BUILD=1  不重新编译工作区的 tinymapper（缺失的二进制仍会编译）

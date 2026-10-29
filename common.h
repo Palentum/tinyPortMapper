@@ -264,7 +264,6 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	address_t adress;
 	int fd;
 	ev_io ev;//ev.data 指向本对象（T10）
-	int local_listen_fd;
 	forward_rule_t *owner;
 	int remote_index;
 	int batch_group;//入向这一批里本会话的组号（U3），批外恒为 -1

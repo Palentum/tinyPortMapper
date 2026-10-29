@@ -19,11 +19,10 @@ run_test() {
     tcp_bw_1|tcp_bw_8)
       j=$(on cli "$CLI $IPERF3 -c $TARGET_IP -p $TARGET_PORT -t $DUR -O 1 -P ${t##*_} -J")
       echo "$j" | jq -c '{gbps: (.end.sum_received.bits_per_second/1e9), retrans: .end.sum_sent.retransmits, err: .error}' ;;
-    udp_bw_1400|udp_pps_64|udp_pps_64_p*)
-      # udp_pps_64_p<N>：N 条流（iperf3 -P N），每条流是转发器里的一个会话
-      local len=${t#udp_*_} par=1
-      case $t in *_p[0-9]*) par=${t##*_p}; len=${len%_p*} ;; esac
-      j=$(on cli "$CLI $IPERF3 -c $TARGET_IP -p $TARGET_PORT -u -b 0 -l $len -P $par -t $DUR -O 1 -J")
+    udp_rr_*)
+      on cli "$CLI $FWDBENCH udp-rr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;
+    udp_bw_*|udp_pps_*)
+      j=$(on cli "$CLI $IPERF3 -c $TARGET_IP -p $TARGET_PORT $(iperf_udp "$t") -t $DUR -O 1 -J")
       echo "$j" | jq -c '{gbps: (.end.sum_received.bits_per_second/1e9), kpps: ((.end.sum_received.packets - .end.sum_received.lost_packets)/.end.sum_received.seconds/1e3), sent_kpps: (.end.sum_sent.packets/.end.sum_sent.seconds/1e3), lost_pct: .end.sum_received.lost_percent, err: .error}' ;;
     tcp_rr_64|tcp_rr_1000)
       on cli "$CLI $FWDBENCH rr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;

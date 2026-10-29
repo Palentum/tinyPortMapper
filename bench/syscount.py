@@ -2,8 +2,9 @@
 """syscall 计数汇总（P0.3）：读取 syscount.sh / prof.sh stat 阶段的原始数据，换算为每单位 syscall 次数。
 
 "不含等待" = 总计减去 epoll_pwait 与 poll/select：等待类调用次数随负载变化，其余都是结构性次数，适合做回归门槛。
-单位：rr = 每个请求/响应对，crr = 每个连接，udp = 转发器发出的每个包（fwd 上 /proc/net/snmp 的 OutDatagrams 增量，
-客户端与转发器同机时再减去客户端发包数），bw = 每 GB（iperf3 服务端收到的 1e9 字节）。
+单位：rr = 每个请求/响应对（tcp_rr、udp_rr 都取客户端报告的 ops），crr = 每个连接，udp = 转发器发出的每个包
+（fwd 上 /proc/net/snmp 的 OutDatagrams 增量，发送方与转发器同机时再减去发送方的发包数；发送方正向为客户端，
+_r 为后端），bw = 每 GB（iperf3 服务端收到的 1e9 字节）。
 
 用法：python3 -I bench/syscount.py <目录> [--json <输出.json>]   # markdown 表格打印到标准输出
 JSON 每个 (转发器, 负载) 一行、键序固定，便于 diff。
@@ -44,21 +45,22 @@ def load_stat(p):
 
 
 def snmp(p):
-    """返回 (前后两次 Udp 计数, 客户端是否与转发器同机)；旧数据没有标记行，按同机处理。"""
+    """返回 (前后两次 Udp 计数, {"cli": 客户端是否与转发器同机, "srv": 后端是否与转发器同机})；旧数据没有标记行，按同机处理。"""
     text = p.read_text()
     rows = [l.split()[1:] for l in text.splitlines() if l.startswith("Udp:")]
     pairs = [dict(zip(rows[i], map(int, rows[i + 1]))) for i in range(0, len(rows), 2)]
-    return pairs, "# cli_on_fwd=0" not in text
+    return pairs, {r: f"# {r}_on_fwd=0" not in text for r in ("cli", "srv")}
 
 
 def per_unit(pre, wl, phase="stat"):
     """返回 (单位数, 单位名, 吞吐)。"""
     c = json.loads(Path(f"{pre}.{phase}.client.json").read_text())
-    if wl.startswith(("tcp_rr", "tcp_crr")):
-        return c["ops"], "op" if wl.startswith("tcp_rr") else "conn", c["ops_per_sec"]
+    if wl.startswith(("tcp_rr", "tcp_crr", "udp_rr")):
+        return c["ops"], "conn" if wl.startswith("tcp_crr") else "op", c["ops_per_sec"]
     if wl.startswith("udp"):
         (b, a), same = snmp(Path(f"{pre}.{phase}.snmp.txt"))
-        return a["OutDatagrams"] - b["OutDatagrams"] - (c["sent_pkts"] if same else 0), "pkt", c["recv_kpps"] * 1e3
+        sender = "srv" if wl.endswith("_r") else "cli"
+        return a["OutDatagrams"] - b["OutDatagrams"] - (c["sent_pkts"] if same[sender] else 0), "pkt", c["recv_kpps"] * 1e3
     return c["bytes"] / 1e9, "GB", c["gbps"]
 
 

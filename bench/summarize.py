@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # 汇总 bench.sh 输出的 raw.jsonl：每个 (test, fwd) 取多轮中位数，输出 markdown 表格
-# 用法：python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl；转发器按首次出现的顺序排列，缺失的测试项不输出
+# 用法：python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl；转发器按首次出现的顺序排列，缺失的测试项不输出；
+# 名字不固定的 UDP 负载（udp_pps_64_p<N>、*_r、udp_rr_<N>）按首次出现的顺序接在同类固定项之后
 import json
 import statistics
 import sys
@@ -9,6 +10,7 @@ from collections import defaultdict
 path = sys.argv[1]
 rows = defaultdict(list)
 FWDS = []
+TESTS = []
 for line in open(path):
     line = line.strip()
     if line.startswith("{"):
@@ -16,6 +18,8 @@ for line in open(path):
         rows[(r["test"], r["fwd"])].append(r)
         if r["fwd"] not in FWDS:
             FWDS.append(r["fwd"])
+        if r["test"] not in TESTS:
+            TESTS.append(r["test"])
 
 
 def med(rs, k):
@@ -78,7 +82,8 @@ for t in ["tcp_rr_64", "tcp_rr_1000", "tcp_crr_32"]:
         ("kops/s 每核", per_core("ops_per_sec", 1e-3)),
     ])
 
-for t in ["udp_bw_1400", "udp_pps_64"]:
+UDP_FIXED = ["udp_bw_1400", "udp_pps_64"]
+for t in UDP_FIXED + [t for t in TESTS if t.startswith(("udp_bw_", "udp_pps_")) and t not in UDP_FIXED]:
     table(t, [
         ("收到 Gbit/s（中位）", lambda rs: f(med(rs, "gbps"), 2)),
         ("收到 kpps", lambda rs: f(med(rs, "kpps"), 0)),
@@ -87,6 +92,20 @@ for t in ["udp_bw_1400", "udp_pps_64"]:
         ("丢包 %", lambda rs: f(med(rs, "lost_pct"), 1)),
         ("转发器 CPU%", cpu),
         ("收到 kpps 每核", per_core("kpps")),
+    ])
+
+# udp_rr_<N>：fwdbench udp-rr，丢失 = 超时（默认 200 ms）没收到回显的请求
+for t in [t for t in TESTS if t.startswith("udp_rr_")]:
+    table(t, [
+        ("ops/s（中位）", lambda rs: f(med(rs, "ops_per_sec"), 0)),
+        ("范围", lambda rs: rng(rs, "ops_per_sec", lambda x: f"{x/1e3:.1f}k")),
+        ("p50 µs", lambda rs: f(med(rs, "p50_us"), 0)),
+        ("p99 µs", lambda rs: f(med(rs, "p99_us"), 0)),
+        ("p99 范围", lambda rs: rng(rs, "p99_us", lambda x: f"{x:.0f}")),
+        ("p99.9 µs", lambda rs: f(med(rs, "p999_us"), 0)),
+        ("丢失 %", lambda rs: f(med(rs, "lost_pct"), 3)),
+        ("转发器 CPU%", cpu),
+        ("kops/s 每核", per_core("ops_per_sec", 1e-3)),
     ])
 
 table("tcp_mem_5000", [

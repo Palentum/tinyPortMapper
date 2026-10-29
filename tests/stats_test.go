@@ -21,6 +21,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"syscall"
 	"testing"
@@ -490,6 +491,167 @@ func TestStatsUDPDrops(t *testing.T) {
 		if s.sessions != 1 || s.total != 1 {
 			t.Errorf("sessions=%d total=%d，期望 1/1", s.sessions, s.total)
 		}
+	})
+	// 回程批量（U4）：监听 fd 的发送一律 EAGAIN，暂停期间 3 个会话各排 k 个回包，恢复后同一轮里收进回程批。downbatch 共 30 个，
+	// 本轮阻塞之前一次发出：EAGAIN 丢掉该规则这一组剩下的全部包，恰好一行 "dropped 30 packets"（EAGAIN 后逐包重试会多出若干行）；
+	// downbatchfull 共 90 个，跨一次批满，每行报告的丢包数不超过批大小 64，至少两行。down_drop 精确、down_pkts 为 0，日志报告的
+	// 丢包数之和与 down_drop 相同；逐包 sendto 时（835690e）每包一行 "[udp]sento returned -1"。之后不空转
+	for _, c := range []struct {
+		name string
+		k    int
+	}{{"downbatch", 10}, {"downbatchfull", 30}} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			const n = 3
+			be := quietUDP(t, loopback4(t))
+			listen := loopback4(t)
+			wait := listenPoints("u", portOf(listen))
+			args := []string{"-l", listen, "-r", be.addr, "-u"}
+			probe := startMapper(t, wait, args...)
+			fd := listenFD(probe.pid(), "udp", portOf(listen))
+			probe.stop(t, false)
+			if fd < 0 {
+				t.Fatal("探测时没有找到 UDP 监听 socket")
+			}
+			m := startMapperSendtoFail(t, fd, fd+1, wait, args...)
+			sessions := make([]string, n)
+			for i := range sessions {
+				sessions[i] = helloConn(t, be, udpDial(t, "", listen), fmt.Appendf(nil, "hello-%d", i))
+			}
+			var replies []udpReply
+			for _, i := range interleaveOrder(n, c.k, true) {
+				replies = append(replies, udpReply{be, sessions[i], []byte("pong")})
+			}
+			total := len(replies)
+			m.pause(t)
+			queueReplies(t, m, replies)
+			m.resume(t)
+			var d statsDump
+			eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+				d = m.statsAfterSignal(t)
+				if d.udp[1].downDrop != uint64(total) {
+					return fmt.Errorf("down_drop=%d，期望 %d", d.udp[1].downDrop, total)
+				}
+				return nil
+			})
+			s := d.udp[1]
+			if s.downPkts != 0 || s.downBytes != 0 {
+				t.Errorf("down_pkts=%d down_bytes=%d，期望全 0（回包发送全部失败）", s.downPkts, s.downBytes)
+			}
+			if s.upPkts != uint64(be.count()) || s.upDrop != 0 {
+				t.Errorf("up_pkts=%d up_drop=%d，期望 %d/0（上行应全部成功）", s.upPkts, s.upDrop, be.count())
+			}
+			if s.sessions != n || s.total != n {
+				t.Errorf("sessions=%d total=%d，期望 %d/%d", s.sessions, s.total, n, n)
+			}
+			var batch []int
+			eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+				var drops, lines int
+				if drops, lines, batch = loggedDownDrops(m); drops != total {
+					return fmt.Errorf("日志里 %d 行回程发送失败的 warn 共报告丢 %d 个包，期望 %d", lines, drops, total)
+				}
+				return nil
+			})
+			if len(batch) != 0 {
+				t.Logf("回程批量发送失败的 warn 各行报告的丢包数：%v", batch)
+				switch {
+				case total <= 64 && (len(batch) != 1 || batch[0] != total):
+					t.Errorf("回程 sendmmsg 失败的 warn 报告 %v，期望恰好一行丢掉整组 %d 个", batch, total)
+				case total > 64 && (len(batch) < 2 || slices.Max(batch) > 64):
+					t.Errorf("回程 sendmmsg 失败的 warn 报告 %v，期望至少两行、每行不超过批大小 64", batch)
+				}
+			}
+			m.expectIdleCPU(t, "回程发送 EAGAIN 之后")
+		})
+	}
+	// 回程批量（U4）、两条规则：只有规则 1 的监听 fd 发送 EAGAIN。两条规则各 2 个会话、各 8 个回包，暂停期间排好，恢复后在同一轮里收进
+	// 回程批、一次发出：规则 1 的组整组丢掉（EAGAIN 只丢该规则这一组剩下的包），规则 2 的组照发、按序到达；down_drop 只记在规则 1 上，
+	// 规则 2 的 down_pkts、down_bytes 精确。批里的顺序是会话回调的顺序（各会话一次收完自己的回包），回调按就绪的逆序执行，所以先排
+	// 规则 2 的会话、后排规则 1 的：规则 1 的组排在批首、先发，它的 EAGAIN 不能连累后面规则 2 的组
+	t.Run("downmultirule", func(t *testing.T) {
+		t.Parallel()
+		const perRule, k = 2, 8
+		bes := []*udpRecorder{quietUDP(t, loopback4(t)), quietUDP(t, loopback4(t))}
+		listens := []string{loopback4(t), loopback4(t)}
+		var cfg strings.Builder
+		var wait []listenPoint
+		for r := range bes {
+			fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = %q\nno_tcp = true\nuse_udp = true\n\n", listens[r], bes[r].addr)
+			wait = append(wait, listenPoints("u", portOf(listens[r]))...)
+		}
+		path := writeConfig(t, cfg.String())
+		probe := startMapper(t, wait, "-c", path)
+		fd := listenFD(probe.pid(), "udp", portOf(listens[0]))
+		probe.stop(t, false)
+		if fd < 0 {
+			t.Fatal("探测时没有找到规则 1 的 UDP 监听 socket")
+		}
+		m := startMapperSendtoFail(t, fd, fd+1, wait, "-c", path)
+		type client struct {
+			rule    int
+			c       *net.UDPConn
+			session string
+			want    [][]byte
+		}
+		var clients []*client
+		for j := range perRule {
+			for r := len(bes) - 1; r >= 0; r-- {
+				c := udpDial(t, "", listens[r])
+				clients = append(clients, &client{r, c, helloConn(t, bes[r], c, fmt.Appendf(nil, "hello-r%d-c%d", r, j)), nil})
+			}
+		}
+		var replies []udpReply
+		for seq := range k {
+			for ci, cl := range clients {
+				msg := fmt.Appendf(nil, "rule%d-c%d-s%d-%s", cl.rule, ci, seq, strings.Repeat("x", ci*3+seq))
+				replies = append(replies, udpReply{bes[cl.rule], cl.session, msg})
+				cl.want = append(cl.want, msg)
+			}
+		}
+		m.pause(t)
+		queueReplies(t, m, replies)
+		m.resume(t)
+		var want2 [][]byte
+		for ci, cl := range clients {
+			if cl.rule == 1 {
+				expectReplies(t, cl.c, cl.want, fmt.Sprintf("规则 2 的客户端 %d ", ci))
+				want2 = append(want2, cl.want...)
+			}
+		}
+		for ci, cl := range clients {
+			if cl.rule == 0 {
+				cl.c.SetReadDeadline(time.Now().Add(100 * time.Millisecond))
+				if nr, err := cl.c.Read(make([]byte, 100)); err == nil {
+					t.Errorf("规则 1 的客户端 %d 收到 %d 字节回包：规则 1 的监听 fd 发送一律失败", ci, nr)
+				}
+			}
+		}
+		const dropped = perRule * k
+		var d statsDump
+		eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+			if d = m.statsAfterSignal(t); d.udp[1].downDrop != dropped {
+				return fmt.Errorf("规则 1 down_drop=%d，期望 %d", d.udp[1].downDrop, dropped)
+			}
+			return nil
+		})
+		if s := d.udp[1]; s.downPkts != 0 || s.downBytes != 0 {
+			t.Errorf("规则 1 down_pkts=%d down_bytes=%d，期望全 0", s.downPkts, s.downBytes)
+		}
+		if s := d.udp[2]; s.downPkts != uint64(len(want2)) || s.downBytes != totalLen(want2) || s.downDrop != 0 {
+			t.Errorf("规则 2 down_pkts=%d down_bytes=%d down_drop=%d，期望 %d/%d/0（另一条规则的发送失败不影响本规则）",
+				s.downPkts, s.downBytes, s.downDrop, len(want2), totalLen(want2))
+		}
+		eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+			drops, lines, batch := loggedDownDrops(m)
+			if drops != dropped {
+				return fmt.Errorf("日志里 %d 行回程发送失败的 warn 共报告丢 %d 个包，期望 %d", lines, drops, dropped)
+			}
+			if len(batch) != 0 && (len(batch) != 1 || batch[0] != dropped) {
+				t.Errorf("回程 sendmmsg 失败的 warn 报告 %v，期望恰好一行丢掉规则 1 的整组 %d 个", batch, dropped)
+			}
+			return nil
+		})
+		m.expectIdleCPU(t, "一条规则的回程发送 EAGAIN 之后")
 	})
 }
 

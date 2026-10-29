@@ -2,10 +2,12 @@ package tests
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"math/rand/v2"
 	"net"
+	"net/netip"
 	"os"
 	"slices"
 	"strings"
@@ -740,9 +742,10 @@ func (m *mapper) resume(t testing.TB) {
 	}
 }
 
-// udpRecorder 是按到达顺序记录每个包（源地址与内容）的 UDP 回显后端，回包与原包相同（无前缀）
+// udpRecorder 是按到达顺序记录每个包（源地址与内容）的 UDP 后端：recordUDP 回显，回包与原包相同（无前缀）；quietUDP 不回显
 type udpRecorder struct {
 	addr string
+	conn *net.UDPConn
 	mu   sync.Mutex
 	pkts []udpPacket
 }
@@ -752,7 +755,12 @@ type udpPacket struct {
 	data []byte
 }
 
-func recordUDP(t testing.TB, addr string) *udpRecorder {
+func recordUDP(t testing.TB, addr string) *udpRecorder { return newUDPRecorder(t, addr, true) }
+
+// quietUDP 同 recordUDP，但不回显：回包由用例经 sendTo 在选定的时刻发往各会话 socket（U4 的用例在 tinymapper 暂停期间排队回包）
+func quietUDP(t testing.TB, addr string) *udpRecorder { return newUDPRecorder(t, addr, false) }
+
+func newUDPRecorder(t testing.TB, addr string, echo bool) *udpRecorder {
 	t.Helper()
 	ua, err := net.ResolveUDPAddr("udp", addr)
 	if err != nil {
@@ -764,7 +772,7 @@ func recordUDP(t testing.TB, addr string) *udpRecorder {
 	}
 	conn.SetReadBuffer(4 << 20)
 	conn.SetWriteBuffer(4 << 20)
-	r := &udpRecorder{addr: conn.LocalAddr().String()}
+	r := &udpRecorder{addr: conn.LocalAddr().String(), conn: conn}
 	go func() {
 		buf := make([]byte, 70000)
 		for {
@@ -778,7 +786,9 @@ func recordUDP(t testing.TB, addr string) *udpRecorder {
 			r.mu.Lock()
 			r.pkts = append(r.pkts, udpPacket{from.String(), append([]byte(nil), buf[:n]...)})
 			r.mu.Unlock()
-			conn.WriteToUDP(buf[:n], from)
+			if echo {
+				conn.WriteToUDP(buf[:n], from)
+			}
 		}
 	}()
 	t.Cleanup(func() { conn.Close() })
@@ -1120,4 +1130,747 @@ func TestUDPBatchSendError(t *testing.T) {
 		}
 		return nil
 	})
+}
+
+// ---- U4：回程批量收发（会话 socket 的回包收进回程批，跨会话按规则对监听 socket 调 sendmmsg）----
+//
+// 下面的用例用不回显的后端（quietUDP）：客户端先各发一个 hello 建会话，后端从源地址得知每个会话 socket 的地址；tinymapper 暂停
+// （SIGSTOP）期间后端把回包逐个排进各会话 socket 的接收队列（queueReplies），恢复后第一轮循环里各会话的回调一起收包，回程批跨会话
+// 攒包、批满时或本轮阻塞之前发出。转发语义与逐包 recv + sendto 相同（会话内保序、回到各自的客户端、内容不变、从规则自己的监听地址
+// 发出），这些用例在 835690e（逐包收发）上同样通过。
+
+// helloSession 经 send 发出 msg（后端不回显），等后端收到后返回它的源地址，即 tinymapper 为这个客户端建的会话 socket 的地址。
+// 环回偶有丢包，500 ms 没收到就重发（命中既有会话，不新建）
+func helloSession(t testing.TB, be *udpRecorder, msg []byte, send func([]byte) error) string {
+	t.Helper()
+	for range 8 {
+		if err := send(msg); err != nil {
+			t.Fatalf("发送 %q 失败：%v", msg, err)
+		}
+		for deadline := time.Now().Add(500 * time.Millisecond); time.Now().Before(deadline); time.Sleep(2 * time.Millisecond) {
+			if src := be.sourceOf(msg); src != "" {
+				return src
+			}
+		}
+	}
+	t.Fatalf("后端一直没收到 %q：会话没有建立", msg)
+	return ""
+}
+
+// helloConn 是 helloSession 用于已 connect 的客户端 socket 的写法
+func helloConn(t testing.TB, be *udpRecorder, c *net.UDPConn, msg []byte) string {
+	t.Helper()
+	return helloSession(t, be, msg, func(b []byte) error { _, err := c.Write(b); return err })
+}
+
+// sourceOf 返回后端收到的第一个内容为 msg 的包的源地址，没有则返回空串
+func (r *udpRecorder) sourceOf(msg []byte) string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	for _, p := range r.pkts {
+		if bytes.Equal(p.data, msg) {
+			return p.from
+		}
+	}
+	return ""
+}
+
+// sendTo 从后端 socket 向 to（会话 socket 的地址）发一个包
+func (r *udpRecorder) sendTo(t testing.TB, to string, msg []byte) {
+	t.Helper()
+	ua, err := net.ResolveUDPAddr("udp", to)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := r.conn.WriteToUDP(msg, ua); err != nil {
+		t.Fatalf("后端向 %s 发 %d 字节失败：%v", to, len(msg), err)
+	}
+}
+
+// udpReply 是暂停期间后端 be 要发往会话 socket session（后端看到的源地址）的一个回包
+type udpReply struct {
+	be      *udpRecorder
+	session string
+	msg     []byte
+}
+
+// queueReplies 在 tinymapper 暂停期间按顺序发出 replies，每发一个都等它进了 tinymapper 那个会话 socket 的接收队列再发下一个
+// （sock_diag 按会话 socket 的本端、对端地址精确查找，UDP 的 rqueue 是队列中各包 truesize 之和，暂停期间没人读，每入队一个包就
+// 严格增大），所以 epoll 里各会话 socket 变为就绪的先后就是它们第一个回包在 replies 里的先后。会话 socket 的 rcvbuf 为
+// 2×min(1 MiB, rmem_max)，队列满时内核静默丢包（sk_drops 加一），这里直接失败
+func queueReplies(t testing.TB, m *mapper, replies []udpReply) {
+	t.Helper()
+	q := map[string]sockBuf{}
+	for i, r := range replies {
+		prev, ok := q[r.session]
+		if !ok {
+			prev = lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, "会话 socket", r.session, r.be.addr)
+		}
+		r.be.sendTo(t, r.session, r.msg)
+		eventually(t, ioTimeout, time.Millisecond, func() error {
+			cur, err := sockDiag(syscall.IPPROTO_UDP, r.session, r.be.addr)
+			if err != nil {
+				return err
+			}
+			if cur.drops != prev.drops {
+				t.Fatalf("会话 socket %s 丢了 %d 个包（第 %d 个回包 %d 字节；接收队列 %d 字节，rcvbuf %d）：暂停期间排队的回包超出了接收缓冲",
+					r.session, cur.drops-prev.drops, i, len(r.msg), cur.rqueue, cur.rcv)
+			}
+			if cur.rqueue <= prev.rqueue {
+				return fmt.Errorf("第 %d 个回包（%d 字节）还没进会话 socket %s 的接收队列（%d 字节）", i, len(r.msg), r.session, cur.rqueue)
+			}
+			q[r.session] = cur
+			return nil
+		})
+	}
+	t.Logf("暂停期间 %d 个回包已排进 %d 个会话 socket", len(replies), len(q))
+}
+
+// interleaveOrder 返回 n 个客户端各 k 个包的排队顺序：第 j 个包来自客户端 order[j]。random 时按固定种子随机交错，否则依次轮转
+func interleaveOrder(n, k int, random bool) []int {
+	var order []int
+	if !random {
+		for range k {
+			for i := range n {
+				order = append(order, i)
+			}
+		}
+		return order
+	}
+	rng := rand.New(rand.NewPCG(uint64(n), uint64(k)))
+	left := make([]int, n)
+	for i := range left {
+		left[i] = k
+	}
+	for len(order) < n*k {
+		if i := rng.IntN(n); left[i] > 0 {
+			left[i]--
+			order = append(order, i)
+		}
+	}
+	return order
+}
+
+// totalLen 返回各包长度之和
+func totalLen(pkts ...[][]byte) uint64 {
+	var n uint64
+	for _, ps := range pkts {
+		for _, p := range ps {
+			n += uint64(len(p))
+		}
+	}
+	return n
+}
+
+// U4：多个会话的回包在同一轮里攒成回程批。暂停期间后端给 n 个会话各排 k 个带编号、长度各异的回包（轮转或随机交错），恢复后每个客户端
+// 按序、逐字节收到自己的回包；客户端 socket 已 connect 到监听地址，内核只收从监听地址发来的包，所以回包也必须从监听地址发出。
+// 100x3 共 300 个回包，第一轮里约 21 个会话的回调就攒满 64 个，批满时当场发出，读到一半的会话剩下的回包留到下一轮：
+// 跨批也要保序。3x40 时一个会话一次收包就占去大半个批。ipv6 与 dualstack（[::] 监听同批回给 v4 映射与 IPv6 客户端）核对
+// 各包的目的地址与 msg_namelen。统计：down_pkts、down_bytes 精确，无丢包，sessions==total==n；之后不空转
+func TestUDPReturnBatch(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name    string
+		listen  string   // 监听地址
+		clients []string // 客户端目标地址，按客户端编号轮换
+		backend string
+		n, k    int
+		random  bool
+	}{
+		{"100x3", "127.0.0.1", []string{"127.0.0.1"}, "127.0.0.1", 100, 3, false},
+		{"3x40", "127.0.0.1", []string{"127.0.0.1"}, "127.0.0.1", 3, 40, true},
+		{"ipv6-10x8", "::1", []string{"::1"}, "::1", 10, 8, true},
+		{"dualstack-8x10", "::", []string{"127.0.0.1", "::1"}, "127.0.0.1", 8, 10, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			be := quietUDP(t, hostPort(c.backend, freePort(t)))
+			lport := freePort(t)
+			m := forward(t, "u", hostPort(c.listen, lport), be.addr)
+			conns := make([]*net.UDPConn, c.n)
+			sessions := make([]string, c.n)
+			for i := range conns {
+				conns[i] = udpDial(t, "", hostPort(c.clients[i%len(c.clients)], lport))
+				sessions[i] = helloConn(t, be, conns[i], fmt.Appendf(nil, "hello-%03d", i))
+			}
+			var replies []udpReply
+			want := make([][][]byte, c.n)
+			for _, i := range interleaveOrder(c.n, c.k, c.random) {
+				seq := len(want[i])
+				msg := fmt.Appendf(nil, "r%03d-s%03d-", i, seq)
+				for j := range (i*7 + seq*13) % 50 {
+					msg = append(msg, byte('A'+(i+seq+j)%26))
+				}
+				replies = append(replies, udpReply{be, sessions[i], msg})
+				want[i] = append(want[i], msg)
+			}
+			m.pause(t)
+			queueReplies(t, m, replies)
+			m.resume(t)
+			for i, cn := range conns {
+				expectReplies(t, cn, want[i], fmt.Sprintf("客户端 %d ", i))
+			}
+			s := m.statsAfterSignal(t).udp[1]
+			if s.sessions != c.n || int(s.total) != c.n {
+				t.Errorf("统计 sessions=%d total=%d，期望 %d/%d", s.sessions, s.total, c.n, c.n)
+			}
+			if s.downPkts != uint64(c.n*c.k) || s.downBytes != totalLen(want...) || s.downDrop != 0 {
+				t.Errorf("统计 down_pkts=%d down_bytes=%d down_drop=%d，期望 %d/%d/0", s.downPkts, s.downBytes, s.downDrop, c.n*c.k, totalLen(want...))
+			}
+			if s.upPkts != uint64(be.count()) || s.upDrop != 0 {
+				t.Errorf("统计 up_pkts=%d up_drop=%d，期望 %d/0（后端收到的 hello 数）", s.upPkts, s.upDrop, be.count())
+			}
+			// 统计输出时已 fflush：收发都不该出错（如 recvmmsg 的 vlen 超出回程批剩余的空位时，越界的那一项让内核记下错误，下一次收包报
+			// recv failed）
+			if data, _ := os.ReadFile(m.logPath); bytes.Contains(data, []byte("[WARN]")) {
+				var warns []string
+				for _, l := range strings.Split(string(data), "\n") {
+					if strings.Contains(l, "[WARN]") {
+						warns = append(warns, l)
+					}
+				}
+				t.Errorf("日志里有 %d 行 warn，期望没有，前几行：\n%s", len(warns), strings.Join(warns[:min(len(warns), 3)], "\n"))
+			}
+			m.expectIdleCPU(t, "回程批发出之后")
+		})
+	}
+}
+
+// recvTraces 返回日志里 --log-level 6 的逐包收包 trace 行：入向 "[udp]received data from udp_listen_fd from {…}"，
+// 回程 "[udp]received data from udp fd N"
+func recvTraces(m *mapper) []string {
+	data, _ := os.ReadFile(m.logPath)
+	var out []string
+	for _, line := range strings.Split(string(data), "\n") {
+		if strings.Contains(line, "received data from udp") {
+			out = append(out, line)
+		}
+	}
+	return out
+}
+
+// U4：回程与入向在同一轮循环里，两个方向逐字节核对。回程批的设计可能与入向批共用 64 个槽和溢出区（D36）：那时入向的回调必须先发出
+// 回程批再收包，否则回包被入向的包覆盖。libev 在同一优先级内按入队的逆序回调（ev_invoke_pending 从 pendings 末尾取），epoll 按
+// fd 变为就绪的先后报告（就绪链表先进先出），所以 sessions-cb-first 先在监听 socket 排入向包、再在会话 socket 排回包：恢复后会话的
+// 回调先收回包，监听的回调后收；listener-cb-first 反过来。从 trace 日志确认这一轮里第一个收包的是哪一方。包长跨 2 KiB 槽边界直到
+// 65507，入向与回程内容不同；后端按源地址核对入向，客户端核对回程；两个方向的计数精确
+func TestUDPReturnWithInbound(t *testing.T) {
+	t.Parallel()
+	sizes := []int{0, 1, 64, 2047, 2048, 2049, 9000, 65507}
+	for _, c := range []struct {
+		name          string
+		listenerFirst bool // 先排入向包：监听 socket 先就绪，回调在会话之后
+	}{
+		{"sessions-cb-first", true},
+		{"listener-cb-first", false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			const n = 3
+			be := quietUDP(t, loopback4(t))
+			listen := loopback4(t)
+			m := startMapper(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", be.addr, "-u", "--log-level", "6")
+			conns := make([]*net.UDPConn, n)
+			sessions := make([]string, n)
+			for i := range conns {
+				conns[i] = udpDial(t, "", listen)
+				sessions[i] = helloConn(t, be, conns[i], fmt.Appendf(nil, "hello-%d", i))
+			}
+			msgOf := func(dir, client, size int) []byte {
+				msg := make([]byte, size)
+				for j := range msg {
+					msg[j] = byte(size+client*7+dir*101) ^ byte(j*31)
+				}
+				return msg
+			}
+			var sends []udpSend
+			var replies []udpReply
+			up, down := make([][][]byte, n), make([][][]byte, n)
+			for j := range sizes {
+				for i := range n {
+					u := msgOf(0, i, sizes[(j+i)%len(sizes)])
+					sends = append(sends, udpSend{conns[i], u})
+					up[i] = append(up[i], u)
+					d := msgOf(1, i, sizes[(len(sizes)-1-j+i)%len(sizes)])
+					replies = append(replies, udpReply{be, sessions[i], d})
+					down[i] = append(down[i], d)
+				}
+			}
+			hellos := be.count()
+			// hello 的 trace 行都写进文件之后再暂停（日志最多晚一个 400 ms 的定时器周期写出），恢复后的第一行 trace 就是这一轮的
+			eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+				if got := len(recvTraces(m)); got < hellos {
+					return fmt.Errorf("日志里有 %d 行收包 trace，期望至少 %d（hello）", got, hellos)
+				}
+				return nil
+			})
+			time.Sleep(500 * time.Millisecond)
+			before := len(recvTraces(m))
+			m.pause(t)
+			if c.listenerFirst {
+				queueUDP(t, m, listen, sends)
+				queueReplies(t, m, replies)
+			} else {
+				queueReplies(t, m, replies)
+				queueUDP(t, m, listen, sends)
+			}
+			m.resume(t)
+
+			for i, cn := range conns {
+				expectReplies(t, cn, down[i], fmt.Sprintf("客户端 %d ", i))
+			}
+			got, pkts, nbytes := be.bySource(t, hellos+len(sends))
+			for src, g := range got {
+				got[src] = slices.DeleteFunc(g, func(p []byte) bool { return bytes.HasPrefix(p, []byte("hello-")) })
+			}
+			srcs := expectBySource(t, got, up)
+			for i := range n {
+				if srcs[i] != "" && srcs[i] != sessions[i] {
+					t.Errorf("客户端 %d 的入向包来自源地址 %s，hello 来自 %s：没有命中既有会话", i, srcs[i], sessions[i])
+				}
+			}
+			s := m.statsAfterSignal(t).udp[1]
+			if s.upPkts != pkts || s.upBytes != nbytes || s.upDrop != 0 {
+				t.Errorf("统计 up_pkts=%d up_bytes=%d up_drop=%d，期望与后端实收的 %d 个包 %d 字节相同、无丢包", s.upPkts, s.upBytes, s.upDrop, pkts, nbytes)
+			}
+			if s.downPkts != uint64(len(replies)) || s.downBytes != totalLen(down...) || s.downDrop != 0 {
+				t.Errorf("统计 down_pkts=%d down_bytes=%d down_drop=%d，期望 %d/%d/0", s.downPkts, s.downBytes, s.downDrop, len(replies), totalLen(down...))
+			}
+
+			// 用例前提：这一轮里先收包的一方
+			var traces []string
+			eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+				if traces = recvTraces(m); len(traces) < before+len(sends)+len(replies) {
+					return fmt.Errorf("日志里恢复后有 %d 行收包 trace，期望 %d", len(traces)-before, len(sends)+len(replies))
+				}
+				return nil
+			})
+			first := traces[before]
+			sessionFirst := strings.Contains(first, "received data from udp fd")
+			t.Logf("恢复后第一行收包 trace：%s", first)
+			if sessionFirst != c.listenerFirst {
+				t.Errorf("恢复后第一行收包 trace 为 %q：用例前提不成立（期望先回调%s）", first, map[bool]string{true: "会话", false: "监听"}[c.listenerFirst])
+			}
+		})
+	}
+}
+
+// U4：回程批里各种包长。回程的每个包也收进 2048 字节的槽加一块溢出区：跨槽边界的 2047/2048/2049 字节、4096、9000 字节与 IPv4 的
+// 65507、IPv6 的 65527 字节（IPv6 的在环回上分片）都必须原样回到客户端，0 字节的包也照转。3 个会话交错排队，客户端 0 按包长升序、
+// 1 按降序、2 从中间轮转，同一批里有多个大包；第二轮再暂停，各会话的顺序轮换：第一轮放过小包的槽这次收大包（发送时若改了 iov 长度，
+// 下次收包前必须恢复，否则大包被截断成 huge packet 丢掉）。down_bytes 精确
+func TestUDPReturnSizes(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		host  string
+		sizes []int
+	}{
+		{"127.0.0.1", []int{0, 1, 64, 2047, 2048, 2049, 4096, 9000, 65507}},
+		{"::1", []int{0, 1, 64, 2047, 2048, 2049, 4096, 9000, 65527}},
+	} {
+		t.Run(c.host, func(t *testing.T) {
+			t.Parallel()
+			const n = 3
+			be := quietUDP(t, hostPort(c.host, freePort(t)))
+			listen := hostPort(c.host, freePort(t))
+			m := forward(t, "u", listen, be.addr)
+			conns := make([]*net.UDPConn, n)
+			sessions := make([]string, n)
+			for i := range conns {
+				conns[i] = udpDial(t, "", listen)
+				sessions[i] = helloConn(t, be, conns[i], fmt.Appendf(nil, "hello-%d", i))
+			}
+			sizeOf := func(client, j int) int {
+				switch client {
+				case 0:
+					return c.sizes[j]
+				case 1:
+					return c.sizes[len(c.sizes)-1-j]
+				}
+				return c.sizes[(j+len(c.sizes)/2)%len(c.sizes)]
+			}
+			var all [][]byte
+			for round := range 2 {
+				var replies []udpReply
+				cur := make([][][]byte, n)
+				for j := range c.sizes {
+					for i := range n {
+						size := sizeOf((i+round)%n, j)
+						msg := make([]byte, size)
+						for b := range msg {
+							msg[b] = byte(size+i*7+round*13) ^ byte(b*31)
+						}
+						replies = append(replies, udpReply{be, sessions[i], msg})
+						cur[i] = append(cur[i], msg)
+						all = append(all, msg)
+					}
+				}
+				m.pause(t)
+				queueReplies(t, m, replies)
+				m.resume(t)
+				for i, cn := range conns {
+					expectReplies(t, cn, cur[i], fmt.Sprintf("第 %d 轮客户端 %d ", round+1, i))
+				}
+			}
+			s := m.statsAfterSignal(t).udp[1]
+			if s.downPkts != uint64(len(all)) || s.downBytes != totalLen(all) || s.downDrop != 0 {
+				t.Errorf("统计 down_pkts=%d down_bytes=%d down_drop=%d，期望 %d/%d/0", s.downPkts, s.downBytes, s.downDrop, len(all), totalLen(all))
+			}
+		})
+	}
+}
+
+// loggedDownDrops 汇总日志里回程发送失败的 warn 报告的丢包数：逐包发送时每行 "[udp]sento returned -1,..." 丢 1 个；回程批量发送
+// （U4）时每行 "[udp]sendmmsg to clients returned -1,<strerror>,dropped N packets" 丢 N 个，batch 依次是这些行各自报告的 N
+func loggedDownDrops(m *mapper) (drops, lines int, batch []int) {
+	data, _ := os.ReadFile(m.logPath)
+	for _, line := range strings.Split(string(data), "\n") {
+		switch {
+		case strings.Contains(line, "[udp]sento returned -1,"):
+			drops++
+			lines++
+		case strings.Contains(line, "[udp]sendmmsg to clients returned -1,"):
+			n := -1
+			if i := strings.LastIndex(line, ",dropped "); i >= 0 {
+				fmt.Sscanf(line[i:], ",dropped %d packets", &n)
+			}
+			drops += n
+			lines++
+			batch = append(batch, n)
+		}
+	}
+	return drops, lines, batch
+}
+
+// U4：回程批内发送出错。与 TestUDPBatchSendError 方向相反的 4to6（IPv4 监听、IPv6 上游）：后端回 65527 字节（IPv6 的 UDP 载荷上限）
+// 的包，会话 socket 照收，经 IPv4 监听 socket 发给 IPv4 客户端时 EMSGSIZE（IPv4 的上限是 65507）。暂停期间排 [大, a, b, 大, c, d, 大]：
+// 逐包 sendto 时每个大包各失败一次；批量发送时 sendmmsg 在第 0 个就返回 -1，只丢它、从 a 继续，发出 a、b 后返回 2（错误被内核吞掉），
+// 再从第二个大包起又是 -1……非 EAGAIN 的错误只丢出错的那一个。客户端按序收到 a、b、c、d，down_pkts=4、down_bytes=1111、
+// down_drop=3，日志报告的丢包数之和也是 3（每个大包一行）；a、b、c、d 长度各不相同，部分发送后从错的下标累加字节数时 down_bytes
+// 对不上。发送失败之后不空转
+func TestUDPReturnSendError(t *testing.T) {
+	t.Parallel()
+	const big = 65527
+	be := quietUDP(t, hostPort("::1", freePort(t)))
+	listen := loopback4(t)
+	m := forward(t, "u", listen, be.addr)
+	c := udpDial(t, "", listen)
+	session := helloConn(t, be, c, []byte("hello"))
+	large := bytes.Repeat([]byte{'L'}, big)
+	small := [][]byte{[]byte("a"), bytes.Repeat([]byte("b"), 10), bytes.Repeat([]byte("c"), 100), bytes.Repeat([]byte("d"), 1000)}
+	var replies []udpReply
+	for _, msg := range [][]byte{large, small[0], small[1], large, small[2], small[3], large} {
+		replies = append(replies, udpReply{be, session, msg})
+	}
+	m.pause(t)
+	queueReplies(t, m, replies)
+	m.resume(t)
+
+	expectReplies(t, c, small, "客户端")
+	// 逐包收发时最后一个大包在客户端收到 d 之后才处理
+	var s udpStat
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if s = m.statsAfterSignal(t).udp[1]; s.downDrop < 3 {
+			return fmt.Errorf("down_drop=%d，期望 3", s.downDrop)
+		}
+		return nil
+	})
+	if s.downPkts != 4 || s.downBytes != 1111 || s.downDrop != 3 {
+		t.Errorf("统计 down_pkts=%d down_bytes=%d down_drop=%d，期望 4/1111/3（3 个大包各丢一次，其余照发）", s.downPkts, s.downBytes, s.downDrop)
+	}
+	if s.upPkts != uint64(be.count()) || s.upDrop != 0 {
+		t.Errorf("统计 up_pkts=%d up_drop=%d，期望 %d/0", s.upPkts, s.upDrop, be.count())
+	}
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if drops, lines, _ := loggedDownDrops(m); drops != 3 || lines != 3 {
+			return fmt.Errorf("日志里有 %d 行回程发送失败的 warn，共报告丢 %d 个包，期望 3 行、3 个（每个大包一行）", lines, drops)
+		}
+		return nil
+	})
+	m.expectIdleCPU(t, "回程发送 EMSGSIZE 之后")
+}
+
+// U4：两条以上 UDP 规则的回包在同一轮里进同一个回程批，按规则分组、各用自己规则的监听 socket 发出，计数记在各自的规则上。三条规则：
+// 两条 IPv4（不同端口）、一条 IPv6，各 2 个客户端，暂停期间后端按规则交错排 15 轮回包（共 90 个，跨一次批满；批里各会话的回包连在
+// 一起，会话按回调顺序、规则交替）。客户端 socket 不
+// connect，用 ReadFromUDP 核对每个回包的源地址就是本规则的监听地址：组发错了监听 socket 时，IPv4 规则的回包源端口不对，IPv6 的回包
+// 在 IPv4 socket 上发不出去。每条规则的 down_pkts、down_bytes 精确
+func TestUDPReturnMultiRule(t *testing.T) {
+	t.Parallel()
+	type rule struct {
+		listen string
+		be     *udpRecorder
+	}
+	rules := []rule{
+		{loopback4(t), quietUDP(t, loopback4(t))},
+		{loopback4(t), quietUDP(t, loopback4(t))},
+		{hostPort("::1", freePort(t)), quietUDP(t, hostPort("::1", freePort(t)))},
+	}
+	var cfg strings.Builder
+	var wait []listenPoint
+	for _, r := range rules {
+		fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = %q\nno_tcp = true\nuse_udp = true\n\n", r.listen, r.be.addr)
+		wait = append(wait, listenPoints("u", portOf(r.listen))...)
+	}
+	m := startMapper(t, wait, "-c", writeConfig(t, cfg.String()))
+
+	const perRule, k = 2, 15
+	type client struct {
+		rule    int
+		c       *net.UDPConn
+		session string
+		want    [][]byte
+	}
+	var clients []*client
+	for j := range perRule {
+		for r, rl := range rules {
+			to, err := net.ResolveUDPAddr("udp", rl.listen)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c, err := net.ListenUDP("udp", &net.UDPAddr{IP: to.IP})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { c.Close() })
+			cl := &client{rule: r, c: c}
+			cl.session = helloSession(t, rl.be, fmt.Appendf(nil, "hello-r%d-c%d", r, j), func(b []byte) error {
+				_, err := c.WriteToUDP(b, to)
+				return err
+			})
+			clients = append(clients, cl)
+		}
+	}
+	var replies []udpReply
+	for seq := range k {
+		for ci, cl := range clients {
+			msg := fmt.Appendf(nil, "rule%d-c%d-s%02d-", cl.rule, ci, seq)
+			for j := range (ci*11 + seq*7) % 40 {
+				msg = append(msg, byte('a'+(ci+j)%26))
+			}
+			replies = append(replies, udpReply{rules[cl.rule].be, cl.session, msg})
+			cl.want = append(cl.want, msg)
+		}
+	}
+	m.pause(t)
+	queueReplies(t, m, replies)
+	m.resume(t)
+
+	buf := make([]byte, 2048)
+	for ci, cl := range clients {
+		lp := netip.MustParseAddrPort(rules[cl.rule].listen)
+		for j, w := range cl.want {
+			cl.c.SetReadDeadline(time.Now().Add(ioTimeout))
+			n, from, err := cl.c.ReadFromUDPAddrPort(buf)
+			if err != nil {
+				t.Fatalf("规则 %d 的客户端 %d 第 %d 个回包：%v", cl.rule+1, ci, j, err)
+			}
+			if from := netip.AddrPortFrom(from.Addr().Unmap(), from.Port()); from != lp {
+				t.Errorf("规则 %d 的客户端 %d 第 %d 个回包来自 %s，期望来自本规则的监听地址 %s", cl.rule+1, ci, j, from, lp)
+			}
+			if !bytes.Equal(buf[:n], w) {
+				t.Fatalf("规则 %d 的客户端 %d 第 %d 个回包为 %q，期望 %q", cl.rule+1, ci, j, buf[:n], w)
+			}
+		}
+	}
+	d := m.statsAfterSignal(t)
+	for r, rl := range rules {
+		var want [][]byte
+		for _, cl := range clients {
+			if cl.rule == r {
+				want = append(want, cl.want...)
+			}
+		}
+		s := d.udp[r+1]
+		if s.sessions != perRule || int(s.total) != perRule {
+			t.Errorf("规则 %d 统计 sessions=%d total=%d，期望 %d/%d", r+1, s.sessions, s.total, perRule, perRule)
+		}
+		if s.downPkts != uint64(len(want)) || s.downBytes != totalLen(want) || s.downDrop != 0 {
+			t.Errorf("规则 %d 统计 down_pkts=%d down_bytes=%d down_drop=%d，期望 %d/%d/0", r+1, s.downPkts, s.downBytes, s.downDrop, len(want), totalLen(want))
+		}
+		if s.upPkts != uint64(rl.be.count()) {
+			t.Errorf("规则 %d 统计 up_pkts=%d，期望 %d", r+1, s.upPkts, rl.be.count())
+		}
+	}
+}
+
+// U4：低负载时回包不等定时器。回程批在每轮循环阻塞之前（ev_prepare）发出：一问一答时回包所在的那一轮结束前就发出去了。只在批满或
+// 400 ms 的定时器里发出时，每个回包平均多等约 200 ms；只在下一次入向收包之前发出时，回包要等客户端的下一个请求，一问一答就卡住。
+// 200 次顺序往返，每次都应远低于 50 ms：全量并行时调度偶有延迟，允许至多 10 次超过 50 ms，1 s 没有回包就重发一次（环回偶有丢包）
+func TestUDPReturnLatency(t *testing.T) {
+	t.Parallel()
+	const rounds, slowLimit, maxSlow = 200, 50 * time.Millisecond, 10
+	be := serveUDP(t, loopback4(t), "")
+	listen := loopback4(t)
+	forward(t, "u", listen, be.addr)
+	c := udpDial(t, "", listen)
+	buf := make([]byte, 100)
+	var lat []time.Duration
+	slowN := 0
+	for i := range rounds {
+		msg := fmt.Appendf(nil, "rtt-%03d", i)
+		start := time.Now()
+		var err error
+		for attempt := 0; attempt < 2; attempt++ {
+			if _, err = c.Write(msg); err != nil {
+				t.Fatal(err)
+			}
+			c.SetReadDeadline(time.Now().Add(time.Second))
+			var n int
+			for n, err = c.Read(buf); err == nil && !bytes.Equal(buf[:n], msg); n, err = c.Read(buf) {
+				// 上一次往返重发后迟到的回包
+			}
+			if err == nil {
+				break
+			}
+		}
+		if err != nil {
+			t.Fatalf("第 %d 次往返重发后 1 s 内仍没有回包：%v", i, err)
+		}
+		d := time.Since(start)
+		lat = append(lat, d)
+		if d > slowLimit {
+			if slowN++; slowN > maxSlow {
+				t.Fatalf("前 %d 次往返里已有 %d 次超过 %v（本次 %v）：回包在等定时器或下一个请求，没有在本轮循环结束前发出", i+1, slowN, slowLimit, d)
+			}
+		}
+	}
+	slices.Sort(lat)
+	t.Logf("%d 次往返：中位数 %v，第 99 百分位 %v，最大 %v，超过 %v 的 %d 次", rounds, lat[rounds/2], lat[rounds*99/100], lat[rounds-1], slowLimit, slowN)
+}
+
+// 只有回程流量的会话（客户端发过一个请求后只收不发，如订阅推送）全靠回程的 lru.update 刷新空闲时间（U4 起每次回调刷新一次）：
+// 后端每 15 s 向会话推一个包、持续 200 s，超过 conn_timeout_udp（180 s）：会话不能被当作空闲清理，客户端收到全部推送
+func TestUDPSessionOneWayDown(t *testing.T) {
+	t.Parallel()
+	slow(t)
+	be := quietUDP(t, loopback4(t))
+	listen := loopback4(t)
+	m := forward(t, "u", listen, be.addr)
+	c := udpDial(t, "", listen)
+	session := helloConn(t, be, c, []byte("subscribe"))
+	sent := 0
+	for start := time.Now(); time.Since(start) < 200*time.Second; sent++ {
+		msg := fmt.Appendf(nil, "push-%d", sent)
+		be.sendTo(t, session, msg)
+		expectReplies(t, c, [][]byte{msg}, fmt.Sprintf("第 %d 次推送（会话建立后 %v）", sent, time.Since(start).Round(time.Second)))
+		time.Sleep(15 * time.Second)
+	}
+	m.fatalIfExited(t, "单向推送 200 s 后")
+	if n := m.logLines("[udp]inactive connection", "cleared"); n != 0 {
+		t.Errorf("日志里有 %d 行会话清理：只有回程流量的会话被当作空闲清理了（回程没有刷新 LRU）", n)
+	}
+	if s := m.statsAfterSignal(t).udp[1]; s.total != 1 || s.downPkts != uint64(sent) {
+		t.Errorf("统计 total=%d down_pkts=%d，期望 1/%d", s.total, s.downPkts, sent)
+	}
+}
+
+// icmpPortUnreachable 用原始 socket 向本机发一个 ICMP 端口不可达（type 3 code 3），内层是 from → to 的 IPv4 UDP 包头，两者都是
+// "127.x.x.x:port"。内核按内层四元组找到本端为 from、connect 到 to 的 UDP socket（__udp4_lib_err）：端口不可达是硬错误，
+// connect 过的 socket 置 sk_err=ECONNREFUSED，此后第一次收包先返回这个错误，队列里的包留给下一次（__skb_recv_udp 先查 sock_error）。
+// 收 ICMP 不受发送方向的限速影响。需要 CAP_NET_RAW（Docker 默认给 root），没有时跳过用例
+func icmpPortUnreachable(t testing.TB, from, to string) {
+	t.Helper()
+	src, dst := netip.MustParseAddrPort(from), netip.MustParseAddrPort(to)
+	fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_RAW|syscall.SOCK_CLOEXEC, syscall.IPPROTO_ICMP)
+	if err != nil {
+		t.Skipf("建原始 ICMP socket 失败（没有 CAP_NET_RAW？）：%v", err)
+	}
+	defer syscall.Close(fd)
+	csum := func(b []byte) uint16 {
+		var s uint32
+		for i := 0; i+1 < len(b); i += 2 {
+			s += uint32(b[i])<<8 | uint32(b[i+1])
+		}
+		for s > 0xffff {
+			s = s>>16 + s&0xffff
+		}
+		return ^uint16(s)
+	}
+	pkt := make([]byte, 8+20+8)
+	pkt[0], pkt[1] = 3, 3 // ICMP_DEST_UNREACH、ICMP_PORT_UNREACH；pkt[4:8] 未用
+	ip := pkt[8:28]
+	ip[0], ip[8], ip[9] = 0x45, 64, syscall.IPPROTO_UDP
+	binary.BigEndian.PutUint16(ip[2:], 28)
+	copy(ip[12:16], src.Addr().AsSlice())
+	copy(ip[16:20], dst.Addr().AsSlice())
+	binary.BigEndian.PutUint16(ip[10:], csum(ip))
+	udp := pkt[28:]
+	binary.BigEndian.PutUint16(udp[0:], src.Port())
+	binary.BigEndian.PutUint16(udp[2:], dst.Port())
+	binary.BigEndian.PutUint16(udp[4:], 8)
+	binary.BigEndian.PutUint16(pkt[2:], csum(pkt))
+	if err := syscall.Sendto(fd, pkt, 0, &syscall.SockaddrInet4{Addr: dst.Addr().As4()}); err != nil {
+		t.Fatalf("发送 ICMP 端口不可达失败：%v", err)
+	}
+}
+
+// U4：会话 socket 上同时有待取的 ICMP 错误与排队的回包（u4-review 的建议）。暂停期间后端向会话排 k 个回包，再伪造一个"后端端口不可达"
+// 的 ICMP 让会话 socket 带上 ECONNREFUSED：恢复后 udp_cb 的 recvmmsg 先返回这个错误（一行 "[udp]recv failed ... Connection refused"，
+// 不能把它当成没有数据或丢掉会话），排着的 k 个回包下一轮照收照发；之后后端再发 m 个，同一会话照常回到客户端。从 --log-level 6 的
+// 日志确认错误先于这些回包的收包 trace。down_pkts 精确，之后不空转
+func TestUDPReturnRecvError(t *testing.T) {
+	t.Parallel()
+	const k, more = 5, 3
+	be := quietUDP(t, loopback4(t))
+	listen := loopback4(t)
+	m := startMapper(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", be.addr, "-u", "--log-level", "6")
+	c := udpDial(t, "", listen)
+	session := helloConn(t, be, c, []byte("hello"))
+	var replies []udpReply
+	var want [][]byte
+	for i := range k {
+		msg := fmt.Appendf(nil, "before-%d", i)
+		replies = append(replies, udpReply{be, session, msg})
+		want = append(want, msg)
+	}
+	m.pause(t)
+	queueReplies(t, m, replies)
+	icmpPortUnreachable(t, session, be.addr)
+	m.resume(t)
+	expectReplies(t, c, want, "客户端（ICMP 错误之前排队的回包）")
+	var after [][]byte
+	for i := range more {
+		msg := fmt.Appendf(nil, "after-%d", i)
+		be.sendTo(t, session, msg)
+		expectReplies(t, c, [][]byte{msg}, "客户端（ICMP 错误之后）")
+		after = append(after, msg)
+	}
+	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+		if n := m.logLines("[udp]recv failed", "Connection refused"); n != 1 {
+			return fmt.Errorf("日志里有 %d 行会话 socket 的 recv 失败（ECONNREFUSED），期望 1：伪造的 ICMP 没有生效或错误被报了多次", n)
+		}
+		return nil
+	})
+	data, _ := os.ReadFile(m.logPath)
+	lines := strings.Split(string(data), "\n")
+	iErr := slices.IndexFunc(lines, func(l string) bool { return strings.Contains(l, "[udp]recv failed") })
+	// 835690e 的逐包 recv 在判断错误之前就记 trace（len=-1），跳过它
+	iData := slices.IndexFunc(lines, func(l string) bool {
+		return strings.Contains(l, "received data from udp fd") && !strings.HasSuffix(l, "len=-1")
+	})
+	if iData >= 0 && iErr > iData {
+		t.Errorf("日志里第一行回程收包 trace（第 %d 行）早于 recv 失败（第 %d 行）：用例前提不成立，期望错误先于排队的回包返回", iData, iErr)
+	}
+	s := m.statsAfterSignal(t).udp[1]
+	if s.downPkts != k+more || s.downBytes != totalLen(want, after) || s.downDrop != 0 || s.sessions != 1 || s.total != 1 {
+		t.Errorf("统计 down_pkts=%d down_bytes=%d down_drop=%d sessions=%d total=%d，期望 %d/%d/0/1/1",
+			s.downPkts, s.downBytes, s.downDrop, s.sessions, s.total, k+more, totalLen(want, after))
+	}
+	m.expectIdleCPU(t, "会话 socket 的 ICMP 错误取走之后")
+}
+
+// U4：回程批的 ev_prepare watcher 每轮循环都执行，不能让循环空转（u4-review 的建议）：TCP+UDP 规则上只有 TCP 流量（回程批一直是空的）
+// 之后，以及一次 UDP 往返之后，tinymapper 都应空闲
+func TestUDPReturnIdle(t *testing.T) {
+	t.Parallel()
+	remote := loopback4(t)
+	serveTCP(t, remote, echoHandler(""))
+	serveUDP(t, remote, "")
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, remote)
+	mustEcho(t, dial(t, listen), "tcp")
+	m.expectIdleCPU(t, "TCP+UDP 规则上只有 TCP 流量之后")
+	udpReplyFrom(t, udpDial(t, "", listen), "udp")
+	m.expectIdleCPU(t, "一次 UDP 往返之后")
 }

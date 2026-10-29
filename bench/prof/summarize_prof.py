@@ -114,13 +114,14 @@ def load_dso(p):
 def per_unit(d, fwd, wl, phase="stat"):
     pre = d / f"{fwd}.{wl}"
     client = json.loads(Path(f"{pre}.{phase}.client.json").read_text())
-    if wl.startswith("tcp_rr") or wl.startswith("tcp_crr"):
-        return client["ops"], "op" if wl.startswith("tcp_rr") else "conn", client["ops_per_sec"], client
+    if wl.startswith(("tcp_rr", "tcp_crr", "udp_rr")):
+        return client["ops"], "conn" if wl.startswith("tcp_crr") else "op", client["ops_per_sec"], client
     if wl.startswith("udp"):
         text = Path(f"{pre}.{phase}.snmp.txt").read_text()
         b, a = snmp_pairs(text)
-        # 客户端与转发器同机（loopback）时，OutDatagrams 也包含客户端发包
-        fwd_tx = (a["OutDatagrams"] - b["OutDatagrams"]) - (0 if "# cli_on_fwd=0" in text else client["sent_pkts"])
+        # 发送方（正向为客户端，_r 为后端）与转发器同机（loopback）时，OutDatagrams 也包含它的发包
+        sender = "srv" if wl.endswith("_r") else "cli"
+        fwd_tx = (a["OutDatagrams"] - b["OutDatagrams"]) - (0 if f"# {sender}_on_fwd=0" in text else client["sent_pkts"])
         return fwd_tx, "pkt", client["recv_kpps"] * 1e3, client
     return client["bytes"] / 1e9, "GB", client["gbps"], client
 
