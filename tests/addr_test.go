@@ -7,9 +7,13 @@ import (
 	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 )
+
+// etcHostsMu 保护 hostsEntry 的"取文件末尾 + 追加"：TestDomainRefresh 与 TestUDPSessionChurn 并行，同时追加会写到同一偏移
+var etcHostsMu sync.Mutex
 
 // 各种地址族组合下 TCP 与 UDP 都能转发
 func TestAddressFamilies(t *testing.T) {
@@ -58,32 +62,35 @@ func TestAddressFamilies(t *testing.T) {
 }
 
 // hostsEntry 在容器的 /etc/hosts 末尾追加 "ip name"，返回原地改写该 IP 最后一个字符的函数。
-// 只做单次 pwrite，避免并发解析的其他进程读到截断的文件；测试结束时截回原长度。
+// 只做单次 pwrite，避免并发解析的其他进程读到截断的文件。测试结束时在该行行首写 '#' 注释掉它，不截断文件：
+// 并行用例后来追加的行还在后面
 func hostsEntry(t testing.TB, ip, name string) func(last byte) {
 	t.Helper()
 	f, err := os.OpenFile("/etc/hosts", os.O_RDWR, 0)
 	if err != nil {
 		t.Fatal(err)
 	}
-	orig, err := f.Seek(0, 2)
-	if err != nil {
-		t.Fatal(err)
-	}
+	t.Cleanup(func() { f.Close() })
 	line := ip + " " + name + "\n"
-	last := make([]byte, 1)
-	if orig > 0 {
-		f.ReadAt(last, orig-1)
-		if last[0] != '\n' {
-			line = "\n" + line
+	var orig int64
+	func() {
+		etcHostsMu.Lock()
+		defer etcHostsMu.Unlock()
+		if orig, err = f.Seek(0, 2); err != nil {
+			t.Fatal(err)
 		}
-	}
-	if _, err := f.WriteAt([]byte(line), orig); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		f.Truncate(orig)
-		f.Close()
-	})
+		last := make([]byte, 1)
+		if orig > 0 {
+			f.ReadAt(last, orig-1)
+			if last[0] != '\n' {
+				line = "\n" + line
+			}
+		}
+		if _, err := f.WriteAt([]byte(line), orig); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	t.Cleanup(func() { f.WriteAt([]byte{'#'}, orig+int64(len(line)-len(name)-len(ip)-2)) })
 	offset := orig + int64(len(line)-len(name)-3) // ip 最后一个字符的位置
 	return func(b byte) {
 		if _, err := f.WriteAt([]byte{b}, offset); err != nil {

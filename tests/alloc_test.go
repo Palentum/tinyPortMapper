@@ -10,7 +10,8 @@
 //     （GLIBC_TUNABLES 对 musl 无副作用）。
 //   - 预热到恰好的 slab 边界（objPoolSlabObjs 的整数倍、顺序建立使数量确定）：预热建满的对象占满整数个 slab，空闲数为 0，紧接着的
 //     第 N+1 个连接/会话在 obj_pool_t::get() 里必须新开一个 slab（大块 malloc），降限下必失败。若没对齐到边界、留有空闲对象，
-//     复用空闲对象的会话唯一的分配是 UDP 的 adress_to_info 节点（小块），它失败是 std::bad_alloc→terminate，属范围外中止。
+//     UDP 会话复用空闲对象且会话表又无需扩容时（U2 之后一个新 UDP 会话不再分配任何小块：adress_to_info 节点已去掉），
+//     根本没有可失败的分配。因此 UDP 预热点选在既踩满对象 slab、又正好触发会话表扩容的位置（见 udpSlabWarm）。
 //   - get() 的 slab malloc 发生在 ev_io_start 之前：失败即返回，不会触碰 libev 的 anfds 数组（fd 号超长度时翻倍再分配，失败会
 //     「(libev) cannot allocate」abort）。预热阶段（未降限）建连已把 anfds 撑到高于后续会用到的 fd 号，被拒的探测连接又不 ev_io_start，
 //     所以降限期间 anfds 不增长。
@@ -126,8 +127,11 @@ const (
 )
 
 const objSlabWarm = 7 * objPoolSlabObjs // TCP 预热到 7 个 slab 整数倍（448），第 448+1 条触发新 slab 分配失败（f2-review 验证）
-// UDP 预热到 3 个 slab 整数倍（192）：glibc 在 128/192/256/448 均确定失败，但 musl 的 mallocng 只在 192（恰好 3 个满组）上让下一个
-// slab 确定失败——128/256/448 组内尚有空闲槽会让该 slab 成功。192 是两 libc 的共同确定点（实测四变体各 3/3），故 UDP 用 192。
+// UDP 预热到 3 个 slab 整数倍（192）：此时对象池 3 个 slab 恰好占满、空闲为 0，且第 193 个会话正好触发 U2 会话表从 256 扩容到 512 槽
+// （LP64 下 512×16B=8 KiB 的 calloc，发生在 udp_accept_cb 里选上游/建 socket 之前的 reserve_one）。所以第 193 个会话既要扩容表、
+// 又要新开第 4 个对象 slab。reserve_one 先分配，但降限后它的 8 KiB 不一定失败（可能由之前释放的块满足），这时失败的是随后的
+// slab malloc；两条路径打印同一行 info，无论哪个先失败，这个会话都被拒、进程存活（本用例不区分是哪一个）。
+// 第 193 个会话在四个变体上都确定被拒（各 5/5）。
 const udpSlabWarm = 3 * objPoolSlabObjs
 
 // TestAllocTCPObjPool：TCP 连接对象 slab 的 malloc 失败——tcp_accept_one 里 tcp_pair_pool.get() 返回 0 时（v2：在
@@ -230,9 +234,11 @@ func TestAllocTCPObjPool(t *testing.T) {
 	checkPoolInvariants(t, m.statsAfterSignal(t))
 }
 
-// TestAllocUDPObjPool：UDP 连接对象 slab 的 malloc 失败——udp_accept_cb 里 udp_pair_pool.get() 返回 0 时，打印 info 行并
-// close 新建的会话 fd、丢弃该包，不退出进程。预热到 slab 边界（空闲数 0）很关键，否则复用空闲对象的会话只分配 adress_to_info
-// 节点，其失败是 bad_alloc→terminate（范围外，v2 仍在）。udp_pair_pool.get() 的 slab 分配在 map 插入之前，边界上它先失败、先返回 0。
+// TestAllocUDPObjPool：UDP 新会话的 malloc 失败路径。udp_accept_cb 里有两处：U2 会话表扩容 reserve_one() 的 calloc（返回 -1，
+// 在选上游、建 socket 之前，没有要关的 fd），以及之后 udp_pair_pool.get() 的 slab malloc（返回 0，close 刚建的会话 fd）。两处都打印
+// 同一行 info、丢弃该包，不退出进程。预热到 192（见 udpSlabWarm）让第 193 个会话同时需要扩容表（256→512 槽）与新开对象 slab，
+// 降限后哪个分配先失败，会话就由哪条路径拒绝；用例只检查日志行、无回包、无 fd 泄漏与恢复，不区分两条路径。
+// 预热对齐边界很关键，否则复用空闲对象且无需扩容的会话不分配任何东西（U2 去掉了每会话的 map 节点），没有可失败的分配。
 func TestAllocUDPObjPool(t *testing.T) {
 	t.Parallel()
 	heavy(t)

@@ -246,13 +246,134 @@ static obj_pool_t<udp_pair_t> udp_pair_pool;
 static tcp_buf_pool_t tcp_buf_pool;
 static char *tcp_scratch=0;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
 
+//UDP 会话的键（U2）：族、端口、地址，IPv6 再加 scope_id（同一个 fe80:: 地址在不同网卡上是不同的对端）。sockaddr 的其余字节不比：
+//from_sockaddr 先清零，内核填的 sin6_flowinfo 恒为 0，结果与比较整个 address_t 相同
+static inline int udp_key_eq(const address_t &a,const address_t &b)
+{
+	if(a.inner.ipv4.sin_family!=b.inner.ipv4.sin_family||a.inner.ipv4.sin_port!=b.inner.ipv4.sin_port) return 0;
+	if(a.inner.ipv4.sin_family==AF_INET) return a.inner.ipv4.sin_addr.s_addr==b.inner.ipv4.sin_addr.s_addr;
+	u64_t x[2],y[2];
+	memcpy(x,&a.inner.ipv6.sin6_addr,sizeof(x));
+	memcpy(y,&b.inner.ipv6.sin6_addr,sizeof(y));
+	return x[0]==y[0]&&x[1]==y[1]&&a.inner.ipv6.sin6_scope_id==b.inner.ipv6.sin6_scope_id;
+}
+static inline u64_t udp_key_mix(u64_t x)//murmur3 的 fmix64
+{
+	x^=x>>33;
+	x*=0xff51afd7ed558ccdULL;
+	x^=x>>33;
+	x*=0xc4ceb9fe1a85ec53ULL;
+	x^=x>>33;
+	return x;
+}
+//每个 64 位字并入后混合一次：IPv4 一次，IPv6 三次。族不参与：一个会话表只属于一个监听 socket
+static inline u32_t udp_key_hash(const address_t &a)
+{
+	if(a.inner.ipv4.sin_family==AF_INET)
+		return (u32_t)udp_key_mix((u64_t)a.inner.ipv4.sin_addr.s_addr<<16|a.inner.ipv4.sin_port);
+	u64_t w[2];
+	memcpy(w,&a.inner.ipv6.sin6_addr,sizeof(w));
+	u64_t h=udp_key_mix((u64_t)a.inner.ipv6.sin6_scope_id<<16|a.inner.ipv6.sin6_port);
+	h=udp_key_mix(h^w[0]);
+	return (u32_t)udp_key_mix(h^w[1]);
+}
+
+static const u32_t udp_table_min_cap=64;
+//客户端地址 → UDP 会话（U2）：开放寻址、线性探测，容量是 2 的幂，最多装到 3/4。槽里存会话指针和键的哈希：探测时先比哈希，
+//不读别的会话对象；扩容时按存下的哈希重新放，不重算。删除用后移（backward shift），没有墓碑。容量从 64 起按需翻倍、不缩
+//（同对象池的 slab），每条规则最多 max_conn_num 个会话，即最多 32768 槽（LP64 512 KiB）
+struct udp_table_t:not_copy_able_t
+{
+	struct slot_t
+	{
+		udp_pair_t *pair;//0 为空槽
+		u32_t hash;
+	};
+	slot_t *slots;
+	u32_t mask;//容量 - 1；slots 为 0 时为 0
+	int cnt;
+	udp_table_t()
+	{
+		slots=0;
+		mask=0;
+		cnt=0;
+	}
+	udp_pair_t *find(const address_t &addr,u32_t hash)
+	{
+		if(slots==0) return 0;
+		for(u32_t i=hash&mask;;i=(i+1)&mask)
+		{
+			if(slots[i].pair==0) return 0;
+			if(slots[i].hash==hash&&udp_key_eq(slots[i].pair->adress,addr)) return slots[i].pair;
+		}
+	}
+	//保证再插入一个也不超过 3/4；扩容的 malloc 失败时返回 -1，调用方只拒这个新会话
+	int reserve_one()
+	{
+		if(slots!=0&&(u32_t)(cnt+1)*4<=(mask+1)*3) return 0;
+		return grow();
+	}
+	int __attribute__((noinline)) grow()//不内联进 udp_accept_cb
+	{
+		u32_t cap=slots?mask+1:0;
+		u32_t new_cap=cap?cap*2:udp_table_min_cap;
+		slot_t *n=(slot_t *)calloc(new_cap,sizeof(slot_t));
+		if(n==0) return -1;
+		u32_t new_mask=new_cap-1;
+		for(u32_t i=0;i<cap;i++)
+		{
+			if(slots[i].pair==0) continue;
+			u32_t j=slots[i].hash&new_mask;
+			while(n[j].pair!=0) j=(j+1)&new_mask;
+			n[j]=slots[i];
+		}
+		free(slots);
+		slots=n;
+		mask=new_mask;
+		return 0;
+	}
+	void insert(udp_pair_t *pair,u32_t hash)//先 reserve_one() 成功，且表里没有这个地址
+	{
+		DEBUG_ASSERT(slots!=0&&(u32_t)(cnt+1)*4<=(mask+1)*3);
+		u32_t i=hash&mask;
+		while(slots[i].pair!=0) i=(i+1)&mask;
+		slots[i].pair=pair;
+		slots[i].hash=hash;
+		cnt++;
+	}
+	void erase(udp_pair_t *pair,u32_t hash)
+	{
+		u32_t i=hash&mask;
+		while(slots[i].pair!=pair)
+		{
+			if(slots[i].pair==0)
+			{
+				DEBUG_ASSERT(0==1);
+				return;
+			}
+			i=(i+1)&mask;
+		}
+		//空出 i 后向后扫到空槽：j 处的项从它的起始位置探测到 j 时经过 i，就挪到 i，j 成为新的空位（Knuth 6.4 算法 R）
+		for(u32_t j=(i+1)&mask;slots[j].pair!=0;j=(j+1)&mask)
+		{
+			if(((j-slots[j].hash)&mask)>=((j-i)&mask))
+			{
+				slots[i]=slots[j];
+				i=j;
+			}
+		}
+		slots[i].pair=0;
+		cnt--;
+	}
+};
+
 struct conn_manager_udp_t
 {
-	unordered_map<address_t,udp_pair_t*,address_t::hash_function> adress_to_info;
+	udp_table_t sessions;
+	udp_pair_t *last_hit;//上一次查到的会话：同一客户端连续来包时不算哈希、不查表；释放这个会话时清零
 
 	long long last_clear_time;
 	lru_collector_t lru;
-	int reserved;
 	//list<udp_pair_t>::iterator clear_it;
 	//O1 累计计数，SIGUSR1 时输出：total 新建的会话数；pkts/bytes 发送成功的包数与字节数，drop 发送失败（含 EAGAIN）丢掉的包数。[0] 客户端→上游，[1] 上游→客户端
 	u64_t total;
@@ -260,22 +381,22 @@ struct conn_manager_udp_t
 
 	conn_manager_udp_t()
 	{
+		last_hit=0;
 		last_clear_time=0;
-		reserved=0;
 		//clear_it=udp_pair_list.begin();
 		total=0;
 		memset(pkts,0,sizeof(pkts));
 		memset(bytes,0,sizeof(bytes));
 		memset(drop,0,sizeof(drop));
 	}
-	int reserve()
+	//没找到时返回 0，hash 为 addr 的哈希，供随后的 insert 用；命中 last_hit 时不算哈希
+	udp_pair_t *find(const address_t &addr,u32_t &hash)
 	{
-		if(!reserved)
-		{
-			adress_to_info.reserve(10007);
-			reserved=1;
-		}
-		return 0;
+		if(last_hit!=0&&udp_key_eq(last_hit->adress,addr)) return last_hit;
+		hash=udp_key_hash(addr);
+		udp_pair_t *pair=sessions.find(addr,hash);
+		if(pair!=0) last_hit=pair;
+		return pair;
 	}
 
 	int erase(udp_pair_t *pair)
@@ -286,9 +407,9 @@ struct conn_manager_udp_t
 		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",pair->adress.get_str(),lru.size()-1);
 		mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
 
-		auto tmp_it=adress_to_info.find(pair->adress);
-		DEBUG_ASSERT(tmp_it!=adress_to_info.end());
-		adress_to_info.erase(tmp_it);
+		//归还后对象还留着旧地址：last_hit 不清零的话，这个客户端的下一个包会命中已归还的对象
+		if(last_hit==pair) last_hit=0;
+		sessions.erase(pair,udp_key_hash(pair->adress));
 
 		close(pair->fd);
 		lru.erase(pair);
@@ -1369,13 +1490,20 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		return;
 	}
 
-	auto it=conn_manager_udp.adress_to_info.find(tmp_addr);
-	if(it==conn_manager_udp.adress_to_info.end())
+	u32_t hash;
+	udp_pair_t *pair=conn_manager_udp.find(tmp_addr,hash);
+	if(pair==0)
 	{
 
 		if(conn_manager_udp.lru.size()>=max_conn_num)
 		{
 			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
+			return;
+		}
+		//会话表要扩容时在选上游、建 socket 之前做：失败只丢这个包，轮询序号不前进
+		if(conn_manager_udp.sessions.reserve_one()!=0)
+		{
+			mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 			return;
 		}
 		int remote_index=select_remote_index(*rule,tmp_addr);
@@ -1420,14 +1548,12 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//udp_pair.last_active_time=get_current_time();
 		udp_pair.local_listen_fd=local_listen_fd_udp;
 
-		conn_manager_udp.adress_to_info[tmp_addr]=&udp_pair;
-		it=conn_manager_udp.adress_to_info.find(tmp_addr);
-		//it=adress_to_info.
+		conn_manager_udp.sessions.insert(&udp_pair,hash);
+		conn_manager_udp.last_hit=&udp_pair;
+		pair=&udp_pair;
 	}
 
-	DEBUG_ASSERT(it!=conn_manager_udp.adress_to_info.end() );
-
-	udp_pair_t &udp_pair=*(it->second);
+	udp_pair_t &udp_pair=*pair;
 	int udp_fd=udp_pair.fd;
 	conn_manager_udp.lru.update(&udp_pair);
 	//udp_pair.last_active_time=get_current_time();
@@ -1481,7 +1607,7 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 	DEBUG_ASSERT(tcp_pair_pool.slabs*obj_pool_slab_objs-tcp_pair_pool.free_objs.cnt==tcp_conns);
 	DEBUG_ASSERT(udp_pair_pool.slabs*obj_pool_slab_objs-udp_pair_pool.free_objs.cnt==udp_conns);
 	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
-		DEBUG_ASSERT((int)it->udp_manager.adress_to_info.size()==it->udp_manager.lru.size());
+		DEBUG_ASSERT(it->udp_manager.sessions.cnt==it->udp_manager.lru.size());
 }
 
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
@@ -1558,7 +1684,6 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 
 	if(rule.enable_udp)
 	{
-		rule.udp_manager.reserve();
 		rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
 		if(rule.local_listen_fd_udp<0)
 		{

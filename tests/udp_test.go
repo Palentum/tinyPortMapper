@@ -297,3 +297,269 @@ func TestUDPEpollAddFailListener(t *testing.T) {
 		t.Errorf("UDP 监听 fd 的 ADD 失败期间空转：2 s 内消耗 CPU %.2f s", float64(ticks)/100)
 	}
 }
+
+// udpTry 发送 msg 并返回回包，超时则重发，最多 attempts 次。整条测试套件并行时环回偶有丢包，
+// 重发只是重走同一客户端：首包已建会话时命中既有会话、不新建，故不影响 total/会话数/后端源地址集等不变式。
+func udpTry(c *net.UDPConn, msg []byte, per time.Duration, attempts int) ([]byte, error) {
+	buf := make([]byte, 2048)
+	var last error
+	for i := 0; i < attempts; i++ {
+		c.SetReadDeadline(time.Now().Add(per))
+		if _, err := c.Write(msg); err != nil {
+			return nil, err
+		}
+		n, err := c.Read(buf)
+		if err == nil {
+			return append([]byte(nil), buf[:n]...), nil
+		}
+		last = err
+		if !isTimeout(err) {
+			return nil, err
+		}
+	}
+	return nil, fmt.Errorf("重发 %d 次仍超时：%w", attempts, last)
+}
+
+// udpEcho 发送 msg，要求回包与 msg 完全一致（后端前缀为空），到达的是本客户端自己的 socket。
+func udpEcho(t testing.TB, c *net.UDPConn, msg []byte) {
+	t.Helper()
+	got, err := udpTry(c, msg, 2*time.Second, 4)
+	if err != nil {
+		t.Fatalf("往返 %q 失败：%v", msg, err)
+	}
+	if !bytes.Equal(got, msg) {
+		t.Fatalf("回包 %q 与请求 %q 不一致：会话串了或查找查错了", got, msg)
+	}
+}
+
+// 大量会话：顺序建立（跨越多个扩容阈值）、交替轮转（每次查找都错过 last_hit）、每客户端连发突发（命中 last_hit）。
+// 每个回包必须等于请求并落到正确的客户端 socket；后端恰好看到 N 个不同源地址；全部阶段后 sessions==N、total==N（无重复会话），
+// 池不变式成立。会话表从 64 槽起按需翻倍：第 49/97/193/385/769 个会话触发扩容。
+func TestUDPManySessions(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct {
+		name           string
+		listen, client string
+		backend        string
+		n              int
+	}{
+		{"ipv4", "127.0.0.1", "127.0.0.1", "127.0.0.1", 1000},
+		{"ipv6", "::1", "::1", "::1", 300},
+		{"v4mapped", "::", "127.0.0.1", "127.0.0.1", 300},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			be := serveUDP(t, hostPort(c.backend, freePort(t)), "")
+			lport := freePort(t)
+			m := forward(t, "u", hostPort(c.listen, lport), be.addr)
+			target := hostPort(c.client, lport)
+			conns := make([]*net.UDPConn, c.n)
+			for i := range conns {
+				conns[i] = udpDial(t, "", target)
+			}
+			msgOf := func(i, seq int) []byte { return fmt.Appendf(nil, "c%05d-s%03d", i, seq) }
+
+			// 阶段 1：顺序建立，每个客户端一次往返（跨越扩容阈值）
+			for i, cn := range conns {
+				udpEcho(t, cn, msgOf(i, 0))
+			}
+			// 阶段 2：交替轮转两轮，相邻两包来自不同客户端，每次查找都错过 last_hit
+			for round := 1; round <= 2; round++ {
+				for i, cn := range conns {
+					udpEcho(t, cn, msgOf(i, round))
+				}
+			}
+			// 阶段 3：每客户端连发 4 包，后 3 包命中 last_hit
+			for i, cn := range conns {
+				for seq := 10; seq < 14; seq++ {
+					udpEcho(t, cn, msgOf(i, seq))
+				}
+			}
+
+			if peers := be.peerList(); len(peers) != c.n {
+				t.Errorf("后端看到 %d 个源地址，期望每客户端一个（%d）", len(peers), c.n)
+			}
+			if s := m.statsAfterSignal(t).udp[1]; s.sessions != c.n || int(s.total) != c.n {
+				t.Errorf("统计 sessions=%d total=%d，期望 %d/%d（会话串了或重复建会话）", s.sessions, s.total, c.n, c.n)
+			}
+		})
+	}
+}
+
+// 删除后幸存会话仍可查到：两个上游做等权轮询，上游 A 为字面量 IP，上游 B 为域名（经 /etc/hosts 解析）。
+// 约 600 个会话按 A、B 交替建立（偶数号→A，奇数号→B）。最后建立的是一个 B 客户端，故 last_hit 指向一个即将被删除的会话。
+// 切换域名 B 的地址后，DNS 刷新（30 s）触发 clear_remote_index 删掉全部 B 会话：
+//   - 那个 last_hit B 客户端再发包必须得到回复（新会话），而不是命中已归还的旧会话（nolastclear 变异在此被杀）；
+//   - 每个 A 客户端仍能经各自的旧会话到达 A：A 后端源地址集不变、A 会话不重建，sessions==numA+1、total==N+1
+//     （删除用后移，表不被打乱；noshift/shiftgt 变异会让部分 A 会话查不到→重建→计数超出，在此被杀）。
+func TestUDPSessionChurn(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	const n = 600
+	const name = "tpm-u2churn.test"
+	bport := freePort(t)
+	aAddr := hostPort("127.0.0.2", bport)
+	beA := serveUDP(t, aAddr, "A")                  // 上游 A：字面量 IP
+	serveUDP(t, hostPort("127.0.0.3", bport), "B3") // 上游 B 初始地址
+	serveUDP(t, hostPort("127.0.0.4", bport), "B4") // 上游 B 切换后的地址
+	setLast := hostsEntry(t, "127.0.0.3", name)
+
+	listen := loopback4(t)
+	args := []string{"-l", listen, "--balance", "roundrobin: 1, 1", "-r", aAddr, "-r", fmt.Sprintf("%s:%d", name, bport), "-u"}
+	m := startMapper(t, listenPoints("u", portOf(listen)), args...)
+
+	// 顺序建立 n 个会话，确认轮询把偶数号发往 A、奇数号发往 B（初始地址 127.0.0.3）
+	conns := make([]*net.UDPConn, n)
+	numA := 0
+	for i := range conns {
+		conns[i] = udpDial(t, "", listen)
+		got, err := udpTry(conns[i], fmt.Appendf(nil, "init-%d", i), 2*time.Second, 4)
+		if err != nil {
+			t.Fatalf("建立第 %d 个会话失败：%v", i, err)
+		}
+		want := "B3"
+		if i%2 == 0 {
+			want = "A"
+			numA++
+		}
+		if !strings.HasPrefix(string(got), want) {
+			t.Fatalf("第 %d 个会话回包 %q，期望上游 %q（轮询序列或路由异常）", i, got, want)
+		}
+	}
+	numB := n - numA
+	// 最后建立的是奇数号 B 客户端，last_hit 即指向它
+	if conns[n-1] == nil || (n-1)%2 == 0 {
+		t.Fatalf("用例前提：最后一个客户端应为 B 客户端")
+	}
+	lastHitB := conns[n-1]
+
+	// 切换域名 B 的地址：127.0.0.3 → 127.0.0.4，等 DNS 刷新触发 clear_remote_index
+	setLast('4')
+	start := time.Now()
+	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
+		if m.logLines("changed from", fmt.Sprintf("udp=%d", numB)) != 0 {
+			return nil
+		}
+		return fmt.Errorf("还没看到 B 域名地址切换、删除 %d 个 B 会话的日志", numB)
+	})
+	t.Logf("切换 /etc/hosts 后 %v 内删除了 %d 个 B 会话", time.Since(start).Round(time.Second), numB)
+
+	// last_hit 曾指向的 B 客户端先发包：必须得到回复（新会话），而不是命中已归还的旧会话。
+	// 删除后轮询状态回到周期起点，这个新会话按轮询路由到 A；若 last_hit 没清零会命中已关 fd 的旧会话→无回复/断言中止。
+	got, err := udpTry(lastHitB, []byte("after-switch"), 2*time.Second, 4)
+	if err != nil {
+		t.Fatalf("切换后 last_hit B 客户端无回复：last_hit 可能仍指向已删除的会话：%v", err)
+	}
+	m.fatalIfExited(t, "切换后 last_hit B 客户端发包后")
+	if p := string(got[:len(got)-len("after-switch")]); p == "B3" {
+		t.Fatalf("切换后回包来自旧 B 地址（%q）：新会话不应连到已失效的地址", p)
+	}
+
+	// 每个 A 客户端再发包：必须命中各自的旧 A 会话、回包仍来自 A，不新建会话
+	for i := 0; i < n; i += 2 {
+		got, err := udpTry(conns[i], fmt.Appendf(nil, "a-again-%d", i), 2*time.Second, 4)
+		if err != nil {
+			t.Fatalf("切换后第 %d 个 A 客户端无回复：A 会话被删除缠绕打乱了：%v", i, err)
+		}
+		if !strings.HasPrefix(string(got), "A") {
+			t.Fatalf("切换后第 %d 个 A 客户端回包 %q，期望仍来自 A：该 A 会话被删除打乱、重建并改了路由", i, got)
+		}
+	}
+	m.fatalIfExited(t, "切换后重发全部 A 客户端后")
+
+	// A 后端源地址集 = numA + 1（last_hit B 客户端重建的新会话按轮询也落到 A）；没有任何 A 客户端新建会话→无新源端口
+	if peers := beA.peerList(); len(peers) != numA+1 {
+		t.Errorf("A 后端看到 %d 个源地址，期望 %d（numA + 重建的 last_hit B 客户端）：A 会话被删除打乱后重建会多出源端口", len(peers), numA+1)
+	}
+	// 统计：当前会话 = numA + 1，累计 = N + 1。noshift/shiftgt 会让部分 A 会话查不到→重建，令两者超出
+	if s := m.statsAfterSignal(t).udp[1]; s.sessions != numA+1 || int(s.total) != n+1 {
+		t.Errorf("统计 sessions=%d total=%d，期望 %d/%d（删除打乱会话表会导致重建、计数超出）", s.sessions, s.total, numA+1, n+1)
+	}
+}
+
+// max_conn_num：填满单规则到上限（20000 会话，用到最大的 32768 槽表），再来的新客户端被忽略（日志 but ignored,bc of
+// max_conv_num reached），既有会话仍能转发，统计 sessions=20000。
+//
+// 临时端口：tinymapper 的 20000 个上游 socket 都在 connect 时从临时端口范围（net.ipv4.ip_local_port_range 32768–60999，
+// 约 28k）自动绑定源端口。客户端也自动绑定时（即便分到别的 127.0.x.y 源 IP），实测 tinymapper 建到第 18738 个（客户端分 3 个
+// 源 IP）或第 19584 个（分 80 个源 IP）上游 socket 时 connect 就返回 EAGAIN（inet_autobind 失败），填不满 20000；机理未查明。
+// 所以客户端显式绑定固定源端口，完全不用临时端口：127.0.1.1 与 127.0.1.2 各 10000 个，端口 1024–11023。端口都低于 20000：
+// freePort 从 20001 起分配给并行用例，其中通配地址（0.0.0.0:p、[::]:p）的绑定会与 127.0.1.x:p 冲突（EADDRINUSE）。
+//
+// 顺序建会话（非并发）：环回上单线程往返约 5000 次/秒，20000 个会话约几秒就建完，远在 180 s 空闲超时之前；并发建会话时首包
+// 大量丢失、靠超时重发，速率反而骤降到约 100/秒，早建的会话会先于填满被 conn_timeout_udp 清掉，sessions 永远到不了 20000。
+func TestUDPMaxConn(t *testing.T) {
+	t.Parallel()
+	heavy(t)
+	const maxConn = 20000
+	const perIP, clientPortBase = 10000, 1024 // 每个源 IP 的客户端数与起始端口：1024..1024+perIP 低于 freePort 的 20001
+	clientAddr := func(i int) *net.UDPAddr {
+		return &net.UDPAddr{IP: net.IPv4(127, 0, 1, byte(1+i/perIP)), Port: clientPortBase + i%perIP}
+	}
+	be := serveUDP(t, loopback4(t), "")
+	listen := loopback4(t)
+	m := forward(t, "u", listen, be.addr)
+	ra, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	conns := make([]*net.UDPConn, maxConn)
+	t.Cleanup(func() {
+		for _, c := range conns {
+			if c != nil {
+				c.Close()
+			}
+		}
+	})
+	start := time.Now()
+	for i := range conns {
+		c, err := net.DialUDP("udp", clientAddr(i), ra)
+		if err != nil {
+			t.Fatalf("第 %d 个客户端建 socket 失败：%v", i, err)
+		}
+		conns[i] = c
+		msg := fmt.Appendf(nil, "fill-%05d", i)
+		got, err := udpTry(c, msg, 2*time.Second, 4)
+		if err != nil {
+			t.Fatalf("第 %d 个会话失败：%v", i, err)
+		}
+		if !bytes.Equal(got, msg) {
+			t.Fatalf("第 %d 个会话回包 %q 与请求不一致", i, got)
+		}
+	}
+	t.Logf("顺序建立 %d 个 UDP 会话用时 %v", maxConn, time.Since(start).Round(time.Millisecond))
+
+	// 第 20001 个客户端（127.0.1.1 上下一个未用的端口 11024，确保是新会话）：被 max_conn_num 忽略、不建会话、无回复
+	extra, err := net.DialUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 1, 1), Port: clientPortBase + perIP}, ra)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { extra.Close() })
+	if _, err := extra.Write([]byte("overflow")); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, logFlushWithin+ioTimeout, 50*time.Millisecond, func() error {
+		m.fatalIfExited(t, "填满 max_conn_num 后")
+		if m.logLines("but ignored,bc of max_conv_num reached") == 0 {
+			return fmt.Errorf("还没看到 max_conn_num 的忽略日志")
+		}
+		return nil
+	})
+	extra.SetReadDeadline(time.Now().Add(500 * time.Millisecond))
+	if nr, err := extra.Read(make([]byte, 64)); err == nil {
+		t.Errorf("超限的新客户端收到 %d 字节回包：不应为它建会话", nr)
+	}
+
+	// 抽查若干既有会话仍能转发
+	for _, i := range []int{0, 1, 9999, 15000, maxConn - 2, maxConn - 1} {
+		msg := fmt.Appendf(nil, "alive-%05d", i)
+		got, err := udpTry(conns[i], msg, 3*time.Second, 6)
+		if err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("超限后第 %d 个既有会话异常：got=%q err=%v", i, got, err)
+		}
+	}
+	if s := m.statsAfterSignal(t).udp[1]; s.sessions != maxConn {
+		t.Errorf("统计 sessions=%d，期望 %d", s.sessions, maxConn)
+	}
+}
