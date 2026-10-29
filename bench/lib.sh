@@ -108,7 +108,9 @@ client() {
     tcp_rr_*)  on cli "$c $FWDBENCH rr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     tcp_crr_*) on cli "$c $FWDBENCH crr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     udp_*)
-      on cli "$c $IPERF3 -c $TARGET_IP -p $TARGET_PORT -u -b 0 -l ${w##*_} -t $d -J" | jq -c '{sent_pkts: .end.sum_sent.packets,
+      local len=${w#udp_*_} par=1 #udp_pps_64_p<N>：N 条流，见 bench.sh
+      case $w in *_p[0-9]*) par=${w##*_p}; len=${len%_p*} ;; esac
+      on cli "$c $IPERF3 -c $TARGET_IP -p $TARGET_PORT -u -b 0 -l $len -P $par -t $d -J" | jq -c '{sent_pkts: .end.sum_sent.packets,
         recv_pkts: (.end.sum_received.packets - .end.sum_received.lost_packets), seconds: .end.sum_received.seconds,
         recv_kpps: ((.end.sum_received.packets - .end.sum_received.lost_packets) / .end.sum_received.seconds / 1e3),
         lost_pct: .end.sum_received.lost_percent, err: .error}' ;;
