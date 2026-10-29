@@ -7,7 +7,8 @@
 // 每次转储都复核三条池不变式（alloc==held+free+scratch；TCP/UDP 在用对象数==各规则连接数/会话数之和），
 // 发布构建里也查（-assert 构建的 sigusr1_cb 自己也断言，破坏不变式会中止进程），所以每个用例都兼作泄漏检查。
 //
-// UDP 丢包用 seccomp 过滤器确定性注入：令指定 fd 区间的 sendto 返回 EAGAIN（arm64/x86_64 上 send() 即 sendto 系统调用）。
+// UDP 丢包用 seccomp 过滤器确定性注入：令指定 fd 区间的 sendto、sendmsg、sendmmsg 返回 EAGAIN（基线的上行与 udp_cb 的回程用
+// send()/sendto()，arm64/x86_64 上都是 sendto 系统调用；U3 起上行直接调 sendmmsg 系统调用）。
 // 这里用 init() 在重新执行的测试二进制里先装过滤器再 exec tinymapper，与 harness_test.go 的 epoll 故障注入同一套路。
 package tests
 
@@ -359,7 +360,8 @@ func TestStatsHeldBlocks(t *testing.T) {
 const tcpBufPoolMaxFree = 64 // main.cpp 的 tcp_buf_pool_max_free
 
 // UDP：会话/总数、两个方向精确的包数与字节数、两个方向确定性的丢包。
-// 用 seccomp 令选定 fd 区间的 sendto 返回 EAGAIN：up 子用例打会话 socket（上行丢），down 子用例打监听 socket（下行丢），另一方向保持精确
+// 用 seccomp 令选定 fd 区间的发送返回 EAGAIN：up、upbatch 子用例打会话 socket（上行丢），down 子用例打监听 socket（下行丢），
+// 另一方向保持精确
 func TestStatsUDPDrops(t *testing.T) {
 	t.Parallel()
 	const K = 5
@@ -395,6 +397,56 @@ func TestStatsUDPDrops(t *testing.T) {
 		}
 		if s.sessions != 1 || s.total != 1 {
 			t.Errorf("sessions=%d total=%d，期望 1/1", s.sessions, s.total)
+		}
+	})
+	// 批量：暂停期间两个客户端交错排队各 kb 个包，恢复后同一批里两个会话（批内新建）的发送都 EAGAIN：up_drop 恰为 2kb、up_pkts 为 0，
+	// 日志报告的丢包数之和与 up_drop 相同。批量发送时（日志为 sendmmsg 的 warn）EAGAIN 说明会话 socket 的发送缓冲已满，一组只试一次、
+	// 丢掉组里剩下的全部包，所以每个会话恰好一行 "dropped kb packets"；EAGAIN 后逐包重试，或只把相邻的包分成一组，都会多出若干行
+	t.Run("upbatch", func(t *testing.T) {
+		t.Parallel()
+		const kb = 20
+		be := serveUDP(t, loopback4(t), "")
+		listen := loopback4(t)
+		wait := listenPoints("u", portOf(listen))
+		args := []string{"-l", listen, "-r", be.addr, "-u"}
+		n := startupFDs(t, wait, args...)
+		m := startMapperSendtoFail(t, n, 0, wait, args...)
+		a, b := udpDial(t, "", listen), udpDial(t, "", listen)
+		var sends []udpSend
+		for range kb {
+			sends = append(sends, udpSend{a, []byte("ping-a")}, udpSend{b, []byte("ping-b")})
+		}
+		m.pause(t)
+		queueUDP(t, m, listen, sends)
+		m.resume(t)
+		var d statsDump
+		eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+			d = m.statsAfterSignal(t)
+			if d.udp[1].upDrop != 2*kb {
+				return fmt.Errorf("up_drop=%d，期望 %d", d.udp[1].upDrop, 2*kb)
+			}
+			return nil
+		})
+		s := d.udp[1]
+		if s.upPkts != 0 || s.upBytes != 0 {
+			t.Errorf("up_pkts=%d up_bytes=%d，期望全 0（上行发送全部失败）", s.upPkts, s.upBytes)
+		}
+		if s.downPkts != 0 || s.downBytes != 0 || s.downDrop != 0 {
+			t.Errorf("下行计数非零 %+v：上行从未送达，不应有回包", s)
+		}
+		if s.sessions != 2 || s.total != 2 {
+			t.Errorf("sessions=%d total=%d，期望 2/2", s.sessions, s.total)
+		}
+		eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+			if drops, lines := loggedUpDrops(m); drops != 2*kb {
+				return fmt.Errorf("日志里 %d 行上行发送失败的 warn 共报告丢 %d 个包，期望 %d", lines, drops, 2*kb)
+			}
+			return nil
+		})
+		if lines := m.logLines("[udp]sendmmsg returned -1,"); lines != 0 {
+			if whole := m.logLines("[udp]sendmmsg returned -1,", fmt.Sprintf(",dropped %d packets", kb)); lines != 2 || whole != 2 {
+				t.Errorf("日志里有 %d 行 sendmmsg 失败的 warn，其中 %d 行丢 %d 个包；期望每个会话恰好一行、丢掉整组（2 行）", lines, whole, kb)
+			}
 		}
 	})
 	t.Run("down", func(t *testing.T) {
@@ -618,8 +670,11 @@ func TestStatsDomainRemote(t *testing.T) {
 // ---- seccomp sendto 故障注入（确定性 UDP 丢包）----
 //
 // init() 在重新执行的测试二进制里运行：TPM_SENDTO_FAIL="lo hi" 存在时，装 seccomp 过滤器后 exec tinymapper，
-// 使 fd 在 [lo, hi) 内的 sendto 返回 EAGAIN，其他系统调用不受影响。arm64/x86_64 上 send() 即 sendto 系统调用，
-// 过滤器按 args[0]（fd）比较。no_new_privs 与过滤器只作用于调用线程并由 execve 保留，对静态链接的 tinymapper 同样有效。
+// 使 fd 在 [lo, hi) 内的 sendto、sendmsg、sendmmsg 返回 EAGAIN，其他系统调用不受影响。基线的上行与 udp_cb 的回程用
+// send()/sendto()，arm64/x86_64 上都是 sendto 系统调用；U3 的上行用 syscall(SYS_sendmmsg) 直接调 sendmmsg 系统调用，64 位 musl 上
+// 也是（musl 的 sendmmsg 包装函数会逐个调 sendmsg，内核与 musl 的 msghdr 字段类型不同）。sendmsg 也拦下，是防将来改回 libc 的
+// sendmmsg 时 musl 构建绕过过滤器：那时第一个 sendmsg 就失败，包装函数返回 -1，与真正的 sendmmsg 相同。过滤器按 args[0]（fd）比较。
+// no_new_privs 与过滤器只作用于调用线程并由 execve 保留，对静态链接的 tinymapper 同样有效。
 // 与 harness_test.go 的 TPM_EPOLL_ADD_FAIL 互不干扰（各认各的环境变量）
 
 const sendtoFailEnv = "TPM_SENDTO_FAIL"
@@ -630,7 +685,11 @@ func init() {
 	}
 }
 
-// sendtoFailFilter 返回 BPF 程序：arch 相符、nr 为 sendto、lo ≤ args[0] < hi 时返回 SECCOMP_RET_ERRNO|EAGAIN，否则放行。
+// sendmmsg 的系统调用号：syscall 包的 amd64 表里没有 SYS_SENDMMSG
+var sendmmsgNR = map[string]uint32{"amd64": 307, "arm64": 269}
+
+// sendtoFailFilter 返回 BPF 程序：arch 相符、nr 为 sendto/sendmsg/sendmmsg、lo ≤ args[0] < hi 时返回 SECCOMP_RET_ERRNO|EAGAIN，
+// 否则放行。
 // 只支持小端架构（取 u64 fd 的低 32 位）
 func sendtoFailFilter(arch, lo, hi uint32) []syscall.SockFilter {
 	const (
@@ -645,17 +704,19 @@ func sendtoFailFilter(arch, lo, hi uint32) []syscall.SockFilter {
 	jump := func(code uint16, k uint32, jt, jf uint8) syscall.SockFilter {
 		return syscall.SockFilter{Code: code, Jt: jt, Jf: jf, K: k}
 	}
-	// 索引 8 为放行
+	// 跳转偏移相对下一条指令；索引 10 为放行
 	return []syscall.SockFilter{
 		stmt(ld, 4),           // 0：arch
-		jump(jeq, arch, 0, 6), // 1：不匹配 → 放行
+		jump(jeq, arch, 0, 8), // 1：不匹配 → 放行
 		stmt(ld, nr),          // 2：nr
-		jump(jeq, uint32(syscall.SYS_SENDTO), 0, 4), // 3：非 sendto → 放行
-		stmt(ld, arg0),      // 4：fd
-		jump(jge, lo, 0, 2), // 5：fd<lo → 放行
-		jump(jge, hi, 1, 0), // 6：fd≥hi → 放行
-		stmt(ret, 0x00050000|uint32(syscall.EAGAIN)), // 7：SECCOMP_RET_ERRNO|EAGAIN
-		stmt(ret, 0x7fff0000),                        // 8：SECCOMP_RET_ALLOW
+		jump(jeq, uint32(syscall.SYS_SENDTO), 2, 0),  // 3：sendto → 6
+		jump(jeq, uint32(syscall.SYS_SENDMSG), 1, 0), // 4：sendmsg → 6
+		jump(jeq, sendmmsgNR[runtime.GOARCH], 0, 4),  // 5：都不是 → 放行
+		stmt(ld, arg0),      // 6：fd
+		jump(jge, lo, 0, 2), // 7：fd<lo → 放行
+		jump(jge, hi, 1, 0), // 8：fd≥hi → 放行
+		stmt(ret, 0x00050000|uint32(syscall.EAGAIN)), // 9：SECCOMP_RET_ERRNO|EAGAIN
+		stmt(ret, 0x7fff0000),                        // 10：SECCOMP_RET_ALLOW
 	}
 }
 
@@ -691,7 +752,7 @@ func execSendtoFail(spec string) {
 	fail("exec %s：%v", os.Args[1], err)
 }
 
-// startMapperSendtoFail 同 startMapper，但 tinymapper 里 fd 在 [lo, hi) 内的 sendto 都返回 EAGAIN；hi 为 0 表示不设上限
+// startMapperSendtoFail 同 startMapper，但 tinymapper 里 fd 在 [lo, hi) 内的 sendto、sendmsg、sendmmsg 都返回 EAGAIN；hi 为 0 表示不设上限
 func startMapperSendtoFail(t testing.TB, lo, hi int, wait []listenPoint, args ...string) *mapper {
 	t.Helper()
 	if _, ok := auditArch[runtime.GOARCH]; !ok {

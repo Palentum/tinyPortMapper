@@ -267,12 +267,14 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	int local_listen_fd;
 	forward_rule_t *owner;
 	int remote_index;
+	int batch_group;//入向这一批里本会话的组号（U3），批外恒为 -1
 	//u64_t last_active_time;
 	udp_pair_t()
 	{
 		memset(&ev,0,sizeof(ev));//同 tcp_info_t（T11）
 		owner=0;
 		remote_index=-1;
+		batch_group=-1;
 	}
 	//int not_used=0;
 };

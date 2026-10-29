@@ -4,6 +4,7 @@
 #include "config.h"
 
 #include <sys/stat.h>
+#include <sys/syscall.h>
 #include <netinet/tcp.h>
 #include <thread>
 #include <mutex>
@@ -246,6 +247,43 @@ static obj_pool_t<udp_pair_t> udp_pair_pool;
 static tcp_buf_pool_t tcp_buf_pool;
 static char *tcp_scratch=0;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
 
+static const int udp_batch_max=64;//U1：一次 recvmmsg 最多收这么多包，也是一次回调最多处理的包数（D35）
+static const int udp_slot_len=2048;
+//UDP 监听 socket 的入向批（U1、U3，D34）。每条消息两段 iov：2 KB 的槽（64 个连续排列，MTU 级的包只碰这里）加本消息自己的溢出区，
+//合计 max_data_len_udp；溢出区是 BSS，只有大于 2 KB 的包才碰到它的页，常驻内存随大包增长，最多约 4 MiB
+struct udp_batch_t
+{
+	mmsghdr in[udp_batch_max];//recvmmsg 用：msg_name 指向 addr[i]，iov 固定指向 slot[i]、overflow[i]
+	iovec in_iov[udp_batch_max][2];
+	address_t::storage_t addr[udp_batch_max];
+	udp_pair_t *pair[udp_batch_max];//第 i 个包所属的会话，0 表示已丢弃
+	//sendmmsg 用：同一会话的包排在一起。msg_name 为 0：connected socket 上带地址就改发到那个地址。udp_send_group 直接调 syscall，
+	//64 位 musl 的 __pad1/__pad2 必须保持 0（非 0 时内核报 EMSGSIZE）：只按字段名赋值，不要把别处的 msghdr 整个赋进来
+	mmsghdr out[udp_batch_max];
+	iovec out_iov[udp_batch_max][2];
+	udp_pair_t *group_pair[udp_batch_max];//组按会话在本批首次出现的顺序编号
+	int group_cnt[udp_batch_max];
+	int group_pos[udp_batch_max];
+	char slot[udp_batch_max][udp_slot_len];
+	char overflow[udp_batch_max][max_data_len_udp-udp_slot_len];
+	udp_batch_t()
+	{
+		for(int i=0;i<udp_batch_max;i++)
+		{
+			in_iov[i][0].iov_base=slot[i];
+			in_iov[i][0].iov_len=udp_slot_len;
+			in_iov[i][1].iov_base=overflow[i];
+			in_iov[i][1].iov_len=sizeof(overflow[i]);
+			in[i].msg_hdr.msg_name=&addr[i];
+			in[i].msg_hdr.msg_namelen=sizeof(addr[i]);
+			in[i].msg_hdr.msg_iov=in_iov[i];
+			in[i].msg_hdr.msg_iovlen=2;
+			out[i].msg_hdr.msg_iov=out_iov[i];
+		}
+	}
+};
+static udp_batch_t udp_batch;
+
 //UDP 会话的键（U2）：族、端口、地址，IPv6 再加 scope_id（同一个 fe80:: 地址在不同网卡上是不同的对端）。sockaddr 的其余字节不比：
 //from_sockaddr 先清零，内核填的 sin6_flowinfo 恒为 0，结果与比较整个 address_t 相同
 static inline int udp_key_eq(const address_t &a,const address_t &b)
@@ -401,6 +439,7 @@ struct conn_manager_udp_t
 
 	int erase(udp_pair_t *pair)
 	{
+		DEBUG_ASSERT(pair->batch_group<0);
 		struct ev_loop * loop= ev_default_loop (0);
 		ev_io_stop(loop, &pair->ev);
 
@@ -1441,11 +1480,163 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		conn_manager_udp.bytes[1]+=ret;
 	}
 }
+//客户端 tmp_addr 的第一个包：建会话。失败时返回 0，这个包丢弃；hash 是 find() 算出的 tmp_addr 的哈希。不内联进逐包的循环
+static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *loop,forward_rule_t *rule,int local_listen_fd_udp,address_t &tmp_addr,u32_t hash)
+{
+	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
+	if(conn_manager_udp.lru.size()>=max_conn_num)
+	{
+		mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
+		return 0;
+	}
+	//会话表要扩容时在选上游、建 socket 之前做：失败只丢这个包，轮询序号不前进
+	if(conn_manager_udp.sessions.reserve_one()!=0)
+	{
+		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+		return 0;
+	}
+	int remote_index=select_remote_index(*rule,tmp_addr);
+	address_t &remote_addr=rule->remote_targets[remote_index].addr;
+	int new_udp_fd=remote_addr.new_connected_udp_fd();
+	if(new_udp_fd==-1)
+	{
+		mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
+		return 0;
+	}
+
+	udp_pair_t *new_pair=udp_pair_pool.get();
+	if(new_pair==0)
+	{
+		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+		close(new_udp_fd);
+		return 0;
+	}
+	udp_pair_t &udp_pair=*new_pair;
+	conn_manager_udp.lru.new_key(&udp_pair);
+	conn_manager_udp.total++;
+	udp_pair.owner=rule;
+	udp_pair.remote_index=remote_index;
+
+	udp_pair.fd=new_udp_fd;
+	udp_pair.ev.data=&udp_pair;
+	ev_io_init (&udp_pair.ev, udp_cb, new_udp_fd, EV_READ);
+	ev_io_start(loop, &udp_pair.ev);
+
+	mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,conn_manager_udp.lru.size());
+
+	udp_pair.adress=tmp_addr;
+	udp_pair.local_listen_fd=local_listen_fd_udp;
+
+	conn_manager_udp.sessions.insert(&udp_pair,hash);
+	conn_manager_udp.last_hit=&udp_pair;
+	return &udp_pair;
+}
+//一个会话本批的 cnt 个包（U3）：sendmmsg 只发出一部分时从断点接着发（内核不报断点处的错误，重发一次才知道它是否仍失败）。
+//EAGAIN 丢掉剩下的包，不排队（UDP 语义）；其他错误（EMSGSIZE 等）只丢断点处这一个包。上一个包引来的 ICMP（ECONNREFUSED）
+//只让断点处的发送失败，错误随之被取走，重发就成功：只有一组的第一个包碰上它时才丢包、记 warn（逐包 send 时每次都丢）。
+//直接调 syscall：64 位 musl 的 sendmmsg() 是逐条 sendmsg() 的循环（它的 msghdr 用 int 加填充，内核用 size_t）；
+//udp_batch.out 在 BSS 里，musl 的 __pad1/__pad2 从不写入、恒为 0，内核读到的 msg_iovlen/msg_controllen 就是本值
+static void udp_send_group(conn_manager_udp_t &conn_manager_udp,int udp_fd,mmsghdr *msgs,int cnt)
+{
+	for(int sent=0;sent<cnt;)
+	{
+		int ret=(int)syscall(SYS_sendmmsg,(long)udp_fd,msgs+sent,(long)(cnt-sent),0L);//变参按 long 读
+		if(ret>0)
+		{
+			conn_manager_udp.pkts[0]+=ret;
+			for(int i=sent;i<sent+ret;i++)
+				conn_manager_udp.bytes[0]+=msgs[i].msg_len;
+			sent+=ret;
+			continue;
+		}
+		int dropped=(errno==EAGAIN||errno==EWOULDBLOCK)?cnt-sent:1;
+		conn_manager_udp.drop[0]+=dropped;
+		mylog(log_warn,"[udp]sendmmsg returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
+		sent+=dropped;
+	}
+}
+//recvmmsg 收到的 n 个包（U1、U3）：逐包查找或新建会话，再按会话分组，每个会话一次 sendmmsg。会话内保持到达顺序，
+//各组按会话在本批首次出现的顺序发出
+static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int local_listen_fd_udp,int n)
+{
+	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
+	udp_batch_t &b=udp_batch;
+	int groups=0;
+	for(int i=0;i<n;i++)
+	{
+		msghdr &h=b.in[i].msg_hdr;
+		int data_len=b.in[i].msg_len;
+		address_t tmp_addr;
+		tmp_addr.from_sockaddr((sockaddr*)&b.addr[i],h.msg_namelen);
+		h.msg_namelen=sizeof(b.addr[i]);//内核按实际地址长度改写了它，下一次 recvmmsg 之前恢复
+		b.pair[i]=0;
+
+		//每包都走这里：地址只在记日志时格式化（T7）
+		mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",tmp_addr.get_str(),data_len);
+
+		if(h.msg_flags&MSG_TRUNC)
+		{
+			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
+			continue;
+		}
+
+		u32_t hash;
+		udp_pair_t *pair=conn_manager_udp.find(tmp_addr,hash);
+		if(pair==0)
+		{
+			pair=udp_new_session(loop,rule,local_listen_fd_udp,tmp_addr,hash);
+			if(pair==0) continue;
+		}
+		if(pair->batch_group<0)
+		{
+			pair->batch_group=groups;
+			b.group_pair[groups]=pair;
+			b.group_cnt[groups]=0;
+			groups++;
+		}
+		b.group_cnt[pair->batch_group]++;
+		b.pair[i]=pair;
+	}
+	//计数排序：group_pos 先是各组在 out 里的起点，放完后是终点
+	int pos=0;
+	for(int g=0;g<groups;g++)
+	{
+		b.group_pos[g]=pos;
+		pos+=b.group_cnt[g];
+	}
+	for(int i=0;i<n;i++)
+	{
+		if(b.pair[i]==0) continue;
+		int j=b.group_pos[b.pair[i]->batch_group]++;
+		int len=b.in[i].msg_len;
+		iovec *iov=b.out_iov[j];
+		iov[0].iov_base=b.slot[i];
+		if(len<=udp_slot_len)
+		{
+			iov[0].iov_len=len;
+			b.out[j].msg_hdr.msg_iovlen=1;
+		}
+		else
+		{
+			iov[0].iov_len=udp_slot_len;
+			iov[1].iov_base=b.overflow[i];
+			iov[1].iov_len=len-udp_slot_len;
+			b.out[j].msg_hdr.msg_iovlen=2;
+		}
+	}
+	for(int g=0;g<groups;g++)
+	{
+		udp_pair_t &udp_pair=*b.group_pair[g];
+		udp_pair.batch_group=-1;
+		conn_manager_udp.lru.update(&udp_pair);
+		int cnt=b.group_cnt[g];
+		udp_send_group(conn_manager_udp,udp_pair.fd,b.out+b.group_pos[g]-cnt,cnt);
+	}
+}
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
 	DEBUG_ASSERT(rule!=0);
-	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
 
 	if((revents&EV_ERROR) !=0)
 	{
@@ -1453,123 +1644,19 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_warn,"[udp]accept watcher of listen fd %d got EV_ERROR\n",watcher->fd);
 		return ;
 	}
-	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
-	{
-		mylog(log_error,"[udp]EPOLLERR or EPOLLHUP from listen_fd events[idx].events=%x \n",events[idx].events);
-		//if there is an error, we will eventually get it at recvfrom();
-	}*/
-
-	char data[max_data_len_udp+200];
-	int data_len;
-
-	socklen_t tmp_len = sizeof(address_t::storage_t);
-	address_t::storage_t tmp_sockaddr_in={0};
-	memset(&tmp_sockaddr_in,0,sizeof(tmp_sockaddr_in));
 
 	int local_listen_fd_udp=watcher->fd;
-
-	if ((data_len = recvfrom(local_listen_fd_udp, data, max_data_len_udp+1, 0,
-			(struct sockaddr *) &tmp_sockaddr_in, &tmp_len)) == -1) //<--first packet from a new ip:port turple
+	//每次回调只收一批（D35）：没收完的由水平触发的 epoll 下一轮再报，一轮里入向最多占 udp_batch_max 个包，
+	//回程（U4 之前每个会话每轮一个包）与 TCP 不会被长时间挤占
+	int n=recvmmsg(local_listen_fd_udp,udp_batch.in,udp_batch_max,MSG_DONTWAIT,0);//socket 本身也非阻塞；阻塞时会等凑满一批
+	if(n<0)
 	{
-		mylog(log_debug,"[udp]recv_from error,errno %s,this shouldnt happen,but lets try to pretend it didnt happen",get_sock_error());
-		//myexit(1);
+		//EAGAIN：唤醒本轮的包校验和错误、已被内核丢掉
+		if(errno!=EAGAIN&&errno!=EWOULDBLOCK)
+			mylog(log_debug,"[udp]recvmmsg error,errno %s\n",get_sock_error());
 		return;
 	}
-
-	address_t tmp_addr;
-	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
-
-	data[data_len] = 0; //for easier debug
-
-	//每包都走这里：地址只在记日志时格式化（T7）
-	mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",tmp_addr.get_str(),data_len);
-
-	if(data_len==max_data_len_udp+1)
-	{
-		mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
-		return;
-	}
-
-	u32_t hash;
-	udp_pair_t *pair=conn_manager_udp.find(tmp_addr,hash);
-	if(pair==0)
-	{
-
-		if(conn_manager_udp.lru.size()>=max_conn_num)
-		{
-			mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
-			return;
-		}
-		//会话表要扩容时在选上游、建 socket 之前做：失败只丢这个包，轮询序号不前进
-		if(conn_manager_udp.sessions.reserve_one()!=0)
-		{
-			mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
-			return;
-		}
-		int remote_index=select_remote_index(*rule,tmp_addr);
-		address_t &remote_addr=rule->remote_targets[remote_index].addr;
-		int new_udp_fd=remote_addr.new_connected_udp_fd();
-		if(new_udp_fd==-1)
-		{
-			mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
-			return;
-		}
-
-		//struct epoll_event ev;
-		//ev.events = EPOLLIN;
-		//ev.data.u64 = fd64;
-
-		//ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, new_udp_fd, &ev);
-		//assert(ret==0);
-
-
-		udp_pair_t *new_pair=udp_pair_pool.get();
-		if(new_pair==0)
-		{
-			mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
-			close(new_udp_fd);
-			return;
-		}
-		udp_pair_t &udp_pair=*new_pair;
-		conn_manager_udp.lru.new_key(&udp_pair);
-		conn_manager_udp.total++;
-		udp_pair.owner=rule;
-		udp_pair.remote_index=remote_index;
-
-		udp_pair.fd=new_udp_fd;
-		udp_pair.ev.data=&udp_pair;
-		ev_io_init (&udp_pair.ev, udp_cb, new_udp_fd, EV_READ);
-		ev_io_start(loop, &udp_pair.ev);
-
-
-		mylog(log_info,"[udp]new connection from {%s},udp fd=%d,udp connections=%d\n",tmp_addr.get_str(),new_udp_fd,conn_manager_udp.lru.size());
-
-		udp_pair.adress=tmp_addr;
-		//udp_pair.last_active_time=get_current_time();
-		udp_pair.local_listen_fd=local_listen_fd_udp;
-
-		conn_manager_udp.sessions.insert(&udp_pair,hash);
-		conn_manager_udp.last_hit=&udp_pair;
-		pair=&udp_pair;
-	}
-
-	udp_pair_t &udp_pair=*pair;
-	int udp_fd=udp_pair.fd;
-	conn_manager_udp.lru.update(&udp_pair);
-	//udp_pair.last_active_time=get_current_time();
-
-	int ret;
-	ret = send(udp_fd, data,data_len, 0);
-	if (ret < 0) {
-		conn_manager_udp.drop[0]++;
-		mylog(log_warn, "[udp]send returned %d,%s\n", ret,get_sock_error() );
-	}
-	else
-	{
-		conn_manager_udp.pkts[0]++;
-		conn_manager_udp.bytes[0]+=ret;
-	}
-
+	udp_forward_batch(loop,rule,local_listen_fd_udp,n);
 }
 //SIGUSR1 输出统计（O1，D25–D27）：每条规则的 TCP、UDP 各一行，再加一行进程级的池。当前连接数、半关闭对数、
 //持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上
