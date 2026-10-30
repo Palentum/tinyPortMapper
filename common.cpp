@@ -799,7 +799,9 @@ int address_t::new_connected_udp_fd()
 	int new_udp_fd;
 	new_udp_fd = socket(get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
 	if (new_udp_fd < 0) {
+		int err=errno;//调用方按 EMFILE/ENFILE 决定是否先关掉空闲 pipe（D52）
 		mylog(log_warn, "create udp_fd error\n");
+		errno=err;
 		return -1;
 	}
 	//会话 socket 只在给了 --sock-buf 时才用 *BUFFORCE（D38 修订）：默认的 1 MiB 仍按 rmem_max/wmem_max 截断，

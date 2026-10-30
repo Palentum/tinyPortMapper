@@ -12,14 +12,19 @@
 #   STAGES   要执行的阶段：bench syscount prof（默认 "bench syscount"）
 #   FWDS     转发器，默认 "direct tinymapper tinymapper-musl rinetd realm-1c realm-2c"；
 #            tinymapper[-musl]@<后缀> 使用 build/tinymapper-{glibc,musl}-<后缀>，缺失时以 REF=<后缀> 自动编译；
-#            加 +gro 后缀（tinymapper+gro、tinymapper-musl@<后缀>+gro，可与 +nocap 组合）为同一二进制加 --udp-gro 启动（U5）
+#            加 +gro 后缀（tinymapper+gro、tinymapper-musl@<后缀>+gro，可与 +nocap 组合）为同一二进制加 --udp-gro 启动（U5），
+#            +nosplice 为加 --disable-splice 启动（B2）；+nonroot（任何转发器，如 realm-1c+nonroot）以专用 uid FWD_UID（4242）启动，
+#            fs.pipe-user-pages-soft 按它计（见 lib.sh 的 start_fwd）
 #   TESTS    测试项，默认全部 8 项；REPS 轮数（3）；DUR 每项秒数（10）
 #            另有不在默认列表里的 UDP 负载（TESTS / SC_TESTS 里显式指定）：
 #              udp_pps_64_p<N>  N 条流（iperf3 -P N），每条流是转发器里的一个会话
 #              <UDP 负载>_r     反向（iperf3 -R）：后端发、客户端收，数据走转发器回程；udp_pps_64_r、udp_pps_64_p<N>_r、udp_bw_1400_r
 #              udp_rr_<N>       fwdbench udp-rr：N 个会话各一个 64 B 请求在途，后端是 fwdbench server 的 UDP 回显；
 #                               udp_rr_1 测低负载延迟，udp_rr_64 测多会话回程；超时 200 ms 未回记为丢失
-#            syscall 计数单位：udp_rr 为每个往返，_r 为转发器发出的每个包
+#              tcp_bulk_<N>[_stall]  fwdbench bulk：N 条连接各自持续写 64 KiB 的块，经转发器到 fwdbench sink（核对内容），
+#                               客户端 SO_SNDBUF 固定为 BULK_SNDBUF（32768）；_stall 时 sink 先停顿 BULK_STALL（1）秒再读，
+#                               所有方向同时积压在转发器里（配 +nonroot 看 pipe 软上限与回退计数，见 lib.sh 的 bulk_args）
+#            syscall 计数单位：udp_rr 为每个往返，_r 为转发器发出的每个包，tcp_bw/tcp_bulk 为每 GB
 #   SC_FWDS / SC_TESTS / SC_DUR  syscall 计数的转发器（默认 FWDS 去掉 direct、realm-2c）、负载（5 个）、秒数（8）
 #   PROF_RUNS / PROF_DUR / PHASES 剖析范围（格式见 bench/prof/prof.sh）
 #   SKIP_BUILD=1  不重新编译工作区的 tinymapper（缺失的二进制仍会编译）
@@ -35,6 +40,8 @@
 #            容器为 --privileged（bench 阶段也是），tinymapper 同 syscount 阶段去掉 CAP_NET_ADMIN。softirq 落点与限制见
 #            lib.sh 的 topo_up 与 BASELINE.md 第 6 节。结果每行多 topo 字段，拓扑核对写入各阶段的 topo.txt
 #   CNAME    容器名前缀（默认不命名）：各阶段容器名为 <CNAME>-<阶段>，便于识别与只停自己的容器
+#   GATE_LOCK  共用 Docker VM 时的锁文件（默认无）：开始编译之前与每个阶段的容器启动前，该文件存在就每 30 s 查一次，直到它消失
+#   BULK_SNDBUF / BULK_STALL / FWD_UID  传给容器（tcp_bulk_* 与 +nonroot，见 lib.sh）
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/bench/lib.sh"
@@ -57,6 +64,8 @@ PIMG=tinymapper-bench-prof:2
 R=$ROOT/bench/results/$(date +%Y%m%d-%H%M%S)
 mkdir -p "$R"
 exec > >(tee -a "$R/run.log") 2>&1
+gate_lock() { while [ -n "${GATE_LOCK:-}" ] && [ -e "$GATE_LOCK" ]; do log "等 $GATE_LOCK"; sleep 30; done; }
+gate_lock
 
 # 1. tinymapper：各阶段用到的 tinymapper 变体
 need=""
@@ -97,7 +106,8 @@ esac
   echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL CAP_ADD=${CAP_ADD:-} REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
   echo "二进制 sha256："
   (cd "$ROOT/build" && shasum -a 256 tinymapper-* "fwdbench-linux-$ARCH" || true)
-  docker run --rm ${CNAME:+--name "$CNAME-env"} $IMG sh -c 'iperf3 --version | head -1; realm --version; rinetd --version; ip -V; ethtool --version'
+  docker run --rm ${CNAME:+--name "$CNAME-env"} $IMG sh -c 'iperf3 --version | head -1; realm --version; rinetd --version; ip -V; ethtool --version
+    echo "PAGESIZE $(getconf PAGESIZE)"; for k in pipe-user-pages-soft pipe-user-pages-hard pipe-max-size; do echo "fs.$k = $(cat /proc/sys/fs/$k)"; done'
 } > "$R/env.txt"
 
 # 4. 各阶段：容器内只有 loopback（TOPO=veth 时脚本在容器里另建命名空间），绑核与 sysctl 同 bench.sh 注释
@@ -108,9 +118,11 @@ COMMON=(--rm --init --network none --ulimit nofile=65536:65536
 [ -z "${VETH_FLUSH_NS:-}" ] || COMMON+=(-e VETH_FLUSH_NS="$VETH_FLUSH_NS")
 [ -z "${VETH_DEFER:-}" ] || COMMON+=(-e VETH_DEFER="$VETH_DEFER")
 for c in ${CAP_ADD:-}; do COMMON+=(--cap-add "$c"); done
+for v in BULK_SNDBUF BULK_STALL FWD_UID; do [ -z "${!v:-}" ] || COMMON+=(-e "$v=${!v}"); done
 PRIV=(--privileged); case " ${CAP_ADD:-} " in *" NET_ADMIN "*) ;; *) PRIV+=(-e TM_NOCAP=1) ;; esac
 BPRIV=(); [ "$TOPO" = veth ] && BPRIV=("${PRIV[@]}")   # bench 阶段只在 veth 时 --privileged
 for s in $STAGES; do
+  gate_lock
   log "阶段 $s"
   N=(); [ -z "${CNAME:-}" ] || N=(--name "$CNAME-$s")
   case $s in

@@ -171,7 +171,7 @@ func TestTCPHalfCloseUpstream(t *testing.T) {
 	})
 	listen := loopback4(t)
 	m := forward(t, "t", listen, be.addr)
-	fds := fdCount(t, m.pid()) // 尚无连接时的基线
+	fds := nonPipeFDs(t, m.pid()) // 尚无连接时的基线；100 KiB 的请求会走 splice，scratch pipe 之后合法地留着
 	c := dial(t, listen)
 	c.SetDeadline(time.Now().Add(ioTimeout))
 	resp, err := io.ReadAll(c)
@@ -194,11 +194,12 @@ func TestTCPHalfCloseUpstream(t *testing.T) {
 		t.Fatal("上游未收到请求与 FIN")
 	}
 	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
-		if n := fdCount(t, m.pid()); n != fds {
-			return fmt.Errorf("tinymapper 打开 %d 个 fd，无连接时为 %d：连接对未释放", n, fds)
+		if n := nonPipeFDs(t, m.pid()); n != fds {
+			return fmt.Errorf("tinymapper 打开 %d 个非 pipe fd，无连接时为 %d：连接对未释放", n, fds)
 		}
 		return nil
 	})
+	m.expectPipeFDs(t, m.statsAfterSignal(t), "连接对释放之后")
 }
 
 // 半关闭排空：客户端关闭写方向时反方向仍有大量积压，积压应完整送达，FIN 随后到达上游

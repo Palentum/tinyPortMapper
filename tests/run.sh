@@ -11,7 +11,7 @@
 #   TPM_SLOW=1             同时运行慢速用例（TCP/UDP 空闲超时，约 7 分钟）
 #
 # 流程：docker/build.sh 编译 tinymapper → 宿主机交叉编译测试二进制 → 每个变体一个
-# `docker run --rm --network none --cap-add NET_ADMIN --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
+# `docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REF=${REF:-}
@@ -61,7 +61,11 @@ for v in $VARIANTS; do
 	# UDP socket 缓冲用 SO_*BUFFORCE 设、不受 rmem_max/wmem_max 截断；没有这项能力的路径由 startMapperNoNetAdmin 覆盖
 	# （去掉 CAP_NET_ADMIN 后以 root 启动 tinymapper）
 	# U5：--device /dev/net/tun 供 GSO 回退用例建 tun 设备（没有 TX 校验和 offload 的出口，6.11 以前 GSO 发送返回 EIO）
-	if docker run --rm --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --device /dev/net/tun \
+	# B2：--cap-add SYS_RESOURCE 让 root 启动的 tinymapper 像主机上的 root 部署一样不受 fs.pipe-user-pages-soft 约束：容器里 uid 0 的 pipe 页数
+	# 由 Docker VM 里所有 root 进程共用（测试进程的回显后端 io.Copy 走 Go 的 splice，每个 pipe 1 MiB，TestTCPMaxConn 期间约 1.9 万个；
+	# 并行的另一份套件也算），用完后断言 splice 的用例拿不到 pipe
+	# （needPipeQuotaExempt）；限额本身由 TestSpliceFallbackPipeQuota 以专用的非 root uid 测
+	if docker run --rm --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun \
 		-v "$ROOT/build:/build:ro" -w /tmp \
 		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW \
 		"$img" "/build/$TESTBIN" -test.timeout=30m "$@"; then

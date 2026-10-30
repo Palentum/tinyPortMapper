@@ -4,7 +4,7 @@
 // 随后 fflush；不受 --log-level 过滤（--log-level 0 除外，什么都不写），用普通 [INFO] 前缀（mylog_unfiltered）。
 // 热路径上只累加转发计数，当前连接数、半关闭对数、持有的块数在信号时沿 LRU 现数。
 //
-// 每次转储都复核三条池不变式（alloc==held+free+scratch；TCP/UDP 在用对象数==各规则连接数/会话数之和），
+// 每次转储都复核池不变式（块池与 pipe 池各自 alloc==held+free+scratch；TCP/UDP 在用对象数==各规则连接数/会话数之和），
 // 发布构建里也查（-assert 构建的 sigusr1_cb 自己也断言，破坏不变式会中止进程），所以每个用例都兼作泄漏检查。
 //
 // UDP 丢包用 seccomp 过滤器确定性注入：令指定 fd 区间的 sendto、sendmsg、sendmmsg 返回 EAGAIN（基线的上行与 udp_cb 的回程用
@@ -34,6 +34,14 @@ import (
 type tcpStat struct {
 	conns, halfClosed         int
 	total, upBytes, downBytes uint64
+	// B1/B2（D49）：经 splice 从 pipe 写出的字节（up_bytes/down_bytes 的一部分），以及想 splice 但拿不到 pipe、改走 recv 的读次数
+	upSplice, downSplice, spliceFallback uint64
+}
+
+// tcpStatLine 按 sigusr1_cb 的格式重新写出一行 tcp 统计（从 "stats rule" 起），解析后与原行逐字节比较：D49 只在行末加三项
+func tcpStatLine(idx int, s tcpStat) string {
+	return fmt.Sprintf("stats rule %d tcp: conns=%d total=%d half_closed=%d up_bytes=%d down_bytes=%d up_splice=%d down_splice=%d splice_fallback=%d",
+		idx, s.conns, s.total, s.halfClosed, s.upBytes, s.downBytes, s.upSplice, s.downSplice, s.spliceFallback)
 }
 
 type udpStat struct {
@@ -57,6 +65,14 @@ func udpStatLine(idx int, u udpStat) string {
 type poolStat struct {
 	alloc, held, free, scratch           int
 	tcpSlabs, tcpFree, udpSlabs, udpFree int
+	// B2（D49）：pipe 池，pipeHeld 是持有 pipe 的方向数（沿 LRU 现数）
+	pipeAlloc, pipeHeld, pipeFree, pipeScratch int
+}
+
+// poolStatLine 按 sigusr1_cb 的格式重新写出 pool 行（从 "stats pool:" 起）：D49 只在行末加 pipes 四项
+func poolStatLine(p poolStat) string {
+	return fmt.Sprintf("stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d",
+		p.alloc, p.held, p.free, p.scratch, p.tcpSlabs, p.tcpFree, p.udpSlabs, p.udpFree, p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch)
 }
 
 type statsDump struct {
@@ -75,9 +91,12 @@ func parseStatsBlock(block []string) (statsDump, error) {
 			s := line[strings.Index(line, "stats rule "):]
 			var idx int
 			var t tcpStat
-			if _, err := fmt.Sscanf(s, "stats rule %d tcp: conns=%d total=%d half_closed=%d up_bytes=%d down_bytes=%d",
-				&idx, &t.conns, &t.total, &t.halfClosed, &t.upBytes, &t.downBytes); err != nil {
+			if _, err := fmt.Sscanf(s, "stats rule %d tcp: conns=%d total=%d half_closed=%d up_bytes=%d down_bytes=%d up_splice=%d down_splice=%d splice_fallback=%d",
+				&idx, &t.conns, &t.total, &t.halfClosed, &t.upBytes, &t.downBytes, &t.upSplice, &t.downSplice, &t.spliceFallback); err != nil {
 				return d, fmt.Errorf("解析 tcp 统计行失败：%q：%w", line, err)
+			}
+			if want := tcpStatLine(idx, t); s != want {
+				return d, fmt.Errorf("tcp 统计行格式不符：%q，期望 %q", s, want)
 			}
 			d.tcp[idx] = t
 		case strings.Contains(line, "stats rule ") && strings.Contains(line, " udp: "):
@@ -103,9 +122,13 @@ func parseStatsBlock(block []string) (statsDump, error) {
 		case strings.Contains(line, "stats pool: "):
 			s := line[strings.Index(line, "stats pool: "):]
 			p := &d.pool
-			if _, err := fmt.Sscanf(s, "stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d",
-				&p.alloc, &p.held, &p.free, &p.scratch, &p.tcpSlabs, &p.tcpFree, &p.udpSlabs, &p.udpFree); err != nil {
+			if _, err := fmt.Sscanf(s, "stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d",
+				&p.alloc, &p.held, &p.free, &p.scratch, &p.tcpSlabs, &p.tcpFree, &p.udpSlabs, &p.udpFree,
+				&p.pipeAlloc, &p.pipeHeld, &p.pipeFree, &p.pipeScratch); err != nil {
 				return d, fmt.Errorf("解析 pool 统计行失败：%q：%w", line, err)
+			}
+			if want := poolStatLine(*p); s != want {
+				return d, fmt.Errorf("pool 统计行格式不符：%q，期望 %q", s, want)
 			}
 			poolSeen = true
 		}
@@ -118,16 +141,32 @@ func parseStatsBlock(block []string) (statsDump, error) {
 
 const objPoolSlabObjs = 64 // main.cpp 的 obj_pool_slab_objs
 
-// checkPoolInvariants 从解析出的数字复核三条池不变式（发布构建里也要查）
+// checkPoolInvariants 从解析出的数字复核池不变式（发布构建里也要查）：块池与 pipe 池各自 alloc==held+free+scratch，
+// 两个对象池的在用对象数等于各规则连接数/会话数之和；另外 pipe 池空闲不超过上限、scratch 至多一个，每个方向至多持有块与 pipe 之一，
+// splice 字节是同方向字节的一部分（D49）
 func checkPoolInvariants(t testing.TB, d statsDump) {
 	t.Helper()
 	p := d.pool
 	if p.alloc != p.held+p.free+p.scratch {
 		t.Fatalf("池不变式 alloc==held+free+scratch 不成立：alloc=%d held=%d free=%d scratch=%d", p.alloc, p.held, p.free, p.scratch)
 	}
+	if p.pipeAlloc != p.pipeHeld+p.pipeFree+p.pipeScratch {
+		t.Fatalf("pipe 池不变式 alloc==held+free+scratch 不成立：pipes alloc=%d held=%d free=%d scratch=%d",
+			p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch)
+	}
+	if p.pipeFree > pipePoolMaxFree || p.pipeScratch > 1 || p.scratch > 1 {
+		t.Fatalf("pipe 池空闲 %d（上限 %d）、scratch pipe %d、scratch 块 %d：超出上限", p.pipeFree, pipePoolMaxFree, p.pipeScratch, p.scratch)
+	}
 	tcpConns := 0
-	for _, s := range d.tcp {
+	for idx, s := range d.tcp {
 		tcpConns += s.conns
+		if s.upSplice > s.upBytes || s.downSplice > s.downBytes {
+			t.Fatalf("规则 %d：splice 字节多于同方向字节：up_splice=%d up_bytes=%d down_splice=%d down_bytes=%d",
+				idx, s.upSplice, s.upBytes, s.downSplice, s.downBytes)
+		}
+	}
+	if p.held+p.pipeHeld > 2*tcpConns {
+		t.Fatalf("持有块 %d 个、持有 pipe %d 个，多于 %d 条 TCP 连接的方向数：一个方向至多持有其一", p.held, p.pipeHeld, tcpConns)
 	}
 	if p.tcpSlabs*objPoolSlabObjs-p.tcpFree != tcpConns {
 		t.Fatalf("TCP 对象池不变式不成立：slabs*64-free=%d，各规则 conns 之和=%d（slabs=%d free=%d）",
@@ -183,6 +222,18 @@ func (m *mapper) statsAfterSignal(t testing.TB) statsDump {
 		return nil
 	})
 	checkPoolInvariants(t, dump)
+	// D48：--disable-splice 时不创建 pipe，splice 计数全 0
+	if slices.Contains(m.cmd.Args, "--disable-splice") {
+		if dump.pool.pipeAlloc != 0 {
+			t.Errorf("--disable-splice 下 pipes alloc=%d，期望 0", dump.pool.pipeAlloc)
+		}
+		for idx, s := range dump.tcp {
+			if s.upSplice != 0 || s.downSplice != 0 || s.spliceFallback != 0 {
+				t.Errorf("--disable-splice 下规则 %d 的 splice 计数非零：up_splice=%d down_splice=%d splice_fallback=%d",
+					idx, s.upSplice, s.downSplice, s.spliceFallback)
+			}
+		}
+	}
 	// U5（D42）：udp 行带不带 GRO 四项只取决于 --udp-gro（以及它是否因第一个监听 socket 开不了 UDP_GRO 而整体关闭，groOff）
 	want := slices.Contains(m.cmd.Args, "--udp-gro") && !m.groOff
 	for idx, s := range dump.udp {
@@ -317,11 +368,33 @@ func TestStatsTCPHalfClose(t *testing.T) {
 	})
 }
 
-// TCP：背压下持有的块数。m 条下行方向各持有一块（> 64 的空闲上限），排空后归零，持有过程与排空计数都要对。
-// --sock-buf 32 把两侧 socket 缓冲锁小，慢读端（8 KiB 接收缓冲、小 MSS）让 tinymapper 持有整块并反复部分发送（走 write 分支）
+// TCP：背压下持有的块数与 pipe 数。m 条下行方向同时持有（> 64 的空闲上限），排空后归零，持有过程与排空计数都要对。
+// --sock-buf 32 把两侧 socket 缓冲锁小，慢读端（8 KiB 接收缓冲、小 MSS）让 tinymapper 持有并反复部分发送（走 write 分支）。
+//   - blocks（--disable-splice，拷贝路径）：每个方向持有一块 64 KiB 缓冲，排空后超过 64 的空闲块 free；
+//   - pipes（splice，B2）：后端以 32 KiB 一块写，每个方向第一次读（recv）就 ≥ 16 KiB、能整段发出，之后都 splice，发不完时持有 pipe：
+//     峰值恰好 m 个方向持有 pipe、0 个持有块；排空后 pipe 还池，超过 64 个空闲的 close（alloc 比峰值少），down_splice 非零，pipe fd 恰为 2×alloc
 func TestStatsHeldBlocks(t *testing.T) {
 	t.Parallel()
-	heavy(t)
+	for _, c := range []struct {
+		name  string
+		pipes bool
+		extra []string
+	}{
+		{"blocks", false, []string{"--disable-splice"}},
+		{"pipes", true, nil},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			if c.pipes {
+				needPipeQuotaExempt(t)
+			}
+			heavy(t)
+			heldBackpressure(t, c.pipes, c.extra...)
+		})
+	}
+}
+
+func heldBackpressure(t *testing.T, pipes bool, extra ...string) {
 	const m, S = 96, 512 << 10
 	be := serveTCP(t, loopback4(t), func(c net.Conn) {
 		r := bufio.NewReader(c)
@@ -335,7 +408,7 @@ func TestStatsHeldBlocks(t *testing.T) {
 		io.Copy(io.Discard, r) // 等客户端关闭
 	})
 	listen := loopback4(t)
-	mp := startMapper(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--sock-buf", "32")
+	mp := startMapper(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-t", "--sock-buf", "32"}, extra...)...)
 
 	reader := net.Dialer{Timeout: ioTimeout, Control: slowReaderSocket}
 	conns := make([]*net.TCPConn, m)
@@ -349,15 +422,18 @@ func TestStatsHeldBlocks(t *testing.T) {
 		conns[i] = c
 		fmt.Fprintf(c, "%d\n", i) // 发 key 触发后端写 S 字节；客户端此后不读，形成下行背压
 	}
-	// 峰值：m 个方向都持有一块
+	// 峰值：m 个方向都持有一块（blocks）或一个 pipe（pipes）
 	var peak statsDump
 	eventually(t, 3*ioTimeout, 100*time.Millisecond, func() error {
 		peak = mp.statsAfterSignal(t)
-		if peak.pool.held != m {
-			return fmt.Errorf("持有块数 %d，期望 %d", peak.pool.held, m)
+		if held, other := peak.pool.held, peak.pool.pipeHeld; pipes && (other != m || held != 0) || !pipes && held != m {
+			return fmt.Errorf("持有块数 %d、持有 pipe 数 %d，期望 %d 个方向都持有%s", held, other, m, map[bool]string{false: "块", true: " pipe"}[pipes])
 		}
 		return nil
 	})
+	if pipes {
+		mp.expectPipeFDs(t, peak, "峰值")
+	}
 	// 慢读排空并校验端到端一致
 	results := make(chan error, m)
 	for i, c := range conns {
@@ -369,12 +445,12 @@ func TestStatsHeldBlocks(t *testing.T) {
 			t.Fatalf("排空校验失败：%v", err)
 		}
 	}
-	// 排空后持有归零；超过 64 的空闲块已 free（alloc 相应减少），不变式仍成立
+	// 排空后持有归零；超过 64 的空闲块与 pipe 已释放（alloc 相应减少），不变式仍成立
 	var d statsDump
 	eventually(t, 3*ioTimeout, 100*time.Millisecond, func() error {
 		d = mp.statsAfterSignal(t)
-		if d.pool.held != 0 {
-			return fmt.Errorf("排空后持有块数 %d，期望 0", d.pool.held)
+		if d.pool.held != 0 || d.pool.pipeHeld != 0 {
+			return fmt.Errorf("排空后持有块数 %d、持有 pipe 数 %d，期望都为 0", d.pool.held, d.pool.pipeHeld)
 		}
 		return nil
 	})
@@ -388,6 +464,17 @@ func TestStatsHeldBlocks(t *testing.T) {
 	if want := uint64(m) * S; d.tcp[1].downBytes != want {
 		t.Errorf("down_bytes=%d，期望 %d（经 write 分支排空的字节也要计数）", d.tcp[1].downBytes, want)
 	}
+	if !pipes {
+		return
+	}
+	if d.pool.pipeFree > pipePoolMaxFree || d.pool.pipeAlloc >= peak.pool.pipeAlloc {
+		t.Errorf("排空后 pipes alloc=%d free=%d（峰值 alloc %d）：空闲超过 %d 个的 pipe 应当 close", d.pool.pipeAlloc, d.pool.pipeFree,
+			peak.pool.pipeAlloc, pipePoolMaxFree)
+	}
+	if d.tcp[1].downSplice == 0 {
+		t.Error("down_splice=0：持有 pipe 的方向排空时写出的是 splice 字节")
+	}
+	mp.expectPipeFDs(t, d, "排空后")
 }
 
 const tcpBufPoolMaxFree = 64 // main.cpp 的 tcp_buf_pool_max_free

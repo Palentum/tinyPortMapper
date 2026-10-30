@@ -395,6 +395,23 @@ func needNetAdmin(t testing.TB) {
 	t.Skip("测试进程没有 CAP_NET_ADMIN（在容器中以 root 运行时由 tests/run.sh 的 --cap-add NET_ADMIN 提供），跳过")
 }
 
+const capSysResource = 24 // CAP_SYS_RESOURCE 在能力位图中的位号
+
+// needPipeQuotaExempt 用于断言“有 splice 字节”的用例（B2）：同时没有 CAP_SYS_RESOURCE 与 CAP_SYS_ADMIN 的进程受 fs.pipe-user-pages-soft
+// 约束，一个用户的 pipe 总页数到了软限（默认 16384 页，即 1024 个 64 KiB 的 pipe）之后新 pipe 只有 2 页，tinymapper 按规格关掉它、回退拷贝。
+// 容器里的 root 默认没有这两项能力，而 uid 0 的页数由 Docker VM 里所有 root 进程共用：测试进程自己的回显后端（echoHandler 的 io.Copy(c, c)
+// 在 Linux 上走 Go 的 splice，每个在途连接一个 pipe 并 F_SETPIPE_SZ 到 1 MiB，即 256 页）64 个就到软限，TestTCPMaxConn 期间约 1.9 万个，
+// 另一个容器里并行的套件也算在内，与之重叠的用例拿不到 pipe。tests/run.sh 以 --cap-add SYS_RESOURCE 启动容器，root 启动的
+// tinymapper 像主机上的 root 部署一样不受限（限额本身由 TestSpliceFallbackPipeQuota 以专用的非 root uid 测）；容器中（TPM_IN_CONTAINER=1）
+// 测试进程没有这项能力时判为失败，容器外不检查
+func needPipeQuotaExempt(t testing.TB) {
+	t.Helper()
+	if os.Getenv("TPM_IN_CONTAINER") == "1" && capEff(t, os.Getpid())&(1<<capSysResource) == 0 {
+		t.Fatalf("测试进程没有 CAP_SYS_RESOURCE（CapEff=%#x）：tests/run.sh 应以 --cap-add SYS_RESOURCE 启动容器，否则 uid 0 共用的 pipe 限额用完时"+
+			"tinymapper 回退拷贝，断言 splice 的用例随机失败", capEff(t, os.Getpid()))
+	}
+}
+
 // startupFDs 不注入故障启动一次 tinymapper，返回它就绪后打开的 fd 数 n，并要求这些 fd 恰好是 0..n-1：
 // 新 fd 总取最小的空闲号，之后的连接依次拿到 n、n+1……
 func startupFDs(t testing.TB, wait []listenPoint, args ...string) int {
@@ -565,14 +582,17 @@ func socketInodes(pid int) map[string]bool {
 // sockBuf 是一个 socket 的 inode、缓冲上限 sk_rcvbuf / sk_sndbuf（即 getsockopt SO_RCVBUF / SO_SNDBUF 的返回值），
 // 以及 inet_diag_msg 的 idiag_rqueue / idiag_wqueue：TCP 监听 socket 上为 accept 队列的当前长度 sk_ack_backlog 与上限
 // sk_max_ack_backlog（tcp_diag_get_info），UDP socket 上 rqueue 为接收队列中各包 truesize 之和；drops 为 sk_drops
-// （UDP 接收队列满时丢弃的包数）
-type sockBuf struct{ inode, rcv, snd, rqueue, wqueue, drops uint32 }
+// （UDP 接收队列满时丢弃的包数）；state 为 idiag_state（TCP_ESTABLISHED=1、TCP_CLOSE_WAIT=8 等）
+type sockBuf struct {
+	inode, rcv, snd, rqueue, wqueue, drops uint32
+	state                                  uint8
+}
 
 func (b sockBuf) String() string {
 	return fmt.Sprintf("rcvbuf=%d sndbuf=%d（inode %d）", b.rcv, b.snd, b.inode)
 }
 
-// sockDiag 用 NETLINK_SOCK_DIAG 按地址查找一个 IPv4 或 IPv6 TCP/UDP socket，返回其 inode、idiag_rqueue / idiag_wqueue 与
+// sockDiag 用 NETLINK_SOCK_DIAG 按地址查找一个 IPv4 或 IPv6 TCP/UDP socket，返回其 inode、idiag_state、idiag_rqueue / idiag_wqueue 与
 // INET_DIAG_SKMEMINFO 中的 SK_MEMINFO_RCVBUF / SK_MEMINFO_SNDBUF / SK_MEMINFO_DROPS。请求不带 NLM_F_DUMP，内核只按四元组查一次哈希表
 // （inet_diag_find_one_icsk、udp_dump_one），不遍历全部 socket，不受并行用例里数万个 socket 的影响。local、remote 是该
 // socket 的本端与对端地址，监听 socket 的 remote 为 0.0.0.0:0（IPv6 为 [::]:0）
@@ -648,7 +668,7 @@ func sockDiag(proto int, local, remote string) (sockBuf, error) {
 				}
 				if typ == inetDiagSkmeminfo && l >= 4+16 {
 					b := sockBuf{inode: inode, rcv: ne.Uint32(a[8:]), snd: ne.Uint32(a[16:]),
-						rqueue: ne.Uint32(m.Data[56:]), wqueue: ne.Uint32(m.Data[60:])}
+						rqueue: ne.Uint32(m.Data[56:]), wqueue: ne.Uint32(m.Data[60:]), state: m.Data[1]}
 					if l >= 4+36 {
 						b.drops = ne.Uint32(a[36:])
 					}

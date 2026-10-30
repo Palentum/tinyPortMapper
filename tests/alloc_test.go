@@ -403,7 +403,8 @@ listen = %q
 remote = %q
 `, l1, echoBE.addr, l2, floodLn.Addr().String()))
 	wait := append(listenPoints("t", portOf(l1)), listenPoints("t", portOf(l2))...)
-	m := startMapperTopPad0(t, wait, "-c", cfg)
+	// 只测块：splice 开着时洪泛方向发不完的数据多半在 pipe 里（B2），不一定走到块的 malloc，pipe fd 也会让下面的 fd 基线对不上
+	m := startMapperTopPad0(t, wait, "-c", cfg, "--disable-splice")
 	baseFd := fdCount(t, m.pid())
 
 	// 规则 1 上建一条既有回显流（顺便分配 scratch），保持空闲

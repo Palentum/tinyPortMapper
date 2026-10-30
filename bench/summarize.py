@@ -2,7 +2,8 @@
 # 汇总 bench.sh 输出的 raw.jsonl：每个 (test, fwd) 取多轮中位数，输出 markdown 表格
 # 用法：python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl；转发器按首次出现的顺序排列，缺失的测试项不输出；
 # 名字不固定的 UDP 负载（udp_pps_64_p<N>、*_r、udp_rr_<N>）按首次出现的顺序接在同类固定项之后；
-# UDP iperf3 表在数据里有 cpus / tm_udp 的 up_gro 时多出：转发器所在 CPU 忙碌%（含 softirq）、udp_bw 的每 Gbit/s CPU%、合并%
+# UDP iperf3 表在数据里有 cpus / tm_udp 的 up_gro 时多出：转发器所在 CPU 忙碌%（含 softirq）、udp_bw 的每 Gbit/s CPU%、合并%；
+# tcp_bw 表在 tm_tcp 有 up_splice（B2 起）时多出 splice 写出的字节占比与回退次数；tcp_bulk_<N>[_stall] 单独一张表（fwdbench bulk）
 import json
 import statistics
 import sys
@@ -64,13 +65,37 @@ def per_core(k, scale=1.0):
     return g
 
 
+def tm(rs, key, fn):
+    """rs 里各行 key（tm_tcp、tm_pool_mid 等）对象经 fn 取值后的中位数；都没有时为 None。"""
+    v = [fn(r[key]) for r in rs if r.get(key)]
+    v = [x for x in v if x is not None]
+    return statistics.median(v) if v else None
+
+
+def splice_pct(t):
+    b = t["up_bytes"] + t["down_bytes"]
+    return 100 * (t["up_splice"] + t["down_splice"]) / b if "up_splice" in t and b else None
+
+
+def held(key):
+    """pool 行的 pipe 持有/已分配与缓冲块持有：`持有/已分配（块 持有）`。"""
+    def g(rs):
+        p, a, bh = tm(rs, key, lambda x: x.get("pipes_held")), tm(rs, key, lambda x: x.get("pipes_alloc")), tm(rs, key, lambda x: x.get("bufs_held"))
+        return "-" if bh is None else f"{f(p, 0)}/{f(a, 0)}（{f(bh, 0)}）"
+    return g
+
+
 for t in ["tcp_bw_1", "tcp_bw_8"]:
+    extra = []
+    if any("up_splice" in (r.get("tm_tcp") or {}) for (tt, _), rs in rows.items() if tt == t for r in rs):
+        extra = [("splice 字节%", lambda rs: f(tm(rs, "tm_tcp", splice_pct), 1)),
+                 ("回退", lambda rs: f(tm(rs, "tm_tcp", lambda x: x.get("splice_fallback")), 0))]
     table(t, [
         ("吞吐 Gbit/s（中位）", lambda rs: f(med(rs, "gbps"))),
         ("范围", lambda rs: rng(rs, "gbps", lambda x: f"{x:.1f}")),
         ("转发器 CPU%", cpu),
         ("Gbit/s 每核", per_core("gbps")),
-    ])
+    ] + extra)
 
 for t in ["tcp_rr_64", "tcp_rr_1000", "tcp_crr_32"]:
     table(t, [
@@ -146,6 +171,23 @@ for t in [t for t in TESTS if t.startswith("udp_rr_")]:
         ("丢失 %", lambda rs: f(med(rs, "lost_pct"), 3)),
         ("转发器 CPU%", cpu),
         ("kops/s 每核", per_core("ops_per_sec", 1e-3)),
+    ])
+
+# tcp_bulk_<N>[_stall]：fwdbench bulk → sink，吞吐为测量窗口内客户端发出的字节；pipe 与缓冲块取 SIGUSR1 统计（`-` 为没有该字段）：
+# 窗口中点（mid）与 sink 停顿中途（stall），回退为转发器结束时的累计
+for t in [t for t in TESTS if t.startswith("tcp_bulk_")]:
+    table(t, [
+        ("Gbit/s（中位）", lambda rs: f(med(rs, "gbps"))),
+        ("范围", lambda rs: rng(rs, "gbps", lambda x: f"{x:.1f}")),
+        ("建立连接", lambda rs: f(med(rs, "established"), 0)),
+        ("不符", lambda rs: f(med(rs, "mismatch"), 0)),
+        ("无结果", lambda rs: f(med(rs, "no_result"), 0)),
+        ("转发器 CPU%", cpu),
+        ("splice 字节%", lambda rs: f(tm(rs, "tm_tcp", splice_pct), 1)),
+        ("回退", lambda rs: f(tm(rs, "tm_tcp", lambda x: x.get("splice_fallback")), 0)),
+        ("mid pipe 持有/已分配（块）", held("tm_pool_mid")),
+        ("stall pipe 持有/已分配（块）", held("tm_pool_stall")),
+        ("RSS KB", lambda rs: f(med(rs, "fwd_rss_kb"), 0)),
     ])
 
 table("tcp_mem_5000", [

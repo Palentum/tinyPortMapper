@@ -172,6 +172,8 @@ STAGES=prof bench/run.sh                                       # CPU 剖析：cl
 FWDS="tinymapper tinymapper+gro" bench/run.sh                  # 同一二进制不加 / 加 --udp-gro（U5），同一批交替
 TOPO=veth TESTS="udp_bw_1400 udp_bw_1400_r udp_pps_64" FWDS="direct tinymapper tinymapper+gro" \
   SC_FWDS="tinymapper tinymapper+gro" SC_TESTS="udp_bw_1400 udp_bw_1400_r udp_pps_64" bench/run.sh   # veth 三命名空间拓扑（第 6 节）
+FWDS="tinymapper tinymapper+nosplice" bench/run.sh            # 同一二进制默认 splice / 加 --disable-splice（B2），同一批交替
+TESTS=tcp_bulk_2000_stall FWDS="tinymapper+nonroot tinymapper+nosplice+nonroot" bench/run.sh   # 2000 条大流量，sink 先停读 1 s（第 7 节）
 python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl     # 重新汇总
 ```
 
@@ -219,3 +221,22 @@ loopback 的包不经过 NAPI，内核不做 GRO，`--udp-gro` 在那里只有�
 - MTU 1500：1400 B 每个合并包至多 46 个数据报（64 KiB），64 B 至多 64 个（`UDP_GRO_CNT_MAX`）。
 - 剖析阶段（`STAGES=prof`）可在 veth 拓扑下跑，但 `summarize_prof.py` 的每包换算仍用 OutDatagrams，开 `--udp-gro` 时偏大。
 - Docker VM 共用宿主 CPU；U5 能否默认开启以优化指导 §8.4 的主机门槛（真实网卡）为准。
+
+## 7. TCP splice（B1+B2，P3）
+
+转发器名后缀：`+nosplice` 给同一二进制加 `--disable-splice`；`+nonroot` 让它以 uid 4242（`FWD_UID`）运行，没有 `CAP_SYS_RESOURCE`，pipe 受 `fs.pipe-user-pages-soft`（16384 页，约 1024 个 64 KiB pipe）限制。`tcp_bulk_<N>[_stall]`：`fwdbench bulk` 建 N 条连接，各自持续写 64 KiB 的块，经转发器到 `fwdbench sink`（端口 9001，逐字节核对，结束时把收到的字节数报回）；客户端 `SO_SNDBUF` 固定 `BULK_SNDBUF`（32768）；`_stall` 时 sink 每条连接先停读 `BULK_STALL`（1）秒，测量窗口从停读结束 1 秒后开始。tinymapper 的行多出 `tm_tcp`/`tm_pool`（SIGUSR1，含 `up_splice`/`down_splice`/`splice_fallback` 与 `pipes_*`），tcp_bulk 另有窗口中点与停读中的两份。
+
+loopback 上客户端、转发器、sink 的 socket 共用这台 VM 的一份 `tcp_mem`（94140/125521/188280 页，上限约 735 MB），2000 条连接时三方都进入内存压力（每次运行 TCPRcvQDrop 数万、TCPTimeouts 1–3 万），吞吐波动大，这个负载主要看错误数、回退计数与同批配对比值。
+
+正式批（`docs/bench/b12/all.sh`，约 66 分钟，5 轮 × 10 s，第 6 版对 `901f9ca`；`bench/results/20261031-000501`、`20261031-005717`）：
+
+| 负载 | `901f9ca` glibc / musl | B2 glibc / musl | realm-1c |
+|---|---|---|---|
+| tcp_bw_1 Gbit/s | 57.9 / 56.4 | 143.2 / 143.7 | 143.9 |
+| tcp_bw_8 Gbit/s | 43.3 / 43.3 | 115.7 / 115.7 | 142.9 |
+| tcp_rr_64 k ops/s | 271.0 / 270.6 | 269.2 / 270.1 | – |
+| tcp_bulk_2000_stall（+nonroot）Gbit/s | 28.4 / 29.0 | 46.6 / 45.4（errors 0） | 31.1（半关闭后不回结果，errors 全是无结果） |
+| tcp_bw_8 syscall/GB | 32,430 | 31,000 | 30,554 |
+| tcp_mem_5000 KB/连接 | 0.30 / 0.31 | 0.33 / 0.35 | – |
+
+限制：iperf3 单流两端各一个线程，tcp_bw_1 约 144 Gbit/s 已到客户端上限（客户端 CPU 忙碌 100%）；回环 MSS 65483，一个 GSO 段就是一次 splice 的量，网卡路径上 splice 每次搬运的片段大小与 CPU 收益要在主机上测（优化指导 §8.4）。广域网类路径的 sndbuf 行为在 loopback 上测不出来（新连接的 sndbuf 回环约 2.6 MB、MSS 1448 时约 87 KB），D54 这类改动要另用 lo MTU 1500 加 netem 时延核对（`build/b12/v5/wan.sh`）。

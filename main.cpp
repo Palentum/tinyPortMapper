@@ -5,6 +5,7 @@
 
 #include <sys/stat.h>
 #include <sys/syscall.h>
+#include <sys/resource.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <thread>
@@ -22,6 +23,7 @@ typedef int i32_t;
 
 int disable_conn_clear=0;
 int disable_tcp_nodelay=0;
+int disable_splice=0;//--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe
 int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
 //--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
 //（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
@@ -245,11 +247,148 @@ struct tcp_buf_pool_t
 	}
 };
 
+//D46：本方向上一次读到这么多字节，下一次读就 splice（探针：每次 64 B 时 splice 比 recv+send 慢 3.7%，2 KB 持平，16 KB 快 19%，64 KB 快 58%）
+static const int splice_read_min=16384;
+//一次 splice 进 pipe 最多读这么多（D51，同 recv 的 64 KiB）：背压时它整段留在方向持有的 pipe 里，是不计入 tcp_mem 与 memcg 的内核页。
+//5.12 起内核按 pipe 剩余空间截断（默认 16 × PAGE_SIZE，4K 页上恰好 64 KiB）；更早的内核不截断，16 个槽可各放一个 32 KiB 的本机片段，约 512 KiB
+static const int splice_read_max=max_data_len_tcp;
+//D53：splice 时一次回调最多搬这么多轮（每轮至多 splice_read_max），源端读不满或目的端没写完就停。每轮写出都可能唤醒一次接收方，
+//转发器满载、源端积压时一轮一回调让每 64 KiB 唤醒一次：同进程 8 条大流量 1 轮 85、4 轮 113、8 轮 123 Gbit/s；代价是一次回调更长，
+//同一轮里其他连接多等：同时测的 64 B 往返 p50 1 轮 106、4 轮 297、8 轮 549 µs（realm-1c 3950 µs）
+static const int splice_rounds_max=4;
+static const int tcp_pipe_min_size=65536;//新 pipe 小于它（fs.pipe-user-pages-soft 已满时只有 2 页）就不用：每次 splice 只能搬 2 个片段
+static const int tcp_pipe_pool_max_free=64;//同 D19
+
+//pipe 里还有多少字节，只给 DEBUG_ASSERT 用：还池与复用的 pipe 必须是空的，计账错了就会把一个连接的数据写给另一个连接
+static inline int tcp_pipe_len(const tcp_pipe_t &p)
+{
+	int n=-1;
+	ioctl(p.r,FIONREAD,&n);
+	return n;
+}
+
+//pipe 池（B2，D47）：splice 都读进 tcp_pipe_scratch，整段写出就留着给下一次；没写完时连同数据交给该方向（tcp_info_t::pipe），
+//排空后还回来。空闲的最多留 tcp_pipe_pool_max_free 个，多出的 close；有残留数据的 pipe 不复用，释放连接对时直接 close
+struct tcp_pipe_pool_t
+{
+	tcp_pipe_t free_pipes[tcp_pipe_pool_max_free];
+	int free_cnt;
+	int alloc;//已创建还没关闭的 pipe 数（O1）：每个要么是 scratch，要么属于某个方向，要么在空闲表里
+	int blocked;//创建失败过：到下一个定时器周期（clear_timer_cb 清零）之前不再创建，免得每次读都试
+	int failures;//创建失败次数，只有第一次记 info
+	tcp_pipe_pool_t()
+	{
+		free_cnt=0;
+		alloc=0;
+		blocked=0;
+		failures=0;
+	}
+	int fail_level()//创建失败：到下一个定时器周期之前不再创建；只有第一次记 info
+	{
+		blocked=1;
+		return failures++==0?log_info:log_debug;
+	}
+	int get(tcp_pipe_t &p)
+	{
+		if(free_cnt>0)
+		{
+			p=free_pipes[--free_cnt];
+			return 0;
+		}
+		return create(p);
+	}
+	int __attribute__((noinline)) create(tcp_pipe_t &p)//池空时才走到，不内联进 tcp_cb
+	{
+		if(blocked) return -1;
+		int fds[2];
+		if(pipe2(fds,O_NONBLOCK|O_CLOEXEC)!=0)
+		{
+			//EMFILE、ENFILE，或到了 fs.pipe-user-pages-hard
+			int level=fail_level();
+			mylog(level,"[tcp]pipe2 failed (%s), forwarding by copy instead of splice until the next timer tick\n",get_sock_error());
+			return -1;
+		}
+		//最后 1/4 的 fd 只留给 socket（D52）：持有数据的 pipe 每方向占 2 个 fd，nofile 小时会挤掉新连接（C5、C6）
+		struct rlimit rl;
+		if(getrlimit(RLIMIT_NOFILE,&rl)==0&&rl.rlim_cur!=RLIM_INFINITY&&(rlim_t)max(fds[0],fds[1])>=rl.rlim_cur/4*3)
+		{
+			close(fds[0]);
+			close(fds[1]);
+			int level=fail_level();
+			mylog(level,"[tcp]pipe fd %d is in the last quarter of RLIMIT_NOFILE (%llu), forwarding by copy instead of splice until the next timer tick\n",max(fds[0],fds[1]),(unsigned long long)rl.rlim_cur);
+			return -1;
+		}
+		int size=fcntl(fds[1],F_GETPIPE_SZ);
+		if(size<tcp_pipe_min_size)
+		{
+			close(fds[0]);
+			close(fds[1]);
+			int level=fail_level();
+			mylog(level,"[tcp]new pipe has only %d bytes (fs.pipe-user-pages-soft reached?), forwarding by copy instead of splice until the next timer tick\n",size);
+			return -1;
+		}
+		p.r=fds[0];
+		p.w=fds[1];
+		alloc++;
+		return 0;
+	}
+	void put(tcp_pipe_t &p)//p 已排空
+	{
+		DEBUG_ASSERT(tcp_pipe_len(p)==0);
+		if(free_cnt>=tcp_pipe_pool_max_free) discard(p);
+		else free_pipes[free_cnt++]=p;
+		p.r=p.w=-1;
+	}
+	void discard(tcp_pipe_t &p)//可能还有数据：直接关掉
+	{
+		close(p.r);
+		close(p.w);
+		alloc--;
+		p.r=p.w=-1;
+	}
+};
+
 //每个 worker 一份（P4 移进 worker_t）
 static obj_pool_t<tcp_pair_t> tcp_pair_pool;
 static obj_pool_t<udp_pair_t> udp_pair_pool;
 static tcp_buf_pool_t tcp_buf_pool;
 static char *tcp_scratch=0;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
+static tcp_pipe_pool_t tcp_pipe_pool;
+static tcp_pipe_t tcp_pipe_scratch={-1,-1};//splice 都读进它，用法同 tcp_scratch（D47）
+//fd 用完（accept4、上游 socket() 或 UDP 会话 socket() 返回 EMFILE/ENFILE）时关掉空闲 pipe 与 scratch pipe，给 socket 腾出 fd，
+//并暂停创建到下一个定时器周期（D52）；返回关掉的个数，不为 0 时调用方再试一次。方向持有的 pipe 里有数据，不动
+static int tcp_pipe_trim()
+{
+	int n=tcp_pipe_pool.free_cnt+(tcp_pipe_scratch.r>=0);
+	while(tcp_pipe_pool.free_cnt>0) tcp_pipe_pool.discard(tcp_pipe_pool.free_pipes[--tcp_pipe_pool.free_cnt]);
+	if(tcp_pipe_scratch.r>=0) tcp_pipe_pool.discard(tcp_pipe_scratch);
+	tcp_pipe_pool.blocked=1;
+	if(n>0) mylog(log_debug,"[tcp]out of file descriptors, closed %d idle pipes\n",n);
+	return n;
+}
+//splice 写不完时对目的端调用（D54）：主机越过 tcp_mem 压力线时内核把目的 socket 的 sndbuf 缩到当时队列的一半（sk_stream_moderate_sndbuf），
+//压力期间不再放大。回环这类 MSS 接近 64 KiB 的目的端缩完装不下 2 段，只有 1 段在途，接收方对单个满长段延迟 ACK（约 40 ms），
+//2000 条停读连接时吞吐只有拷贝路径的一半（拷贝路径很少被缩）。这时锁到 2×MSS（内核再翻倍，4 段），代价是这个 socket 不再自动调大。
+//sndbuf 最小约 4.6 KB（SOCK_MIN_SNDBUF），MSS 1448 这类网卡路径永远有 3 段以上：第一次读 MSS 后就不再查（每方向一次 getsockopt）。
+//只按 sndbuf 判断、不看 MSS 时，网卡路径新连接约 87 KB 的 sndbuf 也会被锁住，10 ms RTT 单流 1.55 → 0.17 Gbit/s。给了 --sock-buf 时不动
+static const int tcp_min_sndbuf=4608;
+static void tcp_unshrink_sndbuf(tcp_info_t &info)
+{
+	if(sock_buf_explicit) return;
+	socklen_t len;
+	if(info.mss==0)
+	{
+		len=sizeof(info.mss);
+		if(getsockopt(info.fd,IPPROTO_TCP,TCP_MAXSEG,&info.mss,&len)!=0||info.mss<=0) info.mss=-1;
+	}
+	if(2*info.mss<=tcp_min_sndbuf) return;
+	int sb=0;
+	len=sizeof(sb);
+	if(getsockopt(info.fd,SOL_SOCKET,SO_SNDBUF,&sb,&len)!=0||sb>=2*info.mss) return;
+	int val=2*info.mss;
+	setsockopt(info.fd,SOL_SOCKET,SO_SNDBUF,&val,sizeof(val));
+	mylog(log_debug,"[tcp]fd=%d sndbuf shrunk to %d (mss %d), set SO_SNDBUF to %d\n",info.fd,sb,info.mss,val);
+}
 
 static const int udp_batch_max=64;//U1：一次 recvmmsg 最多收这么多包，也是一次回调最多处理的包数（D35）
 //U4：会话 socket 每次回调最多收这么多回包（D37）。所有客户端的入向共用一个监听 socket、每轮一批，回程每个会话各一个 socket：
@@ -649,14 +788,19 @@ struct conn_manager_tcp_t
 {
 	long long last_clear_time;
 	lru_collector_t lru;
-	//O1 累计计数，SIGUSR1 时输出：total 建立的连接对数；bytes 发送成功的字节数，[0] 客户端→上游（从 local 读、发往 remote），[1] 上游→客户端
+	//O1 累计计数，SIGUSR1 时输出：total 建立的连接对数；bytes 发送成功的字节数，[0] 客户端→上游（从 local 读、发往 remote），[1] 上游→客户端；
+	//splice_bytes 其中经 splice 从 pipe 写出的部分，splice_fallback 想 splice 但拿不到 pipe、改走 recv 的读次数（D49）
 	u64_t total;
 	u64_t bytes[2];
+	u64_t splice_bytes[2];
+	u64_t splice_fallback;
 	conn_manager_tcp_t()
 	{
 		last_clear_time=0;
 		total=0;
 		memset(bytes,0,sizeof(bytes));
+		memset(splice_bytes,0,sizeof(splice_bytes));
+		splice_fallback=0;
 	}
 	int erase(tcp_pair_t *pair)
 	{
@@ -674,6 +818,8 @@ struct conn_manager_tcp_t
 		lru.erase(pair);
 		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
 		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
+		if(pair->local.pipe.r>=0) tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
+		if(pair->remote.pipe.r>=0) tcp_pipe_pool.discard(pair->remote.pipe);
 		tcp_pair_pool.put(pair);
 		return 0;
 	}
@@ -690,6 +836,8 @@ struct conn_manager_tcp_t
 		lru.erase(pair);
 		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
 		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
+		if(pair->local.pipe.r>=0) tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
+		if(pair->remote.pipe.r>=0) tcp_pipe_pool.discard(pair->remote.pipe);
 		tcp_pair_pool.put(pair);
 		return 0;
 	}
@@ -1223,18 +1371,49 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLIN) ==0 \n");
 			return;
 		}
-		DEBUG_ASSERT(my_info.data_len==0&&my_info.buf==0);
-		if(tcp_scratch==0)
+		DEBUG_ASSERT(my_info.data_len==0&&my_info.buf==0&&my_info.pipe.r<0);
+		int dir=(my_info_p==&tcp_pair.remote);//本方向在计数里的下标
+		int recv_len=-1;
+		int spliced=0;
+		//B2：本方向上一次读够大（D46）就 splice 进 scratch pipe，再从 pipe 写出，不经用户态；拿不到 pipe 时这次照常 recv（D47）。
+		//上游建连中不写出，只走 recv
+		if(my_info.splice_next&&other_info.connected&&!disable_splice)
 		{
-			tcp_scratch=tcp_buf_pool.get();
-			if(tcp_scratch==0)
+			if(tcp_pipe_scratch.r<0&&tcp_pipe_pool.get(tcp_pipe_scratch)!=0)
 			{
-				mylog(log_warn,"[tcp]connection {%s} closed bc of malloc for a %d-byte buffer failed\n",tcp_pair.addr.get_str(),max_data_len_tcp);
-				conn_manager_tcp.erase_closed(&tcp_pair);
-				return;
+				conn_manager_tcp.splice_fallback++;
+			}
+			else
+			{
+				DEBUG_ASSERT(tcp_pipe_len(tcp_pipe_scratch)==0);
+				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,splice_read_max,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				spliced=1;
+				//队首是紧急数据（对端 MSG_OOB）时非阻塞 splice 返回 EAGAIN，epoll 却一直报可读，这一次改用 recv：
+				//它跳过紧急字节（没有 SO_OOBINLINE），与拷贝路径一致。别的原因（如页分配失败）同样交给 recv
+				if(recv_len<0&&errno==EAGAIN) spliced=0;
+				else if(recv_len<0&&(errno==ENOSYS||errno==EPERM||errno==EINVAL||errno==EOPNOTSUPP))
+				{
+					//splice 本身不可用（如 seccomp 白名单里没有它）：什么都没读，整个进程改走拷贝（审查 L1）
+					mylog(log_warn,"[tcp]splice failed (%s), forwarding all TCP by copy from now on\n",get_sock_error());
+					disable_splice=1;
+					spliced=0;
+				}
 			}
 		}
-		int recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
+		if(!spliced)
+		{
+			if(tcp_scratch==0)
+			{
+				tcp_scratch=tcp_buf_pool.get();
+				if(tcp_scratch==0)
+				{
+					mylog(log_warn,"[tcp]connection {%s} closed bc of malloc for a %d-byte buffer failed\n",tcp_pair.addr.get_str(),max_data_len_tcp);
+					conn_manager_tcp.erase_closed(&tcp_pair);
+					return;
+				}
+			}
+			recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
+		}
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
 		{
@@ -1275,34 +1454,76 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		conn_manager_tcp.lru.update(&tcp_pair);
 		//tcp_pair.last_active_time=get_current_time();
 
+		my_info.splice_next=(recv_len>=splice_read_min);
 		my_info.data_len=recv_len;
-		my_info.begin=tcp_scratch;
 
 		//上游建连中不发：它本来就在等可写，数据留在缓冲里、停读本侧，连上后由写分支发出
 		int send_len=0;
-		if(other_info.connected)
+		if(spliced)
 		{
 			DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
-			nodelay_before_send(other_info,my_info.data_len);
-			send_len=send(other_fd,my_info.begin,my_info.data_len,0);
-		}
-
-		if(send_len<=0)
-		{
-			//NOP
+			for(int round=1;;round++)
+			{
+				nodelay_before_send(other_info,my_info.data_len);
+				send_len=splice(tcp_pipe_scratch.r,0,other_fd,0,my_info.data_len,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				if(send_len>0)
+				{
+					my_info.data_len-=send_len;
+					conn_manager_tcp.bytes[dir]+=send_len;
+					conn_manager_tcp.splice_bytes[dir]+=send_len;
+				}
+				if(my_info.data_len!=0)
+				{
+					//没写完（含 EAGAIN；出错时留给写分支，同 send）：scratch pipe 连同数据交给本方向，下一次 splice 前再从池里取一个
+					my_info.pipe=tcp_pipe_scratch;
+					tcp_pipe_scratch.r=tcp_pipe_scratch.w=-1;
+					tcp_unshrink_sndbuf(other_info);
+					break;
+				}
+				//写完了：源端这一轮读满就接着搬（D53）
+				if(round>=splice_rounds_max||recv_len<splice_read_max) break;
+				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,splice_read_max,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				if(recv_len<=0)
+				{
+					//EOF 与 EAGAIN（含紧急数据）留给下一次回调按第一轮处理：EOF 一直可读，下一次 splice 仍读到 0。
+					//出错必须现在关：splice 已经取走 sk_err，下一次只会读到 0，RST 会被当成正常的 EOF
+					if(recv_len<0&&errno!=EAGAIN)
+					{
+						mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of %s,fd=%d\n",recv_len,tcp_pair.addr.get_str(),get_sock_error(),my_fd);
+						conn_manager_tcp.erase_closed(&tcp_pair);
+						return;
+					}
+					break;
+				}
+				my_info.splice_next=(recv_len>=splice_read_min);
+				my_info.data_len=recv_len;
+			}
 		}
 		else
 		{
-			my_info.data_len-=send_len;
-			my_info.begin+=send_len;
-			conn_manager_tcp.bytes[my_info_p==&tcp_pair.remote]+=send_len;
+			my_info.begin=tcp_scratch;
+			if(other_info.connected)
+			{
+				DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
+				nodelay_before_send(other_info,my_info.data_len);
+				send_len=send(other_fd,my_info.begin,my_info.data_len,0);
+			}
+			if(send_len>0)
+			{
+				my_info.data_len-=send_len;
+				my_info.begin+=send_len;
+				conn_manager_tcp.bytes[dir]+=send_len;
+			}
+			if(my_info.data_len!=0)
+			{
+				//没发完（含上游还在建连）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
+				my_info.buf=tcp_scratch;
+				tcp_scratch=0;
+			}
 		}
 
 		if(my_info.data_len!=0)
 		{
-			//没发完（含上游还在建连）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
-			my_info.buf=tcp_scratch;
-			tcp_scratch=0;
 
 			//epoll_event ev;
 
@@ -1337,9 +1558,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			return;
 		}
 
-		DEBUG_ASSERT(other_info.data_len!=0);
+		DEBUG_ASSERT(other_info.data_len!=0&&(other_info.buf!=0)!=(other_info.pipe.r>=0));
+		int dir=(other_info_p==&tcp_pair.remote);
 		nodelay_before_send(my_info,other_info.data_len);
-		int send_len=send(my_fd,other_info.begin,other_info.data_len,0);
+		int send_len;
+		if(other_info.pipe.r>=0)
+			send_len=splice(other_info.pipe.r,0,my_fd,0,other_info.data_len,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+		else
+			send_len=send(my_fd,other_info.begin,other_info.data_len,0);
 		if(send_len==0)
 		{
 			mylog(log_warn,"[tcp]send_len=%d,connection {%s} closed bc of send_len==0\n",send_len,tcp_pair.addr.get_str());
@@ -1348,6 +1574,15 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		if(send_len<0)
 		{
+			//EPOLLOUT 只看本 socket 的剩余空间：主机越过 tcp_mem[2]（或 memcg 记账失败）时，队列接近空的 socket 发送仍返回 EAGAIN，
+			//当作没写出、继续等可写（D50）；越限期间这样的 socket 每轮重试一次
+			if(errno==EAGAIN)
+			{
+				static int logged=0;//越限期间这样的 socket 每轮重试，第一次记 info 便于从日志对上 CPU 占用，之后 debug
+				mylog(logged?log_debug:log_info,"[tcp]send to fd=%d returned EAGAIN although writable (TCP memory above net.ipv4.tcp_mem or a cgroup limit?), retrying\n",my_fd);
+				logged=1;
+				return;
+			}
 			mylog(log_info,"[tcp]send_len=%d,connection {%s} closed bc of %s\n",send_len,tcp_pair.addr.get_str(),get_sock_error());
 			conn_manager_tcp.erase_closed(&tcp_pair);
 			return;
@@ -1358,13 +1593,22 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		mylog(log_trace,"[tcp]fd=%d send len=%d\n",my_fd,send_len);
 		other_info.data_len-=send_len;
-		other_info.begin+=send_len;
-		conn_manager_tcp.bytes[other_info_p==&tcp_pair.remote]+=send_len;
+		conn_manager_tcp.bytes[dir]+=send_len;
+		if(other_info.pipe.r>=0) conn_manager_tcp.splice_bytes[dir]+=send_len;
+		else other_info.begin+=send_len;
+		if(other_info.pipe.r>=0&&other_info.data_len!=0) tcp_unshrink_sndbuf(my_info);
 
 		if(other_info.data_len==0)
 		{
-			tcp_buf_pool.put(other_info.buf);
-			other_info.buf=0;
+			if(other_info.pipe.r>=0)
+			{
+				tcp_pipe_pool.put(other_info.pipe);
+			}
+			else
+			{
+				tcp_buf_pool.put(other_info.buf);
+				other_info.buf=0;
+			}
 
 			//ev=my_info.ev;
 			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, my_fd, &ev);
@@ -1420,6 +1664,8 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		int err=errno;
 		if(err==EAGAIN||err==EWOULDBLOCK) return 0;//backlog 已取空，是一轮的正常结束，不记日志
 		mylog(log_warn,"[tcp]accept failed %d %s\n", new_fd,get_sock_error());
+		//fd 用完时先关掉空闲 pipe，关掉了就接着 accept（客户端还在 backlog 里），否则按 C6 停到下一个周期（D52）
+		if((err==EMFILE||err==ENFILE)&&tcp_pipe_trim()>0) return 1;
 		if(err!=EINTR&&err!=ECONNABORTED)
 		{
 			//EMFILE/ENFILE/ENOMEM or an LSM denial: the connection stays in the backlog and the level-triggered watcher would fire again at once; clear_timer_cb restarts it
@@ -1451,6 +1697,8 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 
 
 	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+	if(new_remote_fd<0&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim()>0)//fd 用完时关掉空闲 pipe 再试一次（D52）
+		new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
 	if(new_remote_fd<0)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",tmp_addr.get_str(),get_sock_error());
@@ -1556,6 +1804,7 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 			ev_io_start(loop,&it->udp_accept_watcher);
 		}
 	}
+	tcp_pipe_pool.blocked=0;//创建 pipe 失败后每个周期最多再试一次（每次失败都会重新置位）
 	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
@@ -1651,6 +1900,8 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	int remote_index=select_remote_index(*rule,tmp_addr);
 	address_t &remote_addr=rule->remote_targets[remote_index].addr;
 	int new_udp_fd=remote_addr.new_connected_udp_fd();
+	if(new_udp_fd==-1&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim()>0)//同 TCP：fd 用完时关掉空闲 pipe 再试一次（D52）
+		new_udp_fd=remote_addr.new_connected_udp_fd();
 	if(new_udp_fd==-1)
 	{
 		mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
@@ -2076,7 +2327,7 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 //持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上
 void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	int held=0,tcp_conns=0,udp_conns=0;
+	int held=0,pipes_held=0,tcp_conns=0,udp_conns=0;
 	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
 	{
 		forward_rule_t &rule=*it;
@@ -2088,12 +2339,13 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 			tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
 			half_closed+=(pair->local.eof||pair->remote.eof);
 			held+=(pair->local.buf!=0)+(pair->remote.buf!=0);
+			pipes_held+=(pair->local.pipe.r>=0)+(pair->remote.pipe.r>=0);
 		}
 		tcp_conns+=tcp.lru.size();
 		udp_conns+=udp.lru.size();
 		if(rule.enable_tcp)
-			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu\n",
-				rule.index,tcp.lru.size(),tcp.total,half_closed,tcp.bytes[0],tcp.bytes[1]);
+			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu up_splice=%llu down_splice=%llu splice_fallback=%llu\n",
+				rule.index,tcp.lru.size(),tcp.total,half_closed,tcp.bytes[0],tcp.bytes[1],tcp.splice_bytes[0],tcp.splice_bytes[1],tcp.splice_fallback);
 		if(rule.enable_udp&&!udp_gro)
 			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu\n",
 				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1]);
@@ -2103,12 +2355,15 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 				udp.gro[0],udp.gro[1],udp.gso_fallback[0],udp.gso_fallback[1]);
 	}
 	int scratch=(tcp_scratch!=0);
-	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d\n",
+	int pipe_scratch=(tcp_pipe_scratch.r>=0);
+	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d\n",
 		tcp_buf_pool.alloc,held,tcp_buf_pool.free_bufs.cnt,scratch,
-		tcp_pair_pool.slabs,tcp_pair_pool.free_objs.cnt,udp_pair_pool.slabs,udp_pair_pool.free_objs.cnt);
+		tcp_pair_pool.slabs,tcp_pair_pool.free_objs.cnt,udp_pair_pool.slabs,udp_pair_pool.free_objs.cnt,
+		tcp_pipe_pool.alloc,pipes_held,tcp_pipe_pool.free_cnt,pipe_scratch);
 	//先写出再检查：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
 	fflush(stdout);
 	DEBUG_ASSERT(tcp_buf_pool.alloc==held+tcp_buf_pool.free_bufs.cnt+scratch);
+	DEBUG_ASSERT(tcp_pipe_pool.alloc==pipes_held+tcp_pipe_pool.free_cnt+pipe_scratch);
 	DEBUG_ASSERT(tcp_pair_pool.slabs*obj_pool_slab_objs-tcp_pair_pool.free_objs.cnt==tcp_conns);
 	DEBUG_ASSERT(udp_pair_pool.slabs*obj_pool_slab_objs-udp_pair_pool.free_objs.cnt==udp_conns);
 	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
@@ -2365,6 +2620,8 @@ void print_help()
 	printf("                                          UDP buffers are capped by net.core.rmem_max/wmem_max unless running with CAP_NET_ADMIN\n");
 	printf("                                          (UDP sessions: only a --sock-buf value is set past the cap)\n");
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
+	printf("    --disable-splice                      forward TCP by recv/send copies only; by default a direction whose last read\n");
+	printf("                                          was at least 16 KiB moves the next one with splice through a pipe\n");
 	printf("    --udp-gro                             receive UDP with UDP_GRO and forward merged packets with UDP_SEGMENT (GSO),\n");
 	printf("                                          Linux 5.0 or later, off by default\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
@@ -2393,6 +2650,7 @@ void process_arg(int argc, char *argv[])
 		{"sock-buf", required_argument,    0, 1},
 		{"udp-listen-buf", required_argument,    0, 1},
 		{"disable-tcp-nodelay", no_argument,    0, 1},
+		{"disable-splice", no_argument,    0, 1},
 		{"udp-gro", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
@@ -2549,6 +2807,10 @@ void process_arg(int argc, char *argv[])
 			else if(strcmp(long_options[option_index].name,"disable-tcp-nodelay")==0)
 			{
 				disable_tcp_nodelay=1;
+			}
+			else if(strcmp(long_options[option_index].name,"disable-splice")==0)
+			{
+				disable_splice=1;
 			}
 			else if(strcmp(long_options[option_index].name,"udp-gro")==0)
 			{

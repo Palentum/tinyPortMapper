@@ -201,6 +201,10 @@ func tmHolds(pid int, srcLocal, srcRemote, dstLocal, dstRemote string) error {
 //     扩大，读端 MSS 为 1460 时只有约 87 KB（MSS 64 KiB 时为 2.6 MB）；读端的接收窗口限住发送，拥塞窗口不再增长，发送缓冲也就不再扩大。
 //     源一侧接收缓冲自动调优、recv 一次读满 64 KiB 的块，持有的剩余数据常常多于 EPOLLOUT 时腾出的空间。
 //
+// 这两项测的是块池，所以带 --disable-splice：splice 开着时大流量方向持有的是 pipe（B2）。
+//   - splice：同 default 但 splice 开着：两个方向反复持有 pipe、write 分支一再只 splice 出一部分、pipe 还池或 close，SHA-256 照样校验；
+//     fd 比的是非 pipe fd（scratch pipe 与空闲 pipe 合法地留着），VmRSS 这一项对它只是附带。
+//
 // 共 rounds 轮，比较第 2 轮与最后一轮结束时的 VmRSS：排空的块若只置 0 不还池，每次交接都泄漏一块；正常实现持平
 func TestTCPBufferPoolStorm(t *testing.T) {
 	t.Parallel()
@@ -208,8 +212,9 @@ func TestTCPBufferPoolStorm(t *testing.T) {
 		name  string
 		extra []string
 	}{
-		{"sock-buf", []string{"--sock-buf", "32"}},
-		{"default", nil},
+		{"sock-buf", []string{"--sock-buf", "32", "--disable-splice"}},
+		{"default", []string{"--disable-splice"}},
+		{"splice", nil},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
@@ -250,7 +255,7 @@ func poolStorm(t *testing.T, extra ...string) {
 	})
 	listen := loopback4(t)
 	mp := startMapperStableRSS(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-t"}, extra...)...)
-	base := fdCount(t, mp.pid())
+	base := nonPipeFDs(t, mp.pid())
 
 	var rss []int
 	for round := range rounds {
@@ -332,8 +337,8 @@ func poolStorm(t *testing.T, extra ...string) {
 			cc.c.Close()
 		}
 		eventually(t, 3*ioTimeout, 50*time.Millisecond, func() error {
-			if got := fdCount(t, mp.pid()); got != base {
-				return fmt.Errorf("第 %d 轮结束后 tinymapper 有 %d 个 fd，建连前为 %d：连接对未全部释放", round+1, got, base)
+			if got := nonPipeFDs(t, mp.pid()); got != base {
+				return fmt.Errorf("第 %d 轮结束后 tinymapper 有 %d 个非 pipe fd，建连前为 %d：连接对未全部释放", round+1, got, base)
 			}
 			return nil
 		})
@@ -343,6 +348,8 @@ func poolStorm(t *testing.T, extra ...string) {
 		rss = append(rss, vmRSS(t, mp.pid()))
 	}
 
+	// 非 pipe fd 回到基线之外，留着的 pipe（scratch 与池里空闲的）必须恰为统计的 2×pipes alloc（--disable-splice 时为 0）
+	mp.expectPipeFDs(t, mp.statsAfterSignal(t), "最后一轮释放之后")
 	growth := rss[rounds-1] - rss[1]
 	t.Logf("各轮结束时 VmRSS（KB）：%v；第 2 轮至最后一轮增长 %d KB", rss, growth)
 	const leakThreshold = 12 << 10 // KB；排空不还池时每轮泄漏数十 MiB（96 条流各排空约 S/64KiB 块）
@@ -375,6 +382,7 @@ func fillUntilStalled(c net.Conn, stall time.Duration) error {
 //     约 2.6 MB，要先灌满它才会持有，固定的写入量不可靠，所以由后端写到停住来确认持有；连接数少一些，限住每轮几十 MB 的内核内存；
 //   - sock-buf：--sock-buf 32 把两侧缓冲锁在约 64 KiB，几百 KiB 就持有，连接数多一些。
 //
+// 两项都带 --disable-splice：splice 开着时持有的是 pipe，释放时直接 close，见 TestSpliceReset。
 // 只做上游→客户端方向（remote.buf）；变异把 local.buf、remote.buf 两行一并删除，捕到 remote.buf 泄漏即可判定。排空路径（write
 // 分支归还）由 TestTCPBufferPoolStorm 覆盖。UDP 会话对象（udp_pair_t，D18）的池化复用由 TestDomainRefresh（释放旧会话后新会话
 // 后进先出地复用同一对象与 fd 号）与 TestUDPEpollAddFail（反复取出、归还）覆盖；“UDP erase 不归还对象”这种纯泄漏每个会话只有
@@ -386,8 +394,8 @@ func TestTCPBufferReleaseNoLeak(t *testing.T) {
 		m     int
 		extra []string
 	}{
-		{"default", 8, nil},
-		{"sock-buf", 40, []string{"--sock-buf", "32"}},
+		{"default", 8, []string{"--disable-splice"}},
+		{"sock-buf", 40, []string{"--sock-buf", "32", "--disable-splice"}},
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()

@@ -18,7 +18,9 @@ FWDBENCH=${FWDBENCH:-fwdbench}; IPERF3=${IPERF3:-iperf3}; REALM=${REALM:-realm};
 PERF=${PERF:-perf}; SUDO=${SUDO:-}   # fwd 上的 perf 与提权前缀
 TOPO=${TOPO:-loopback}           # loopback | veth（见 topo_up）
 VETH_FLUSH_NS=${VETH_FLUSH_NS:-50000}; VETH_DEFER=${VETH_DEFER:-2}   # veth 拓扑转发器一侧的 gro_flush_timeout / napi_defer_hard_irqs
-FPORT=20000; IPERF_PORT=5201; ECHO_PORT=9000
+FPORT=20000; IPERF_PORT=5201; ECHO_PORT=9000; SINK_PORT=9001
+FWD_UID=${FWD_UID:-4242}         # +nonroot 转发器的 uid/gid（专用、不与其他进程共用，pipe-user-pages-soft 按 uid 计）
+BULK_SNDBUF=${BULK_SNDBUF:-32768}; BULK_STALL=${BULK_STALL:-1}   # tcp_bulk_*：客户端 SO_SNDBUF（字节）、_stall 时 sink 的停顿（秒）
 FWD_PID=""; FWD_NAME=""; FWD_SET=""; SRV_PIDS=""; TARGET_IP=""; TARGET_PORT=""
 CLI_NS=""; FWD_NS=""; SRV_NS=""  # veth 拓扑下各角色的网络命名空间
 
@@ -107,12 +109,27 @@ wait_listen() {
 start_backends() {
   SRV_PIDS="$(spawn srv iperf3-server.log "taskset -c $SRV_CPUS $IPERF3 -s -p $IPERF_PORT")"
   SRV_PIDS="$SRV_PIDS $(spawn srv echo-server.log "taskset -c $SRV_CPUS $FWDBENCH server -l $(hp "$SRV_IP" $ECHO_PORT)")"
-  wait_listen srv $IPERF_PORT && wait_listen srv $ECHO_PORT
+  SRV_PIDS="$SRV_PIDS $(spawn srv sink.log "taskset -c $SRV_CPUS $FWDBENCH sink -l $(hp "$SRV_IP" $SINK_PORT)")"
+  wait_listen srv $IPERF_PORT && wait_listen srv $ECHO_PORT && wait_listen srv $SINK_PORT
 }
 
 stop_backends() { local p; for p in $SRV_PIDS; do stop_pid srv "$p"; done; SRV_PIDS=""; }
 
-backend_for() { case $1 in udp_rr_*) echo $ECHO_PORT ;; tcp_bw_*|udp_*) echo $IPERF_PORT ;; *) echo $ECHO_PORT ;; esac; }
+backend_for() { case $1 in udp_rr_*) echo $ECHO_PORT ;; tcp_bw_*|udp_*) echo $IPERF_PORT ;; tcp_bulk_*) echo $SINK_PORT ;; *) echo $ECHO_PORT ;; esac; }
+
+# bulk_args <负载> <秒数> <预热秒数>：tcp_bulk_<N>[_stall] 的 fwdbench bulk 参数。N 条连接各自持续写 64 KiB 的块，经转发器到
+# fwdbench sink（读完丢弃并逐字节核对，结束时把收到的字节数报回客户端）；客户端 SO_SNDBUF 固定为 BULK_SNDBUF：loopback 上
+# 三方的 socket 共用一份 tcp_mem（这台 VM 约 735 MB），2000 条连接时自动调大的客户端发送队列会把它占满、触发丢包。
+# _stall：sink 在每条连接上先停顿 BULK_STALL 秒再读，所有方向同时积压在转发器里，非 root 时 pipe 达到 pipe-user-pages-soft，
+# 回退计数必然出现；预热相应加长，测量窗口从停顿结束 1 秒后开始。停顿越长，零窗口探测的退避越长（200 ms 起倍增），
+# 停顿结束后个别连接要等下一次探测才恢复，所以默认只停 1 秒（2 秒时收尾偶尔要 4–6 秒）。
+# 这台 Docker VM（8 GB）的 tcp_mem 上限约 735 MB，2000 条连接时三方的 socket 会进入内存压力（RcvQDrop、RTO 超时），吞吐波动大，
+# 这个负载主要看错误数与回退计数
+bulk_args() {
+  local n=${1#tcp_bulk_} st=""
+  case $n in *_stall) n=${n%_stall}; st=" -stall ${BULK_STALL}s" ;; esac
+  echo "bulk -c $(hp "$TARGET_IP" "$TARGET_PORT") -n $n -s 65536 -sndbuf $BULK_SNDBUF -d ${2}s -w ${3}s$st"
+}
 
 # iperf_udp <负载>：udp_{bw,pps}_<包长>[_p<N>][_r] 的 iperf3 参数。_p<N> 为 N 条流（iperf3 -P N），每条流是转发器里的一个会话；
 # _r 为反向（-R）：后端发、客户端收，数据走转发器的回程。iperf3 3.16 加 -R 时 end.sum_sent 仍是发送方（后端）、
@@ -125,11 +142,15 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap] | rinetd | realm-1c | realm-2c
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot] | rinetd | realm-1c | realm-2c
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；+ 开头的标记顺序任意，可组合：
 # +gro：同一二进制加 --udp-gro 启动（U5），同一批里对照开/关；
+# +nosplice：同一二进制加 --disable-splice 启动（B2），同一批里对照 splice 开/关；
 # +nocap：同一二进制经 setpriv 去掉 CAP_NET_ADMIN 后启动，在加了 NET_ADMIN 的容器里（run.sh 的 CAP_ADD）对照不带该权限的部署；
-# TM_NOCAP=1 时所有 tinymapper 都这样启动（run.sh 给 --privileged 的 syscount/prof 阶段与 veth 拓扑设置）
+# TM_NOCAP=1 时所有 tinymapper 都这样启动（run.sh 给 --privileged 的 syscount/prof 阶段与 veth 拓扑设置）；
+# +nonroot（各转发器都可加，如 realm-1c+nonroot）：经 setpriv 以专用 uid/gid FWD_UID 启动，没有任何 capability，
+# fs.pipe-user-pages-soft 按这个 uid 计（容器里的 root 与 VM 里所有 root 进程同一 uid，--privileged 时还不受该限额约束）；
+# 只用于 loopback 容器（脚本以 root 运行）
 tm_file() {
   local n=${1%%+*} v s=""
   v=${n%%@*}
@@ -140,21 +161,23 @@ tm_file() {
 
 # start_fwd <转发器> <后端端口>：启动转发器，设置 FWD_PID、FWD_NAME、所在 CPU FWD_SET 与客户端目标 TARGET_IP:TARGET_PORT
 start_fwd() {
-  local fwd=$1 bp=$2 l r c
+  local fwd=$1 bp=$2 l r c u=""
   FWD_PID=""; FWD_NAME=$fwd; FWD_SET=$FWD_CPUS; TARGET_IP=$FWD_IP; TARGET_PORT=$FPORT
   l=$(hp "$FWD_IP" $FPORT); r=$(hp "$SRV_IP" "$bp")
-  case $fwd in
+  case "$fwd+" in *+nonroot+*) u="setpriv --reuid=$FWD_UID --regid=$FWD_UID --clear-groups " ;; esac
+  case ${fwd%%+*} in
     direct) TARGET_IP=$SRV_IP; TARGET_PORT=$bp; return 0 ;;
     tinymapper*)
-      c="taskset -c $FWD_CPUS"
-      case "${TM_NOCAP:-}:$fwd+" in 1:*|*+nocap+*) c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin" ;; esac
+      c="taskset -c $FWD_CPUS $u"
+      [ -n "$u" ] || case "${TM_NOCAP:-}:$fwd+" in 1:*|*+nocap+*) c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin" ;; esac
       c="$c $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL"
-      case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac ;;
+      case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac
+      case "$fwd+" in *+nosplice+*) c="$c --disable-splice" ;; esac ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
-      c="taskset -c $FWD_CPUS $RINETD -f -c $WORK/rinetd.conf" ;;
-    realm-1c) c="taskset -c $FWD_CPUS $REALM -l $l -r $r -u" ;;
-    realm-2c) c="taskset -c $FWD_CPUS2 $REALM -l $l -r $r -u"; FWD_SET=$FWD_CPUS2 ;;
+      c="taskset -c $FWD_CPUS $u$RINETD -f -c $WORK/rinetd.conf" ;;
+    realm-1c) c="taskset -c $FWD_CPUS $u$REALM -l $l -r $r -u" ;;
+    realm-2c) c="taskset -c $FWD_CPUS2 $u$REALM -l $l -r $r -u"; FWD_SET=$FWD_CPUS2 ;;
     *) log "未知转发器：$fwd"; return 1 ;;
   esac
   FWD_PID=$(spawn fwd fwd.log "$c")
@@ -207,19 +230,27 @@ cpu_json() {
     }'
 }
 
-# tm_stats：被测 tinymapper 支持 SIGUSR1 统计（O1 起）时让它输出一次，打印其中 `stats rule 1 udp:` 行（单规则）的 key=value 部分（去掉颜色码）；
-# 其他转发器、没有统计的旧二进制（收到 SIGUSR1 会退出）与 --log-level 0 时不输出。等到 `stats pool:` 行写出（sigusr1_cb 最后 fflush）
+# tm_stats：被测 tinymapper 支持 SIGUSR1 统计（O1 起）时让它输出一次，打印其中（单规则）`stats rule N tcp:`、`stats rule N udp:`、
+# `stats pool:` 各一行，行首为 tcp / udp / pool，后面是原样的字段（去掉颜色码），如 `udp sessions=1 total=1 up_pkts=…`、
+# `pool bufs alloc=64 held=0 … pipes alloc=…`；其他转发器、没有统计的旧二进制（收到 SIGUSR1 会退出）与 --log-level 0 时不输出。
+# 等到 `stats pool:` 行写出（sigusr1_cb 最后 fflush）
 tm_stats() {
   case $FWD_NAME in tinymapper*) ;; *) return 0 ;; esac
   [ -n "$FWD_PID" ] && [ "$TM_LOG_LEVEL" != 0 ] || return 0
   on fwd "f=$WORK/fwd.log; LC_ALL=C grep -aq 'stats rule' $BIN/$(tm_file "$FWD_NAME") || exit 0
     n=\$(grep -ac 'stats pool:' \$f); kill -USR1 $FWD_PID 2>/dev/null || exit 0
     for i in \$(seq 100); do [ \$(grep -ac 'stats pool:' \$f) -gt \$n ] && break; sleep 0.02; done
-    grep -a 'stats rule [0-9]* udp:' \$f | tail -1 | sed 's/.*udp: //; s/\x1b\[[0-9;]*m//g'"
+    for k in 'rule [0-9]* tcp' 'rule [0-9]* udp' pool; do
+      grep -a \"stats \$k:\" \$f | tail -1 | sed 's/.*stats \(rule [0-9]* \)*\([a-z]*\): /\2 /; s/\x1b\[[0-9;]*m//g'
+    done"
 }
 
-# stats_json：tm_stats 的一行 key=value 转为 JSON 对象，没有输入时输出 null
-stats_json() { awk '{for (i = 1; i <= NF; i++) if (split($i, kv, "=") == 2) printf "%s\"%s\":%s", (n++ ? "," : "{"), kv[1], kv[2]} END {print (n ? "}" : "null")}'; }
+# stats_json <tcp|udp|pool>：从 tm_stats 的输出里取该行转为 JSON 对象，没有时输出 null。pool 行里不带 = 的词（bufs、tcp_pairs、
+# udp_pairs、pipes）作为其后字段的前缀：{"bufs_alloc":…, "pipes_held":…}
+stats_json() {
+  awk -v k="$1" '$1 == k {for (i = 2; i <= NF; i++) if (split($i, kv, "=") == 2) printf "%s\"%s%s\":%s", (n++ ? "," : "{"), p, kv[1], kv[2]; else p = $i "_"}
+    END {print (n ? "}" : "null")}'
+}
 
 # client <负载> <秒数>：在 cli 上跑一次负载并覆盖整个客户端生命周期（fwdbench -w 0s，iperf3 不跳过首秒），输出一行 JSON
 client() {
@@ -229,6 +260,7 @@ client() {
     tcp_rr_*)  on cli "$c $FWDBENCH rr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     tcp_crr_*) on cli "$c $FWDBENCH crr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
     udp_rr_*)  on cli "$c $FWDBENCH udp-rr -c $t -n ${w##*_} -s 64 -d ${d}s -w 0s" ;;
+    tcp_bulk_*) on cli "$c $FWDBENCH $(bulk_args "$w" "$d" 0)" ;;
     udp_*)
       # sent_pkts 是发送方的发包数：正向为客户端，_r 为后端
       on cli "$c $IPERF3 -c $TARGET_IP -p $TARGET_PORT $(iperf_udp "$w") -t $d -J" | jq -c '{sent_pkts: .end.sum_sent.packets,
@@ -251,11 +283,11 @@ snmp_udp() {
 
 # count_phase <阶段名> <perf 事件参数> <输出前缀> <负载> <秒数>：perf stat 计数 fwd 进程，窗口覆盖客户端整个生命周期
 # 输出 <前缀>.<阶段>.csv / .client.json / .snmp.txt；UDP 的计数单位取 fwd 上 /proc/net/snmp 的 OutDatagrams 增量。
-# udp_bw/udp_pps 且被测的是 tinymapper 时，perf 窗口前后各取一次 SIGUSR1 统计写入 .stats.txt：GSO 一次发多个数据报，
-# OutDatagrams 每次发送只加 1（udp_send_skb），syscount.py 有它时改用 up_pkts+down_pkts 的增量
+# udp_bw/udp_pps、tcp_bw/tcp_bulk 且被测的是 tinymapper 时，perf 窗口前后各取一次 SIGUSR1 统计写入 .stats.txt：GSO 一次发多个数据报，
+# OutDatagrams 每次发送只加 1（udp_send_skb），syscount.py 有它时改用 up_pkts+down_pkts 的增量；TCP 由它算 splice 写出的字节占比与回退次数
 count_phase() {
   local ph=$1 ev=$2 pre=$3 pp st=""
-  case $4 in udp_bw_*|udp_pps_*) st=$pre.$ph.stats.txt ;; esac
+  case $4 in udp_bw_*|udp_pps_*|tcp_bw_*|tcp_bulk_*) st=$pre.$ph.stats.txt ;; esac
   snmp_udp > "$pre.$ph.snmp.txt"
   [ -z "$st" ] || tm_stats > "$st"
   pp=$(spawn fwd perf-$ph.log "$SUDO $PERF stat -x, -o $WORK/$ph.csv $ev -p $FWD_PID")

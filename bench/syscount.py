@@ -4,10 +4,12 @@
 "不含等待" = 总计减去 epoll_pwait 与 poll/select：等待类调用次数随负载变化，其余都是结构性次数，适合做回归门槛。
 单位：rr = 每个请求/响应对（tcp_rr、udp_rr 都取客户端报告的 ops），crr = 每个连接，udp = 转发器发出的每个包
 （fwd 上 /proc/net/snmp 的 OutDatagrams 增量，发送方与转发器同机且同一网络命名空间时再减去发送方的发包数；发送方正向为客户端，
-_r 为后端），bw = 每 GB（iperf3 服务端收到的 1e9 字节）。
+_r 为后端），bw = 每 GB（iperf3 服务端收到的 1e9 字节；tcp_bulk 为 fwdbench bulk 发出、sink 核对过的字节）。
 udp 有 <前缀>.stat.stats.txt（被测的是 tinymapper，lib.sh 的 count_phase 在 perf 窗口前后各取一次 SIGUSR1 统计）时单位改用
 up_pkts+down_pkts 的增量：tinymapper 按数据报计，而 GSO 一次发出多个数据报时 OutDatagrams 只加 1（udp_send_skb）；
 OutDatagrams 的换算仍记在 JSON 的 snmp_units 里，两者相差超过 0.5% 时在明细里注明。
+tcp_bw / tcp_bulk 有统计（B2 起 tcp 行含 up_splice）时 JSON 另记 splice_pct（splice 写出的字节占 up_bytes+down_bytes 增量的 %）与
+splice_fallback（增量），明细里注明。
 
 用法：python3 -I bench/syscount.py <目录> [--json <输出.json>]   # markdown 表格打印到标准输出
 JSON 每个 (转发器, 负载) 一行、键序固定，便于 diff。
@@ -65,6 +67,18 @@ def tm_pkts(p):
     return sum(int(rows[-1][k]) - int(rows[0][k]) for k in ("up_pkts", "down_pkts"))
 
 
+def tm_splice(p):
+    """统计前后两次 tcp 行的增量：splice 写出的字节占比与回退次数；没有文件、不足两行或没有 up_splice（B2 以前）时返回 {}。"""
+    if not p.exists():
+        return {}
+    rows = [dict(kv.split("=", 1) for kv in l.split() if "=" in kv) for l in p.read_text().splitlines() if l.startswith("tcp ")]
+    if len(rows) < 2 or "up_splice" not in rows[-1]:
+        return {}
+    d = lambda k: int(rows[-1][k]) - int(rows[0][k])
+    b = d("up_bytes") + d("down_bytes")
+    return {"splice_pct": round(100 * (d("up_splice") + d("down_splice")) / b, 2) if b else None, "splice_fallback": d("splice_fallback")}
+
+
 def per_unit(pre, wl, phase="stat"):
     """返回 (单位数, 单位名, 吞吐, 附加字段)。"""
     c = json.loads(Path(f"{pre}.{phase}.client.json").read_text())
@@ -102,6 +116,7 @@ def analyze(d, fwd, wl):
         "fail": r(sum(fails.values())), "fail_detail": {k: r(v) for k, v in sorted(fails.items())},
         "ctx_sw": round(ev["context-switches"] / n, 5),
         **extra,
+        **(tm_splice(Path(f"{pre}.stat.stats.txt")) if wl.startswith("tcp") else {}),
     }
 
 
@@ -143,6 +158,8 @@ def main():
         units = ""
         if x.get("units_src") == "tm_stats" and abs(x["snmp_units"] - x["units"]) > 0.005 * x["units"]:
             units = f"；单位取 SIGUSR1 统计 {x['units']:,.0f} 个数据报，OutDatagrams 增量 {x['snmp_units']:,.0f}（GSO 每次发送只计 1）"
+        if x.get("splice_pct") is not None:
+            units += f"；splice 写出 {fmt(x['splice_pct'], 2)}% 字节，回退 {x['splice_fallback']} 次"
         print(f"- `{x['fwd']}.{x['workload']}`：失败返回明细 {detail}" + (f"；其他 syscall：{other}" if other else "") + units)
     for n in bad:
         print(f"- `{n}`：没有有效的 perf 计数（见转发器主机上的 perf-stat.log）")

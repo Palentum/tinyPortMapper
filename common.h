@@ -142,29 +142,41 @@ struct not_copy_able_t
 	}
 };
 
+struct tcp_pipe_t//pipe2 得到的一对 fd（B2）；r 为 -1 表示没有
+{
+	int r;
+	int w;
+};
+
 struct tcp_info_t:not_copy_able_t
 {
 	int fd;
 	ev_io ev;//ev.data 指向所属的 tcp_pair_t（T10）
 	//epoll_event ev;
 	//char * data;
-	char *buf;//本侧读到、还没发完的数据所在的池缓冲：recv 读进 scratch，没发完就把这块整块留下（D17），排空后还回池；data_len 为 0 时为 0
+	char *buf;//本侧读到、还没发完的数据所在的池缓冲：recv 读进 scratch，没发完就把这块整块留下（D17），排空后还回池；数据不在块里时为 0
+	tcp_pipe_t pipe;//同 buf，数据是 splice 进 pipe 的（B2，D47）：没写完才持有，排空后还回 pipe 池；与 buf 至多其一，没有时 r 为 -1
 	char * begin;
-	int data_len;
+	int data_len;//还没发完的字节数，在 buf 或 pipe 里；不为 0 恰好当二者之一存在
+	int splice_next;//本侧上一次读到至少 splice_read_min 字节：下一次读用 splice（D46），每次读之后按本次字节数重算
 	int eof;//本侧 recv 已返回 0：不再读本侧，对另一侧发 shutdown(SHUT_WR)
 	int connected;//已确认连接建立（accept 得到、connect 返回 0，或建连中可写且无错误）；为 0 时 watcher 同时等读写、不收发，对建连中的 socket 调 shutdown 会中止 connect
 	int nodelay_wait;//只用于上游（T15）：TCP_NODELAY 还没设时为 1（还没 send 过）或 2（已 send 过一次，下次 send 前要设）；已设或 --disable-tcp-nodelay 时为 0
+	int mss;//本侧 socket 的 TCP_MAXSEG，第一次 splice 写不完时读（D54）；0 为还没读，-1 为读失败
 	tcp_info_t()
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
 
 		memset(&ev,0,sizeof(ev));//对 ev_io_stop 等价于 ev_init：slab 新切出的内存未初始化，ev_io_init 之前走到释放路径时 ev_io_stop 要读 active/pending（T11）
 		buf=0;
+		pipe.r=pipe.w=-1;
 		begin=0;
 		data_len=0;
+		splice_next=0;
 		eof=0;
 		connected=0;
 		nodelay_wait=0;
+		mss=0;
 
 	}
 	~tcp_info_t()
