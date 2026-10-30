@@ -701,8 +701,9 @@ type udpSend struct {
 // queueUDP 在 tinymapper 暂停期间按顺序发出 sends，每发一个都等它进了监听 socket listen 的接收队列再发下一个，所以队列中的顺序就是
 // sends 的顺序。sock_diag 报的 UDP rqueue 是队列中各包 truesize 之和，暂停期间没人读，每入队一个包就严格增大；环回上软中断通常在
 // write 返回前就把包放进队列，负载高时可能推迟到 ksoftirqd。队列满时内核静默丢包（sk_drops 加一），这里直接失败：监听 socket 的
-// rcvbuf 为 2×min(2 MiB, rmem_max)，默认 rmem_max 下是 425984 字节；实测 60 字节左右的小包 truesize 为 960 字节，65527 字节的
-// IPv6 包约 66 KiB
+// rcvbuf 在 tests/run.sh 的容器里为 2×2 MiB（U6：tinymapper 有 CAP_NET_ADMIN，用 SO_RCVBUFFORCE 设，不受 rmem_max 截断）；没有
+// 这项能力时为 2×min(2 MiB, rmem_max)，默认 rmem_max 下是 425984 字节，各用例排队的包都按这个较小的值控制。实测 60 字节左右的
+// 小包 truesize 为 960 字节，65527 字节的 IPv6 包约 66 KiB
 func queueUDP(t testing.TB, m *mapper, listen string, sends []udpSend) {
 	t.Helper()
 	remote := "0.0.0.0:0"
@@ -1197,7 +1198,8 @@ type udpReply struct {
 // queueReplies 在 tinymapper 暂停期间按顺序发出 replies，每发一个都等它进了 tinymapper 那个会话 socket 的接收队列再发下一个
 // （sock_diag 按会话 socket 的本端、对端地址精确查找，UDP 的 rqueue 是队列中各包 truesize 之和，暂停期间没人读，每入队一个包就
 // 严格增大），所以 epoll 里各会话 socket 变为就绪的先后就是它们第一个回包在 replies 里的先后。会话 socket 的 rcvbuf 为
-// 2×min(1 MiB, rmem_max)，队列满时内核静默丢包（sk_drops 加一），这里直接失败
+// 2×min(1 MiB, rmem_max)，默认 425984 字节（U6：会话 socket 只在给了 --sock-buf 时才用 FORCE，D38 修订），
+// 队列满时内核静默丢包（sk_drops 加一），这里直接失败
 func queueReplies(t testing.TB, m *mapper, replies []udpReply) {
 	t.Helper()
 	q := map[string]sockBuf{}
@@ -1873,4 +1875,214 @@ func TestUDPReturnIdle(t *testing.T) {
 	m.expectIdleCPU(t, "TCP+UDP 规则上只有 TCP 流量之后")
 	udpReplyFrom(t, udpDial(t, "", listen), "udp")
 	m.expectIdleCPU(t, "一次 UDP 往返之后")
+}
+
+// ---- U6：UDP socket 缓冲（D38–D40）----
+
+// udpBufModes 是 U6 用例的两种权限：cap 直接启动 tinymapper（tests/run.sh 的容器里以 root 运行，有 CAP_NET_ADMIN），nocap 由
+// startMapperNoNetAdmin 去掉这项能力后启动
+var udpBufModes = []struct {
+	name     string
+	netAdmin bool
+}{{"cap", true}, {"nocap", false}}
+
+// startUDPBufMapper 按 netAdmin 启动 tinymapper，并核对它的 CapEff 里是否真有 CAP_NET_ADMIN
+func startUDPBufMapper(t testing.TB, netAdmin bool, wait []listenPoint, args ...string) *mapper {
+	t.Helper()
+	if !netAdmin {
+		return startMapperNoNetAdmin(t, wait, args...)
+	}
+	needNetAdmin(t)
+	m := startMapper(t, wait, args...)
+	if !hasNetAdmin(t, m.pid()) {
+		t.Fatalf("tinymapper（pid %d）没有 CAP_NET_ADMIN（CapEff=%#x）", m.pid(), capEff(t, m.pid()))
+	}
+	return m
+}
+
+// udpBufWant 返回请求 req 字节时 UDP socket 缓冲的期望值：force（tinymapper 有 CAP_NET_ADMIN 且对这个 socket 用 SO_*BUFFORCE）时不截断，
+// 恰为 2×req；否则为
+// 2×min(req, rmem_max/wmem_max)，与测试自己的 socket 上用 SO_RCVBUF/SO_SNDBUF 设出的值相同
+func udpBufWant(t testing.TB, force bool, req int) sockBuf {
+	t.Helper()
+	if force {
+		return sockBuf{rcv: uint32(2 * req), snd: uint32(2 * req)}
+	}
+	return setBuf(t, req)
+}
+
+// udpBufInfoLine 是监听 socket 的缓冲小于 2×请求值（req 字节）时第 rule 条规则的 info 行（D40），got 为实际的缓冲
+func udpBufInfoLine(rule int, got sockBuf, req int) string {
+	return fmt.Sprintf("rule %d [udp] listen socket buffers are rcv %d / snd %d bytes instead of %d: "+
+		"capped by net.core.rmem_max/wmem_max, raise them to at least %d or run with CAP_NET_ADMIN", rule, got.rcv, got.snd, 2*req, req)
+}
+
+// udpBufForceFailed 是 SO_*BUFFORCE 第一次失败（EPERM）时的 debug 行，之后整个进程只用 SO_SNDBUF/SO_RCVBUF，不再记
+const udpBufForceFailed = "SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (1:Operation not permitted), UDP socket buffers are capped by net.core.rmem_max/wmem_max"
+
+// U6（D38–D40）：UDP socket 的缓冲。tinymapper 先用 SO_SNDBUFFORCE/SO_RCVBUFFORCE（要 CAP_NET_ADMIN，不受 rmem_max/wmem_max 截断），
+// 第一次失败后整个进程只用 SO_SNDBUF/SO_RCVBUF；监听 socket 按 --udp-listen-buf（默认 2048 KiB），会话 socket 按 --sock-buf（默认
+// 1 MiB），会话 socket 只在给了 --sock-buf 时才用 FORCE（D38 修订）。cap 与 nocap 各跑一遍，经 sock_diag 查监听 socket 和 3 个
+// 会话 socket：用了 FORCE 的（cap 下的监听 socket，cap 且给了 --sock-buf 时的会话 socket）恰为 2×请求值，其余为 2×min(请求值,
+// rmem_max/wmem_max)（默认 rmem_max 为 212992，内核存 425984；cap/default 的会话 socket 因此与 nocap 相同）。请求值低于 rmem_max、介于 rmem_max 与其 2 倍之间（300 KiB：
+// 截断后 425984 仍大于请求值，info 的条件少了内核的 2 倍时看不出截断）、远高于 rmem_max 的各有一组，--udp-listen-buf 的边界值
+// 10、10240 也在这里（越界的值见 TestConfigInvalid）。日志（--log-level 5，log-level-4 一组除外）：
+//   - 监听 socket 小于 2×请求值时恰有一行 info，带实际的 rcv/snd 与请求值；否则没有（cap，以及 nocap 下请求值不高于 rmem_max）；
+//   - nocap 下 FORCE 失败的 debug 行恰有一行：失败在第一个 UDP socket（监听 socket）上，之后的会话 socket 不再试。缺了失败缓存时
+//     给了 --sock-buf 的一组里每个会话 socket 都再试一次、再记一行（配置模式的三个监听 socket 同样），所以先建 3 个会话再数；
+//     cap 下一行也没有；默认的 --log-level 4 下也没有（只有 info 行）
+func TestUDPSockBuf(t *testing.T) {
+	t.Parallel()
+	t.Logf("测试进程 CapEff=%#x；SO_RCVBUF/SO_SNDBUF 设 2 MiB 得到 %v", capEff(t, os.Getpid()), setBuf(t, 2<<20))
+	const sessions = 3
+	for _, mode := range udpBufModes {
+		for _, c := range []struct {
+			name            string
+			extra           []string
+			listen, session int  // 监听 socket、会话 socket 请求的字节数
+			level4          bool // 以 --log-level 4 运行：debug 行不该出现
+			sockBuf         bool // 给了 --sock-buf：会话 socket 也用 FORCE
+		}{
+			{"default", nil, 2048 << 10, 1 << 20, false, false},
+			{"log-level-4", []string{"--log-level", "4"}, 2048 << 10, 1 << 20, true, false},
+			{"listen-3000", []string{"--udp-listen-buf", "3000"}, 3000 << 10, 1 << 20, false, false},
+			{"listen-300", []string{"--udp-listen-buf", "300"}, 300 << 10, 1 << 20, false, false},
+			{"listen-100", []string{"--udp-listen-buf", "100"}, 100 << 10, 1 << 20, false, false},
+			{"listen-10", []string{"--udp-listen-buf", "10"}, 10 << 10, 1 << 20, false, false},
+			{"listen-10240", []string{"--udp-listen-buf", "10240"}, 10240 << 10, 1 << 20, false, false},
+			{"sock-buf-40", []string{"--sock-buf", "40"}, 2048 << 10, 40 << 10, false, true},
+			{"sock-buf-3000", []string{"--sock-buf", "3000"}, 2048 << 10, 3000 << 10, false, true},
+		} {
+			t.Run(mode.name+"/"+c.name, func(t *testing.T) {
+				t.Parallel()
+				be := serveUDP(t, loopback4(t), "")
+				listen := loopback4(t)
+				// 同一选项给了两次时后一个生效：log-level-4 一组的 --log-level 4 盖过这里的 5
+				args := append([]string{"-l", listen, "-r", be.addr, "-u", "--log-level", "5"}, c.extra...)
+				m := startUDPBufMapper(t, mode.netAdmin, listenPoints("u", portOf(listen)), args...)
+				for range sessions {
+					udpReplyFrom(t, udpDial(t, "", listen), "udp") // 首包创建会话 socket
+				}
+				peers := be.peerList()
+				if len(peers) != sessions {
+					t.Fatalf("后端看到的源地址为 %v，期望恰好 %d 个（tinymapper 的会话 socket）", peers, sessions)
+				}
+				// 统计行写完后 tinymapper fflush stdout：此前的日志（启动时的 info 行、debug 行）都已在文件里
+				if s := m.statsAfterSignal(t).udp[1]; s.sessions != sessions {
+					t.Fatalf("统计 sessions=%d，期望 %d", s.sessions, sessions)
+				}
+
+				for _, s := range []struct {
+					name, local, remote string
+					req                 int
+					force               bool // 期望用 FORCE 设
+				}{
+					{"UDP 监听 socket", listen, "0.0.0.0:0", c.listen, mode.netAdmin},
+					{"UDP 会话 socket 1", peers[0], be.addr, c.session, mode.netAdmin && c.sockBuf},
+					{"UDP 会话 socket 2", peers[1], be.addr, c.session, mode.netAdmin && c.sockBuf},
+					{"UDP 会话 socket 3", peers[2], be.addr, c.session, mode.netAdmin && c.sockBuf},
+				} {
+					got, want := lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, s.name, s.local, s.remote), udpBufWant(t, s.force, s.req)
+					t.Logf("%s：%v", s.name, got)
+					if got.rcv != want.rcv || got.snd != want.snd {
+						t.Errorf("%s rcvbuf=%d sndbuf=%d，期望 %d、%d（请求 %d 字节，CAP_NET_ADMIN=%v，FORCE=%v）", s.name, got.rcv, got.snd, want.rcv, want.snd, s.req, mode.netAdmin, s.force)
+					}
+				}
+
+				lis := udpBufWant(t, mode.netAdmin, c.listen)
+				wantInfo := 0
+				if lis.rcv < uint32(2*c.listen) || lis.snd < uint32(2*c.listen) {
+					wantInfo = 1
+				} else if !mode.netAdmin && c.name == "default" {
+					t.Logf("rmem_max/wmem_max 不低于 2 MiB：nocap 下默认请求也不截断，info 行出现的分支没有覆盖")
+				}
+				if n := m.logLines(udpBufInfoLine(1, lis, c.listen)); n != wantInfo {
+					t.Errorf("日志中有 %d 行 %q，期望 %d 行", n, udpBufInfoLine(1, lis, c.listen), wantInfo)
+				}
+				if n := m.logLines("listen socket buffers are"); n != wantInfo {
+					t.Errorf("日志中有 %d 行监听 socket 缓冲的 info，期望 %d 行", n, wantInfo)
+				}
+				wantDebug := 1
+				if mode.netAdmin || c.level4 {
+					wantDebug = 0
+				}
+				if n := m.logLines(udpBufForceFailed); n != wantDebug {
+					t.Errorf("建了 %d 个会话之后日志中有 %d 行 %q，期望 %d 行", sessions, n, udpBufForceFailed, wantDebug)
+				}
+			})
+		}
+	}
+}
+
+// U6：配置文件模式下 --udp-listen-buf（D39，作用于整个进程）对每条 UDP 规则的监听 socket 生效。四条规则：TCP+UDP、仅 UDP、仅 TCP、
+// IPv6 的 TCP+UDP，--udp-listen-buf 3000（高于默认的 rmem_max）。cap 下三个 UDP 监听 socket 都恰为 2×3000 KiB，没有 info 行；
+// nocap 下为 2×min(3000 KiB, rmem_max/wmem_max)，UDP 规则 1、2、4 各有一行 info，仅 TCP 的规则 3 没有；FORCE 失败的 debug 行只有
+// 一行（三个监听 socket，缺了失败缓存时有三行）
+func TestUDPSockBufConfig(t *testing.T) {
+	t.Parallel()
+	const req = 3000 << 10
+	for _, mode := range udpBufModes {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			remote := loopback4(t) // 只看监听 socket，不需要后端
+			p1, p2, p3 := loopback4(t), loopback4(t), loopback4(t)
+			p4 := hostPort("::1", freePort(t))
+			cfg := writeConfig(t, fmt.Sprintf(`[[endpoints]]   # 规则 1：TCP + UDP
+listen = %q
+remote = %q
+use_udp = true
+
+[[endpoints]]   # 规则 2：仅 UDP
+listen = %q
+remote = %q
+no_tcp = true
+use_udp = true
+
+[[endpoints]]   # 规则 3：仅 TCP
+listen = %q
+remote = %q
+
+[[endpoints]]   # 规则 4：IPv6，TCP + UDP
+listen = %q
+remote = %q
+use_udp = true
+`, p1, remote, p2, remote, p3, remote, p4, remote))
+			wait := slices.Concat(listenPoints("tu", portOf(p1)), listenPoints("u", portOf(p2)), listenPoints("t", portOf(p3)), listenPoints("tu", portOf(p4)))
+			m := startUDPBufMapper(t, mode.netAdmin, wait, "-c", cfg, "--udp-listen-buf", "3000", "--log-level", "5")
+			m.statsAfterSignal(t) // 统计行之后 fflush：启动时的日志都已在文件里
+
+			want := udpBufWant(t, mode.netAdmin, req)
+			wantInfo := 0
+			if want.rcv < 2*req || want.snd < 2*req {
+				wantInfo = 1
+			}
+			for _, r := range []struct {
+				rule          int
+				listen, other string
+			}{{1, p1, "0.0.0.0:0"}, {2, p2, "0.0.0.0:0"}, {4, p4, "[::]:0"}} {
+				name := fmt.Sprintf("规则 %d 的 UDP 监听 socket", r.rule)
+				got := lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, name, r.listen, r.other)
+				t.Logf("%s：%v", name, got)
+				if got.rcv != want.rcv || got.snd != want.snd {
+					t.Errorf("%s rcvbuf=%d sndbuf=%d，期望 %d、%d", name, got.rcv, got.snd, want.rcv, want.snd)
+				}
+				if n := m.logLines(udpBufInfoLine(r.rule, want, req)); n != wantInfo {
+					t.Errorf("日志中有 %d 行 %q，期望 %d 行", n, udpBufInfoLine(r.rule, want, req), wantInfo)
+				}
+			}
+			if n := m.logLines("rule 3 [udp]"); n != 0 {
+				t.Errorf("仅 TCP 的规则 3 有 %d 行 [udp] 日志，期望没有", n)
+			}
+			if n := m.logLines("listen socket buffers are"); n != 3*wantInfo {
+				t.Errorf("日志中有 %d 行监听 socket 缓冲的 info，期望 %d 行（每条 UDP 规则 %d 行）", n, 3*wantInfo, wantInfo)
+			}
+			wantDebug := 1
+			if mode.netAdmin {
+				wantDebug = 0
+			}
+			if n := m.logLines(udpBufForceFailed); n != wantDebug {
+				t.Errorf("三个 UDP 监听 socket 建好后日志中有 %d 行 %q，期望 %d 行", n, udpBufForceFailed, wantDebug)
+			}
+		})
+	}
 }

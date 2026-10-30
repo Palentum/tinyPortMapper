@@ -27,7 +27,7 @@ int max_pending_packet=0;
 
 static app_config_t app_config;
 
-const int listen_fd_buf_size=2*1024*1024;
+int listen_fd_buf_size=2*1024*1024;//UDP 监听 socket 的 SO_SNDBUF/SO_RCVBUF，--udp-listen-buf
 static const u32_t dns_refresh_interval=30000;
 static const int max_accept_per_round=8;
 //内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
@@ -1833,7 +1833,16 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 		}
 
 		setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-		set_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
+		set_udp_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
+		//内核保存的是请求值的 2 倍；没有 CAP_NET_ADMIN 时先被 rmem_max/wmem_max 截断（6.18 以前默认 212992）
+		int rcv=0,snd=0;
+		socklen_t opt_len=sizeof(rcv);
+		getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_RCVBUF, &rcv, &opt_len);
+		opt_len=sizeof(snd);
+		getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_SNDBUF, &snd, &opt_len);
+		if(rcv<2*listen_fd_buf_size||snd<2*listen_fd_buf_size)
+			mylog(log_info,"rule %d [udp] listen socket buffers are rcv %d / snd %d bytes instead of %d: capped by net.core.rmem_max/wmem_max, raise them to at least %d or run with CAP_NET_ADMIN\n",
+				rule.index,rcv,snd,2*listen_fd_buf_size,listen_fd_buf_size);
 
 		if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 		{
@@ -1972,6 +1981,9 @@ void print_help()
 	printf("    --sock-buf            <number>        buf size for socket, >=10 and <=10240, unit: kbyte\n");
 	printf("                                          TCP: kernel autotuning if not set; setting it disables autotuning\n");
 	printf("                                          and is capped by net.core.rmem_max/wmem_max; UDP sessions: default 1024\n");
+	printf("    --udp-listen-buf      <number>        buf size for UDP listen sockets, >=10 and <=10240, unit: kbyte, default 2048\n");
+	printf("                                          UDP buffers are capped by net.core.rmem_max/wmem_max unless running with CAP_NET_ADMIN\n");
+	printf("                                          (UDP sessions: only a --sock-buf value is set past the cap)\n");
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
@@ -1997,6 +2009,7 @@ void process_arg(int argc, char *argv[])
 		{"disable-color", no_argument,    0, 1},
 		{"enable-color", no_argument,    0, 1},
 		{"sock-buf", required_argument,    0, 1},
+		{"udp-listen-buf", required_argument,    0, 1},
 		{"disable-tcp-nodelay", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
@@ -2133,6 +2146,20 @@ void process_arg(int argc, char *argv[])
 				else
 				{
 					mylog(log_fatal,"sock-buf value must be between 1 and 10240 (kbyte) \n");
+					myexit(-1);
+				}
+			}
+			else if(strcmp(long_options[option_index].name,"udp-listen-buf")==0)
+			{
+				int tmp=-1;
+				sscanf(optarg,"%d",&tmp);
+				if(10<=tmp&&tmp<=10*1024)
+				{
+					listen_fd_buf_size=tmp*1024;
+				}
+				else
+				{
+					mylog(log_fatal,"udp-listen-buf value must be between 10 and 10240 (kbyte)\n");
 					myexit(-1);
 				}
 			}

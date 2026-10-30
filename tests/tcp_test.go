@@ -1043,13 +1043,14 @@ func tcpBufDefault(t testing.TB, name string) int {
 //     这个值看不出是否加锁（--sock-buf 64 设出的 131072 恰好相等），但传输后的增长也不能当判据：loopback 上 advmss 约 64 KiB，
 //     tcp_rcv_space_adjust 起始的 space 就是整个初始窗口（65535），tinymapper 每次最多读 64 KiB（T11），一个 RTT 估计内读走的数据
 //     只在一个窗口上下，增长与否取决于计时抖动（实测约 1/10 的连接回显 64 MiB 后仍为 131072）
-//   - --sock-buf N：两侧都是 2×min(N KiB, rmem_max/wmem_max)；双向各传 16 MiB 后不变
+//   - --sock-buf N：两侧都是 2×min(N KiB, rmem_max/wmem_max)；双向各传 16 MiB 后不变。N 高于 rmem_max 时同样截断：tests/run.sh 的
+//     容器里 tinymapper 有 CAP_NET_ADMIN，但 SO_*BUFFORCE 只用于 UDP socket（U6，D38）
 //
 // 监听 socket 也要检查：accept 得到的 socket 复制监听 socket 的缓冲与锁位，SYN-ACK 的窗口、wscale 也按监听 socket 的缓冲计算，
 // 所以 --sock-buf 应设在监听 socket 上，而不是每次 accept 后再设（只看客户端 socket 分不出这两种做法）；没给 --sock-buf 时
 // 监听 socket 不能设，否则客户端 socket 继承到锁住的缓冲。
 //
-// UDP 不在 T4 范围内：监听 socket 固定 2 MiB，会话 socket 为 --sock-buf（默认 1 MiB）
+// UDP socket 的缓冲见 TestUDPSockBuf（U6）
 func TestTCPSockBuf(t *testing.T) {
 	t.Parallel()
 	rmemDefault, wmemDefault := tcpBufDefault(t, "tcp_rmem"), tcpBufDefault(t, "tcp_wmem")
@@ -1061,6 +1062,7 @@ func TestTCPSockBuf(t *testing.T) {
 	}{
 		{"default", nil, 0},
 		{"sock-buf", []string{"--sock-buf", "40"}, 40},
+		{"sock-buf-3000", []string{"--sock-buf", "3000"}, 3000},
 	} {
 		t.Run("tcp/"+mode.name, func(t *testing.T) {
 			t.Parallel()
@@ -1128,34 +1130,6 @@ func TestTCPSockBuf(t *testing.T) {
 				t.Logf("双向各传 16 MiB 后 %s：%v", s.name, got)
 				if got.rcv != want.rcv || got.snd != want.snd {
 					t.Errorf("双向各传 16 MiB 后 %s rcvbuf=%d sndbuf=%d，期望仍为 %d、%d", s.name, got.rcv, got.snd, want.rcv, want.snd)
-				}
-			}
-		})
-		t.Run("udp/"+mode.name, func(t *testing.T) {
-			t.Parallel()
-			be := serveUDP(t, loopback4(t), "")
-			listen := loopback4(t)
-			m := startMapper(t, listenPoints("u", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-u"}, mode.extra...)...)
-			udpReplyFrom(t, udpDial(t, "", listen), "udp") // 首包创建会话 socket
-			peers := be.peerList()
-			if len(peers) != 1 {
-				t.Fatalf("后端看到的源地址为 %v，期望恰好 1 个（tinymapper 的会话 socket）", peers)
-			}
-			session := 1 << 20 // --sock-buf 的默认值
-			if mode.kib != 0 {
-				session = mode.kib << 10
-			}
-			for _, s := range []struct {
-				name, local, remote string
-				size                int
-			}{
-				{"UDP 监听 socket", listen, "0.0.0.0:0", 2 << 20},
-				{"UDP 会话 socket", peers[0], be.addr, session},
-			} {
-				got, want := lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, s.name, s.local, s.remote), setBuf(t, s.size)
-				t.Logf("%s：%v", s.name, got)
-				if got.rcv != want.rcv || got.snd != want.snd {
-					t.Errorf("%s rcvbuf=%d sndbuf=%d，期望 %d、%d（2×min(%d, rmem_max/wmem_max)）", s.name, got.rcv, got.snd, want.rcv, want.snd, s.size)
 				}
 			}
 		})

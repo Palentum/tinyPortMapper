@@ -72,11 +72,14 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀] | rinetd | realm-1c | realm-2c
-# tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+nocap] | rinetd | realm-1c | realm-2c
+# tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；
+# +nocap：同一二进制经 setpriv 去掉 CAP_NET_ADMIN 后启动，在加了 NET_ADMIN 的容器里（run.sh 的 CAP_ADD）对照不带该权限的部署；
+# TM_NOCAP=1 时所有 tinymapper 都这样启动（run.sh 给 --privileged 的 syscount/prof 阶段设置）
 tm_file() {
-  local v=${1%%@*} s=""
-  case $1 in *@*) s=-${1#*@} ;; esac
+  local n=${1%+nocap} v s=""
+  v=${n%%@*}
+  case $n in *@*) s=-${n#*@} ;; esac
   [ "$v" = tinymapper ] && v=tinymapper-glibc
   echo "$v$s"
 }
@@ -88,7 +91,10 @@ start_fwd() {
   l=$(hp "$FWD_IP" $FPORT); r=$(hp "$SRV_IP" "$bp")
   case $fwd in
     direct) TARGET_IP=$SRV_IP; TARGET_PORT=$bp; return 0 ;;
-    tinymapper*) c="taskset -c $FWD_CPUS $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL" ;;
+    tinymapper*)
+      c="taskset -c $FWD_CPUS"
+      if [ "${TM_NOCAP:-}" = 1 ] || [ "$fwd" != "${fwd%+nocap}" ]; then c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin"; fi
+      c="$c $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL" ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
       c="taskset -c $FWD_CPUS $RINETD -f -c $WORK/rinetd.conf" ;;

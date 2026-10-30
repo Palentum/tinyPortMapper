@@ -119,6 +119,7 @@ const u32_t timer_interval=400;//this should be smaller than heartbeat_interval 
 extern int about_to_exit;
 
 extern int socket_buf_size;
+extern int sock_buf_explicit;
 
 
 
@@ -322,6 +323,7 @@ bool larger_than_u32(u32_t a,u32_t b);
 void setnonblocking(int sock);
 
 int set_buf_size(int fd,int socket_buf_size);
+int set_udp_buf_size(int fd,int size);
 
 void  signal_handler(int sig);
 

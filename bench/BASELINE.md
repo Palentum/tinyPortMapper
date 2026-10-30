@@ -172,4 +172,4 @@ STAGES=prof bench/run.sh                                       # CPU 剖析：cl
 python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl     # 重新汇总
 ```
 
-`REPS`、`DUR`、`TESTS`、`FWDS`、`SC_*`、`PROF_*` 等环境变量见 `bench/run.sh` 头部注释。工具镜像 `tinymapper-bench:1` 不含 tinymapper，二进制在运行时从 `build/` 挂载，改源码不需要重建镜像。
+`REPS`、`DUR`、`TESTS`、`FWDS`、`SC_*`、`PROF_*` 等环境变量见 `bench/run.sh` 头部注释。各阶段的 tinymapper 默认都没有 `CAP_NET_ADMIN`（syscount/prof 容器是 `--privileged`，由 `TM_NOCAP` 去掉这一项），UDP socket 缓冲按 `rmem_max` 截断为 416 KiB，与本文的数据可比；`CAP_ADD=NET_ADMIN` 时各阶段统一带这项能力（U6：UDP 缓冲用 `SO_*BUFFORCE` 设，监听 4 MiB、会话 2 MiB），转发器名加 `+nocap` 后缀的同一二进制仍去掉它，可在同一批里对照。工具镜像 `tinymapper-bench:1` 不含 tinymapper，二进制在运行时从 `build/` 挂载，改源码不需要重建镜像。

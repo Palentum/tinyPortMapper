@@ -22,6 +22,11 @@
 #   PROF_RUNS / PROF_DUR / PHASES 剖析范围（格式见 bench/prof/prof.sh）
 #   SKIP_BUILD=1  不重新编译工作区的 tinymapper（缺失的二进制仍会编译）
 #   TM_LOG_LEVEL  tinymapper 的 --log-level（默认 3）；TM_LOG_LEVEL=4 测默认日志级别下的性能
+#   CAP_ADD       给 bench 等阶段的容器另加的 capability（空格分隔，默认无，与 BASELINE.md 可比）。CAP_ADD=NET_ADMIN 时容器里
+#                 root 运行的 tinymapper 能用 SO_{SND,RCV}BUFFORCE（UDP 缓冲不受 rmem_max 截断，U6）；FWDS 里同一二进制
+#                 加 +nocap 后缀（tinymapper+nocap、tinymapper-musl@<后缀>+nocap）在同一批里对照不带该权限的运行。
+#                 syscount、prof 阶段是 --privileged（root 带 CAP_NET_ADMIN）：CAP_ADD 不含 NET_ADMIN 时这两个阶段的 tinymapper
+#                 也去掉该权限启动（TM_NOCAP=1），同一次运行的各阶段 UDP 缓冲一致，也与 U6 以前的 syscall 计数可比
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 . "$ROOT/bench/lib.sh"
@@ -52,7 +57,7 @@ for s in $STAGES; do
     prof) need="$need $(echo "$PROF_RUNS" | tr ' ' '\n' | sed 's/:.*//')" ;;
   esac
 done
-for f in $(echo $need | tr ' ' '\n' | grep '^tinymapper' | sort -u); do
+for f in $(echo $need | tr ' ' '\n' | grep '^tinymapper' | sed 's/+nocap$//' | sort -u); do
   file=$(tm_file "$f"); v=${file#tinymapper-}; v=${v%%-*}
   case $f in
     *@*) [ -x "$ROOT/build/$file" ] || REF=${f#*@} "$ROOT/docker/build.sh" "$v" ;;
@@ -78,7 +83,7 @@ esac
   echo "时间：$(date '+%F %T %z')"
   echo "源码：$(git -C "$ROOT" describe --always --dirty)"
   echo "Docker VM：$(docker info -f '{{.KernelVersion}} {{.Architecture}} {{.NCPU}} vCPU {{.MemTotal}} B')"
-  echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
+  echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL CAP_ADD=${CAP_ADD:-} REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
   echo "二进制 sha256："
   (cd "$ROOT/build" && shasum -a 256 tinymapper-* "fwdbench-linux-$ARCH" || true)
   docker run --rm $IMG sh -c 'iperf3 --version | head -1; realm --version; rinetd --version'
@@ -89,14 +94,16 @@ COMMON=(--rm --init --network none --ulimit nofile=65536:65536
   --sysctl net.ipv4.tcp_tw_reuse=1 --sysctl net.ipv4.ip_local_port_range="21000 65535"
   -v "$ROOT/build:/build:ro" -v "$ROOT/bench:/bench:ro" -v "$R:/results"
   -e FWDBENCH="/build/fwdbench-linux-$ARCH" -e TM_LOG_LEVEL="$TM_LOG_LEVEL")
+for c in ${CAP_ADD:-}; do COMMON+=(--cap-add "$c"); done
+PRIV=(--privileged); case " ${CAP_ADD:-} " in *" NET_ADMIN "*) ;; *) PRIV+=(-e TM_NOCAP=1) ;; esac
 for s in $STAGES; do
   log "阶段 $s"
   case $s in
     bench) docker run "${COMMON[@]}" -e REPS="$REPS" -e DUR="$DUR" -e TESTS="$TESTS" -e FWDS="$FWDS" -e OUT=/results/raw.jsonl \
       $IMG bash /bench/bench.sh ;;
-    syscount) docker run "${COMMON[@]}" --privileged -e DUR="$SC_DUR" -e TESTS="$SC_TESTS" -e FWDS="$SC_FWDS" -e OUT=/results/syscount \
+    syscount) docker run "${COMMON[@]}" "${PRIV[@]}" -e DUR="$SC_DUR" -e TESTS="$SC_TESTS" -e FWDS="$SC_FWDS" -e OUT=/results/syscount \
       $PIMG bash /bench/syscount.sh ;;
-    prof) docker run "${COMMON[@]}" --privileged -e DUR="$PROF_DUR" -e RUNS="$PROF_RUNS" -e PHASES="$PHASES" -e OUT=/results/prof \
+    prof) docker run "${COMMON[@]}" "${PRIV[@]}" -e DUR="$PROF_DUR" -e RUNS="$PROF_RUNS" -e PHASES="$PHASES" -e OUT=/results/prof \
       $PIMG bash /bench/prof/prof.sh ;;
     *) log "未知阶段：$s"; exit 2 ;;
   esac || { rc=$?; log "阶段 ${s} 失败（退出码 ${rc}），结果目录：${R}"; exit $rc; }

@@ -231,6 +231,23 @@ int set_buf_size(int fd,int socket_buf_size)
 	return 0;
 }
 
+//UDP socket 的缓冲（U6）：*BUFFORCE 不受 net.core.rmem_max/wmem_max 截断，需要初始 user namespace 里的 CAP_NET_ADMIN
+//（内核用 capable() 检查：主机上的 root 有，user namespace 里的 root 没有）。
+//权限在进程运行期间不变，第一次失败（EPERM）后就只用 set_buf_size()，没有权限时每个新会话不多花 syscall
+int set_udp_buf_size(int fd,int size)
+{
+	static int force=1;
+	if(force)
+	{
+		if(setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &size, sizeof(size))==0&&
+			setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size))==0)
+			return 0;
+		mylog(log_debug,"SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (%s), UDP socket buffers are capped by net.core.rmem_max/wmem_max\n",get_sock_error());
+		force=0;
+	}
+	return set_buf_size(fd,size);
+}
+
 void myexit(int a)
 {
     if(enable_log_color)
@@ -775,7 +792,12 @@ int address_t::new_connected_udp_fd()
 		mylog(log_warn, "create udp_fd error\n");
 		return -1;
 	}
-	set_buf_size(new_udp_fd,socket_buf_size);
+	//会话 socket 只在给了 --sock-buf 时才用 *BUFFORCE（D38 修订）：默认的 1 MiB 仍按 rmem_max/wmem_max 截断，
+	//否则会话越多、持续过载时排队的内存与时延越大（反向 32 流满载 -13%，128 MB 路由器的 udp_mem[0] 约 11 MiB）
+	if(sock_buf_explicit)
+		set_udp_buf_size(new_udp_fd,socket_buf_size);
+	else
+		set_buf_size(new_udp_fd,socket_buf_size);
 
 	mylog(log_debug, "created new udp_fd %d\n", new_udp_fd);
 	int ret = connect(new_udp_fd, (struct sockaddr *) &inner, get_len());

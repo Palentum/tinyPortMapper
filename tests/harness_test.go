@@ -4,7 +4,7 @@
 //
 //	TINYMAPPER_BIN    被测 tinymapper 可执行文件（必填）
 //	TPM_SLOW=1        运行耗时超过约 60 s 的用例（TCP/UDP 空闲超时、TCP 上游建连超时）
-//	TPM_IN_CONTAINER=1 允许修改 /etc/hosts 的用例运行（只应由 tests/run.sh 在容器中设置）
+//	TPM_IN_CONTAINER=1 允许修改 /etc/hosts 的用例运行，并要求测试进程有 CAP_NET_ADMIN（needNetAdmin）（只应由 tests/run.sh 在容器中设置）
 //	TPM_VARIANT       被测构建的 libc（glibc 或 musl），用于只在某一变体上预期失败的已知缺陷
 package tests
 
@@ -38,6 +38,9 @@ var (
 func TestMain(m *testing.M) {
 	if spec := os.Getenv(epollAddFailEnv); spec != "" {
 		execEpollAddFail(spec)
+	}
+	if os.Getenv(noNetAdminEnv) != "" {
+		execNoNetAdmin()
 	}
 	mapperBin = os.Getenv("TINYMAPPER_BIN")
 	if mapperBin == "" || runtime.GOOS != "linux" {
@@ -282,6 +285,113 @@ func startMapperEpollAddFail(t testing.TB, lo, hi int, wait []listenPoint, args 
 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d", epollAddFailEnv, lo, hi))
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)
+}
+
+// U6：tinymapper 有 CAP_NET_ADMIN 时用 SO_SNDBUFFORCE/SO_RCVBUFFORCE 设 UDP socket 缓冲。tests/run.sh 给容器加了这项能力，以 root
+// 运行的测试进程直接启动的 tinymapper 也有。startMapperNoNetAdmin 以环境变量 noNetAdminEnv 重新执行测试二进制自身，TestMain 见到它
+// 就不跑测试，改由 execNoNetAdmin 在当前线程上把 CAP_NET_ADMIN 从 bounding 集与 inheritable 集里去掉后 exec tinymapper：root 执行
+// 没有文件能力的程序时，新的 permitted、effective 集为 inheritable ∪ bounding，所以 tinymapper 仍以 root 运行、只少这一项能力（与
+// 默认能力集的 Docker 容器里以 root 运行相同）。不改用 uid 65534（SysProcAttr.Credential）：uid 不同时读 /proc/<pid>/fd 的链接要过
+// ptrace_may_access，Docker 默认能力集里没有 CAP_SYS_PTRACE，listening、lookupSockBuf 都认不出 tinymapper 的 socket；同为 root 时
+// 测试进程的 permitted 集是 tinymapper 的超集（cap_ptrace_access_check），照常可读。bounding 集与 capset 都只作用于调用线程，所以
+// 锁定线程后在同一线程上 exec
+const noNetAdminEnv = "TPM_NO_NET_ADMIN"
+
+const capNetAdmin = 12 // CAP_NET_ADMIN 在能力位图中的位号
+
+// execNoNetAdmin 在重新执行的测试二进制里运行：os.Args[1:] 是 tinymapper 的 argv。成功时不返回
+func execNoNetAdmin() {
+	const (
+		prCapbsetDrop = 24         // PR_CAPBSET_DROP
+		capVersion3   = 0x20080522 // _LINUX_CAPABILITY_VERSION_3
+	)
+	fail := func(format string, a ...any) {
+		fmt.Fprintf(os.Stderr, "去掉 CAP_NET_ADMIN 启动失败："+format+"\n", a...)
+		os.Exit(127)
+	}
+	if len(os.Args) < 2 {
+		fail("参数 %q 无效", os.Args)
+	}
+	runtime.LockOSThread()
+	// 非 root 没有 CAP_SETPCAP，返回 EPERM；非 root 执行没有文件能力的程序本来就得不到能力，由 startMapperNoNetAdmin 核对 CapEff
+	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prCapbsetDrop, capNetAdmin, 0); e != 0 && os.Getuid() == 0 {
+		fail("prctl(PR_CAPBSET_DROP)：%v", e)
+	}
+	hdr := struct {
+		version uint32
+		pid     int32
+	}{capVersion3, 0}
+	var data [2]struct{ effective, permitted, inheritable uint32 } // data[0] 为能力 0–31
+	if _, _, e := syscall.RawSyscall(syscall.SYS_CAPGET, uintptr(unsafe.Pointer(&hdr)), uintptr(unsafe.Pointer(&data[0])), 0); e != 0 {
+		fail("capget：%v", e)
+	}
+	data[0].inheritable &^= 1 << capNetAdmin // ambient 集随之去掉这一位（内核保证 ambient ⊆ permitted ∩ inheritable）
+	if _, _, e := syscall.RawSyscall(syscall.SYS_CAPSET, uintptr(unsafe.Pointer(&hdr)), uintptr(unsafe.Pointer(&data[0])), 0); e != 0 {
+		fail("capset：%v", e)
+	}
+	err := syscall.Exec(os.Args[1], os.Args[1:], os.Environ())
+	fail("exec %s：%v", os.Args[1], err)
+}
+
+// startMapperNoNetAdmin 同 startMapper，但 tinymapper 没有 CAP_NET_ADMIN；wait 中的监听就绪时已 exec 成 tinymapper，随即核对它的 CapEff
+func startMapperNoNetAdmin(t testing.TB, wait []listenPoint, args ...string) *mapper {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "tinymapper.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd.Env = append(os.Environ(), noNetAdminEnv+"=1")
+	cmd.Stdout, cmd.Stderr = f, f
+	m := runMapper(t, cmd, logPath, wait)
+	if hasNetAdmin(t, m.pid()) {
+		t.Fatalf("tinymapper（pid %d）仍有 CAP_NET_ADMIN（CapEff=%#x）", m.pid(), capEff(t, m.pid()))
+	}
+	return m
+}
+
+// capEff 返回进程 pid 的有效能力集（/proc/<pid>/status 的 CapEff，十六进制位图；任何进程都可读，不经 ptrace 检查）
+func capEff(t testing.TB, pid int) uint64 {
+	t.Helper()
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/status", pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(string(data), "\n") {
+		if v, ok := strings.CutPrefix(line, "CapEff:"); ok {
+			c, err := strconv.ParseUint(strings.TrimSpace(v), 16, 64)
+			if err != nil {
+				t.Fatalf("/proc/%d/status 的 CapEff 无法解析：%q", pid, line)
+			}
+			return c
+		}
+	}
+	t.Fatalf("/proc/%d/status 中没有 CapEff", pid)
+	return 0
+}
+
+func hasNetAdmin(t testing.TB, pid int) bool {
+	t.Helper()
+	return capEff(t, pid)&(1<<capNetAdmin) != 0
+}
+
+// needNetAdmin 用于要求 tinymapper 有 CAP_NET_ADMIN 的用例：测试进程没有这项能力时，容器中（TPM_IN_CONTAINER=1）判为失败
+// （tests/run.sh 应以 --cap-add NET_ADMIN 启动容器），否则跳过
+func needNetAdmin(t testing.TB) {
+	t.Helper()
+	if hasNetAdmin(t, os.Getpid()) {
+		return
+	}
+	if os.Getenv("TPM_IN_CONTAINER") == "1" {
+		t.Fatalf("测试进程没有 CAP_NET_ADMIN（CapEff=%#x）：tests/run.sh 应以 --cap-add NET_ADMIN 启动容器", capEff(t, os.Getpid()))
+	}
+	t.Skip("测试进程没有 CAP_NET_ADMIN（在容器中以 root 运行时由 tests/run.sh 的 --cap-add NET_ADMIN 提供），跳过")
 }
 
 // startupFDs 不注入故障启动一次 tinymapper，返回它就绪后打开的 fd 数 n，并要求这些 fd 恰好是 0..n-1：

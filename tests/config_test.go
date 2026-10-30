@@ -387,6 +387,9 @@ func TestConfigUDPOnly(t *testing.T) {
 	}
 }
 
+// udpListenBufFatal 是 --udp-listen-buf 的值越界或不是数字时的 fatal 行
+const udpListenBufFatal = "udp-listen-buf value must be between 10 and 10240 (kbyte)"
+
 // 非法配置：进程以非零状态退出并给出原因
 func TestConfigInvalid(t *testing.T) {
 	t.Parallel()
@@ -430,6 +433,15 @@ func TestConfigInvalid(t *testing.T) {
 		{"cli_listen_not_local", []string{"-l", "192.0.2.1:80", "-r", r1, "-t"}, "", "bind failed"},
 		{"cli_listen_busy", []string{"-l", busy.Addr().String(), "-r", r1, "-t"}, "", "bind failed"},
 		{"cli_sock_buf", []string{"-l", l, "-r", r1, "-t", "--sock-buf", "5"}, "", "sock-buf value"},
+		// U6：--udp-listen-buf 只接受 10–10240（KiB）；边界值 10、10240 的生效见 TestUDPSockBuf
+		{"cli_udp_listen_buf_9", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "9"}, "", udpListenBufFatal},
+		{"cli_udp_listen_buf_10241", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "10241"}, "", udpListenBufFatal},
+		{"cli_udp_listen_buf_abc", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "abc"}, "", udpListenBufFatal},
+		{"cli_udp_listen_buf_empty", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", ""}, "", udpListenBufFatal},
+		// 没给值：getopt_long 把下一个参数 -u 当作值；在最后一个参数时由 getopt_long 报错（glibc、musl 的措辞都含这一句）
+		{"cli_udp_listen_buf_no_value", []string{"-l", l, "-r", r1, "--udp-listen-buf", "-u"}, "", udpListenBufFatal},
+		{"cli_udp_listen_buf_missing", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf"}, "", "requires an argument"},
+		{"toml_udp_listen_buf_9", []string{"-c", "CFG", "--udp-listen-buf", "9"}, ep("use_udp = true\n"), udpListenBufFatal},
 		{"cli_log_level", []string{"--log-level", "9", "-l", l, "-r", r1, "-t"}, "", "invalid log_level"},
 		{"cli_config_missing", []string{"-c", filepath.Join(dir, "missing.toml")}, "", "cannot be accessed"},
 		{"cli_config_dir", []string{"-c", dir}, "", "must be a regular file"},
