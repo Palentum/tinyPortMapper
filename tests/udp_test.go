@@ -706,16 +706,27 @@ type udpSend struct {
 // 小包 truesize 为 960 字节，65527 字节的 IPv6 包约 66 KiB
 func queueUDP(t testing.TB, m *mapper, listen string, sends []udpSend) {
 	t.Helper()
+	queueListen(t, m, listen, len(sends), func(i int) int { return len(sends[i].msg) }, func(i int) error {
+		_, err := sends[i].c.Write(sends[i].msg)
+		return err
+	})
+}
+
+// queueListen 是 queueUDP 的通用写法：暂停期间依次调 send(0..n-1) 发出一个包（size(i) 字节，只用于报错），每个都等它进了监听 socket
+// listen 的接收队列再发下一个。U5 的 GSO 发送也走这里：开了 UDP_GRO 的监听 socket 整包收下一个合并包，没开的拆成多个数据报入队，
+// 两种情况 rqueue 都严格增大
+func queueListen(t testing.TB, m *mapper, listen string, n int, size func(i int) int, send func(i int) error) {
+	t.Helper()
 	remote := "0.0.0.0:0"
 	if strings.HasPrefix(listen, "[") {
 		remote = "[::]:0"
 	}
 	q := lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, "UDP 监听 socket", listen, remote)
 	drops0 := q.drops
-	for i, s := range sends {
+	for i := range n {
 		prev := q.rqueue
-		if _, err := s.c.Write(s.msg); err != nil {
-			t.Fatalf("暂停期间第 %d 个包（%d 字节）发送失败：%v", i, len(s.msg), err)
+		if err := send(i); err != nil {
+			t.Fatalf("暂停期间第 %d 个包（%d 字节）发送失败：%v", i, size(i), err)
 		}
 		eventually(t, ioTimeout, time.Millisecond, func() error {
 			var err error
@@ -724,15 +735,15 @@ func queueUDP(t testing.TB, m *mapper, listen string, sends []udpSend) {
 			}
 			if q.drops != drops0 {
 				t.Fatalf("监听 socket 丢了 %d 个包（第 %d 个包 %d 字节；接收队列 %d 字节，rcvbuf %d）：暂停期间排队的包超出了接收缓冲",
-					q.drops-drops0, i, len(s.msg), q.rqueue, q.rcv)
+					q.drops-drops0, i, size(i), q.rqueue, q.rcv)
 			}
 			if q.rqueue <= prev {
-				return fmt.Errorf("第 %d 个包（%d 字节）还没进监听 socket 的接收队列（%d 字节）", i, len(s.msg), q.rqueue)
+				return fmt.Errorf("第 %d 个包（%d 字节）还没进监听 socket 的接收队列（%d 字节）", i, size(i), q.rqueue)
 			}
 			return nil
 		})
 	}
-	t.Logf("暂停期间 %d 个包已排进监听 socket：接收队列 %d 字节，rcvbuf %d", len(sends), q.rqueue, q.rcv)
+	t.Logf("暂停期间 %d 个包已排进监听 socket：接收队列 %d 字节，rcvbuf %d", n, q.rqueue, q.rcv)
 }
 
 // resume 让 pause 停下的 tinymapper 继续运行
@@ -1202,30 +1213,40 @@ type udpReply struct {
 // 队列满时内核静默丢包（sk_drops 加一），这里直接失败
 func queueReplies(t testing.TB, m *mapper, replies []udpReply) {
 	t.Helper()
+	queueSessions(t, m, len(replies), func(i int) (string, string, int) {
+		return replies[i].session, replies[i].be.addr, len(replies[i].msg)
+	}, func(i int) { replies[i].be.sendTo(t, replies[i].session, replies[i].msg) })
+}
+
+// queueSessions 是 queueReplies 的通用写法：第 i 个回包由 send(i) 从后端地址 from 发往会话 socket session（at(i) 给出两者与包长），
+// 每个都等它进了那个会话 socket 的接收队列再发下一个。U5 的后端用 GSO 发回包也走这里（会话 socket 开了 UDP_GRO 时整包入队）
+func queueSessions(t testing.TB, m *mapper, n int, at func(i int) (session, from string, size int), send func(i int)) {
+	t.Helper()
 	q := map[string]sockBuf{}
-	for i, r := range replies {
-		prev, ok := q[r.session]
+	for i := range n {
+		session, from, size := at(i)
+		prev, ok := q[session]
 		if !ok {
-			prev = lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, "会话 socket", r.session, r.be.addr)
+			prev = lookupSockBuf(t, m.pid(), syscall.IPPROTO_UDP, "会话 socket", session, from)
 		}
-		r.be.sendTo(t, r.session, r.msg)
+		send(i)
 		eventually(t, ioTimeout, time.Millisecond, func() error {
-			cur, err := sockDiag(syscall.IPPROTO_UDP, r.session, r.be.addr)
+			cur, err := sockDiag(syscall.IPPROTO_UDP, session, from)
 			if err != nil {
 				return err
 			}
 			if cur.drops != prev.drops {
 				t.Fatalf("会话 socket %s 丢了 %d 个包（第 %d 个回包 %d 字节；接收队列 %d 字节，rcvbuf %d）：暂停期间排队的回包超出了接收缓冲",
-					r.session, cur.drops-prev.drops, i, len(r.msg), cur.rqueue, cur.rcv)
+					session, cur.drops-prev.drops, i, size, cur.rqueue, cur.rcv)
 			}
 			if cur.rqueue <= prev.rqueue {
-				return fmt.Errorf("第 %d 个回包（%d 字节）还没进会话 socket %s 的接收队列（%d 字节）", i, len(r.msg), r.session, cur.rqueue)
+				return fmt.Errorf("第 %d 个回包（%d 字节）还没进会话 socket %s 的接收队列（%d 字节）", i, size, session, cur.rqueue)
 			}
-			q[r.session] = cur
+			q[session] = cur
 			return nil
 		})
 	}
-	t.Logf("暂停期间 %d 个回包已排进 %d 个会话 socket", len(replies), len(q))
+	t.Logf("暂停期间 %d 个回包已排进 %d 个会话 socket", n, len(q))
 }
 
 // interleaveOrder 返回 n 个客户端各 k 个包的排队顺序：第 j 个包来自客户端 order[j]。random 时按固定种子随机交错，否则依次轮转

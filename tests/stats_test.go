@@ -39,6 +39,19 @@ type tcpStat struct {
 type udpStat struct {
 	sessions                                                      int
 	total, upPkts, upBytes, downPkts, downBytes, upDrop, downDrop uint64
+	// U5（D42）：只有给了 --udp-gro 时行末才有这四项，gro 记录这一行是否带着它们
+	gro                                            bool
+	upGRO, downGRO, upGSOFallback, downGSOFallback uint64
+}
+
+// udpStatLine 按 sigusr1_cb 的格式重新写出一行 udp 统计（从 "stats rule" 起），解析后与原行逐字节比较
+func udpStatLine(idx int, u udpStat) string {
+	s := fmt.Sprintf("stats rule %d udp: sessions=%d total=%d up_pkts=%d up_bytes=%d down_pkts=%d down_bytes=%d up_drop=%d down_drop=%d",
+		idx, u.sessions, u.total, u.upPkts, u.upBytes, u.downPkts, u.downBytes, u.upDrop, u.downDrop)
+	if u.gro {
+		s += fmt.Sprintf(" up_gro=%d down_gro=%d up_gso_fallback=%d down_gso_fallback=%d", u.upGRO, u.downGRO, u.upGSOFallback, u.downGSOFallback)
+	}
+	return s
 }
 
 type poolStat struct {
@@ -74,6 +87,17 @@ func parseStatsBlock(block []string) (statsDump, error) {
 			if _, err := fmt.Sscanf(s, "stats rule %d udp: sessions=%d total=%d up_pkts=%d up_bytes=%d down_pkts=%d down_bytes=%d up_drop=%d down_drop=%d",
 				&idx, &u.sessions, &u.total, &u.upPkts, &u.upBytes, &u.downPkts, &u.downBytes, &u.upDrop, &u.downDrop); err != nil {
 				return d, fmt.Errorf("解析 udp 统计行失败：%q：%w", line, err)
+			}
+			if i := strings.Index(s, " up_gro="); i >= 0 {
+				u.gro = true
+				if _, err := fmt.Sscanf(s[i:], " up_gro=%d down_gro=%d up_gso_fallback=%d down_gso_fallback=%d",
+					&u.upGRO, &u.downGRO, &u.upGSOFallback, &u.downGSOFallback); err != nil {
+					return d, fmt.Errorf("解析 udp 统计行的 GRO 计数失败：%q：%w", line, err)
+				}
+			}
+			// 不带 --udp-gro 时必须与 U5 之前的行逐字节相同，带时只在末尾多四项（D42）
+			if want := udpStatLine(idx, u); s != want {
+				return d, fmt.Errorf("udp 统计行格式不符：%q，期望 %q", s, want)
 			}
 			d.udp[idx] = u
 		case strings.Contains(line, "stats pool: "):
@@ -159,6 +183,14 @@ func (m *mapper) statsAfterSignal(t testing.TB) statsDump {
 		return nil
 	})
 	checkPoolInvariants(t, dump)
+	// U5（D42）：udp 行带不带 GRO 四项只取决于 --udp-gro（以及它是否因第一个监听 socket 开不了 UDP_GRO 而整体关闭，groOff）
+	want := slices.Contains(m.cmd.Args, "--udp-gro") && !m.groOff
+	for idx, s := range dump.udp {
+		if s.gro != want {
+			t.Errorf("规则 %d 的 udp 统计行%s GRO 计数，期望%s（--udp-gro %v）", idx, map[bool]string{true: "带", false: "不带"}[s.gro],
+				map[bool]string{true: "带", false: "不带"}[want], want)
+		}
+	}
 	return dump
 }
 
@@ -850,10 +882,10 @@ func init() {
 // sendmmsg 的系统调用号：syscall 包的 amd64 表里没有 SYS_SENDMMSG
 var sendmmsgNR = map[string]uint32{"amd64": 307, "arm64": 269}
 
-// sendtoFailFilter 返回 BPF 程序：arch 相符、nr 为 sendto/sendmsg/sendmmsg、lo ≤ args[0] < hi 时返回 SECCOMP_RET_ERRNO|EAGAIN，
-// 否则放行。
+// sendtoFailFilter 返回 BPF 程序：arch 相符、nr 为 sendto/sendmsg/sendmmsg、lo ≤ args[0] < hi 时返回 SECCOMP_RET_ERRNO|errno
+// （默认 EAGAIN；U5 的用例另用 ECONNREFUSED、EPERM 这类不是 GSO 本身的错误），否则放行。
 // 只支持小端架构（取 u64 fd 的低 32 位）
-func sendtoFailFilter(arch, lo, hi uint32) []syscall.SockFilter {
+func sendtoFailFilter(arch, lo, hi uint32, errno syscall.Errno) []syscall.SockFilter {
 	const (
 		ld   = syscall.BPF_LD | syscall.BPF_W | syscall.BPF_ABS
 		jeq  = syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K
@@ -874,11 +906,11 @@ func sendtoFailFilter(arch, lo, hi uint32) []syscall.SockFilter {
 		jump(jeq, uint32(syscall.SYS_SENDTO), 2, 0),  // 3：sendto → 6
 		jump(jeq, uint32(syscall.SYS_SENDMSG), 1, 0), // 4：sendmsg → 6
 		jump(jeq, sendmmsgNR[runtime.GOARCH], 0, 4),  // 5：都不是 → 放行
-		stmt(ld, arg0),      // 6：fd
-		jump(jge, lo, 0, 2), // 7：fd<lo → 放行
-		jump(jge, hi, 1, 0), // 8：fd≥hi → 放行
-		stmt(ret, 0x00050000|uint32(syscall.EAGAIN)), // 9：SECCOMP_RET_ERRNO|EAGAIN
-		stmt(ret, 0x7fff0000),                        // 10：SECCOMP_RET_ALLOW
+		stmt(ld, arg0),                      // 6：fd
+		jump(jge, lo, 0, 2),                 // 7：fd<lo → 放行
+		jump(jge, hi, 1, 0),                 // 8：fd≥hi → 放行
+		stmt(ret, 0x00050000|uint32(errno)), // 9：SECCOMP_RET_ERRNO|errno
+		stmt(ret, 0x7fff0000),               // 10：SECCOMP_RET_ALLOW
 	}
 }
 
@@ -894,7 +926,8 @@ func execSendtoFail(spec string) {
 		os.Exit(127)
 	}
 	var lo, hi uint32
-	if _, err := fmt.Sscan(spec, &lo, &hi); err != nil || len(os.Args) < 2 {
+	errno := uint32(syscall.EAGAIN) // 可选的第三项
+	if n, _ := fmt.Sscan(spec, &lo, &hi, &errno); n < 2 || len(os.Args) < 2 {
 		fail("%s=%q 或参数 %q 无效", sendtoFailEnv, spec, os.Args)
 	}
 	arch, ok := auditArch[runtime.GOARCH]
@@ -905,7 +938,7 @@ func execSendtoFail(spec string) {
 	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prSetNoNewPrivs, 1, 0); e != 0 {
 		fail("prctl(PR_SET_NO_NEW_PRIVS)：%v", e)
 	}
-	filter := sendtoFailFilter(arch, lo, hi)
+	filter := sendtoFailFilter(arch, lo, hi, syscall.Errno(errno))
 	prog := syscall.SockFprog{Len: uint16(len(filter)), Filter: &filter[0]}
 	if _, _, e := syscall.RawSyscall(syscall.SYS_PRCTL, prSetSeccomp, seccompModeFilter, uintptr(unsafe.Pointer(&prog))); e != 0 {
 		fail("prctl(PR_SET_SECCOMP)：%v", e)
@@ -916,6 +949,12 @@ func execSendtoFail(spec string) {
 
 // startMapperSendtoFail 同 startMapper，但 tinymapper 里 fd 在 [lo, hi) 内的 sendto、sendmsg、sendmmsg 都返回 EAGAIN；hi 为 0 表示不设上限
 func startMapperSendtoFail(t testing.TB, lo, hi int, wait []listenPoint, args ...string) *mapper {
+	t.Helper()
+	return startMapperSendFail(t, lo, hi, syscall.EAGAIN, wait, args...)
+}
+
+// startMapperSendFail 同 startMapperSendtoFail，但返回的是 errno
+func startMapperSendFail(t testing.TB, lo, hi int, errno syscall.Errno, wait []listenPoint, args ...string) *mapper {
 	t.Helper()
 	if _, ok := auditArch[runtime.GOARCH]; !ok {
 		t.Skipf("seccomp 故障注入只支持 amd64、arm64，当前为 %s", runtime.GOARCH)
@@ -934,7 +973,7 @@ func startMapperSendtoFail(t testing.TB, lo, hi int, wait []listenPoint, args ..
 	}
 	defer f.Close()
 	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
-	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d", sendtoFailEnv, lo, hi))
+	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d %d", sendtoFailEnv, lo, hi, int(errno)))
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)
 }

@@ -120,6 +120,8 @@ extern int about_to_exit;
 
 extern int socket_buf_size;
 extern int sock_buf_explicit;
+extern int udp_gro;
+extern int listen_fd_buf_size;
 
 
 
@@ -268,6 +270,7 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	forward_rule_t *owner;
 	int remote_index;
 	int batch_group;//入向这一批里本会话的组号（U3），批外恒为 -1
+	unsigned char gso_off[2];//U5（D45）：这个会话 [0] 入向（会话 socket）、[1] 回程（监听 socket 发往它）的 GSO 失败过，此后合并包逐个数据报发送
 	//u64_t last_active_time;
 	udp_pair_t()
 	{
@@ -275,6 +278,7 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 		owner=0;
 		remote_index=-1;
 		batch_group=-1;
+		gso_off[0]=gso_off[1]=0;
 	}
 	//int not_used=0;
 };

@@ -1,8 +1,8 @@
-# 剖析镜像：tinymapper-bench:1 加 strace、binutils（perf 源码行归因用 addr2line）和 perf。
+# 剖析镜像：tinymapper-bench:2 加 strace、binutils（perf 源码行归因用 addr2line）和 perf。
 # perf 优先装与 Docker VM 内核匹配的 linux-tools-<KVER>，找不到时退回 linux-tools-generic。
 # 构建（bench/run.sh 自动执行）：
-#   docker build --build-arg KVER="$(docker info -f '{{.KernelVersion}}')" -t tinymapper-bench-prof:1 - < bench/prof/Dockerfile
-FROM tinymapper-bench:1
+#   docker build --build-arg KVER="$(docker info -f '{{.KernelVersion}}')" -t tinymapper-bench-prof:2 - < bench/prof/Dockerfile
+FROM tinymapper-bench:2
 ARG KVER=
 RUN apt-get update && apt-get install -y --no-install-recommends strace binutils \
     && (apt-get install -y --no-install-recommends "linux-tools-$KVER" \

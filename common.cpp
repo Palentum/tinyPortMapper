@@ -233,19 +233,29 @@ int set_buf_size(int fd,int socket_buf_size)
 
 //UDP socket 的缓冲（U6）：*BUFFORCE 不受 net.core.rmem_max/wmem_max 截断，需要初始 user namespace 里的 CAP_NET_ADMIN
 //（内核用 capable() 检查：主机上的 root 有，user namespace 里的 root 没有）。
-//权限在进程运行期间不变，第一次失败（EPERM）后就只用 set_buf_size()，没有权限时每个新会话不多花 syscall
+//权限在进程运行期间不变，第一次失败（EPERM）后就只用普通选项，没有权限时每个新会话不多花 syscall
+static int udp_buf_force=1;
+//一个方向：force 时先试 *BUFFORCE；普通选项失败同 set_buf_size，退出
+static void set_udp_buf_dir(int fd,int snd,int size,int force)
+{
+	if(force&&udp_buf_force)
+	{
+		if(setsockopt(fd, SOL_SOCKET, snd?SO_SNDBUFFORCE:SO_RCVBUFFORCE, &size, sizeof(size))==0)
+			return;
+		mylog(log_debug,"SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (%s), UDP socket buffers are capped by net.core.rmem_max/wmem_max\n",get_sock_error());
+		udp_buf_force=0;
+	}
+	if(setsockopt(fd, SOL_SOCKET, snd?SO_SNDBUF:SO_RCVBUF, &size, sizeof(size))<0)
+	{
+		mylog(log_fatal,"%s fail  socket_buf_size=%d  errno=%s\n",snd?"SO_SNDBUF":"SO_RCVBUF",size,get_sock_error());
+		myexit(1);
+	}
+}
 int set_udp_buf_size(int fd,int size)
 {
-	static int force=1;
-	if(force)
-	{
-		if(setsockopt(fd, SOL_SOCKET, SO_SNDBUFFORCE, &size, sizeof(size))==0&&
-			setsockopt(fd, SOL_SOCKET, SO_RCVBUFFORCE, &size, sizeof(size))==0)
-			return 0;
-		mylog(log_debug,"SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (%s), UDP socket buffers are capped by net.core.rmem_max/wmem_max\n",get_sock_error());
-		force=0;
-	}
-	return set_buf_size(fd,size);
+	set_udp_buf_dir(fd,1,size,1);
+	set_udp_buf_dir(fd,0,size,1);
+	return 0;
 }
 
 void myexit(int a)
@@ -793,11 +803,18 @@ int address_t::new_connected_udp_fd()
 		return -1;
 	}
 	//会话 socket 只在给了 --sock-buf 时才用 *BUFFORCE（D38 修订）：默认的 1 MiB 仍按 rmem_max/wmem_max 截断，
-	//否则会话越多、持续过载时排队的内存与时延越大（反向 32 流满载 -13%，128 MB 路由器的 udp_mem[0] 约 11 MiB）
-	if(sock_buf_explicit)
-		set_udp_buf_size(new_udp_fd,socket_buf_size);
-	else
-		set_buf_size(new_udp_fd,socket_buf_size);
+	//否则会话越多、持续过载时排队的内存与时延越大（反向 32 流满载 -13%，128 MB 路由器的 udp_mem[0] 约 11 MiB）。
+	//--udp-gro 且监听缓冲更大时，发送缓冲取监听缓冲的大小、有权限时越过截断（D44）：一次入向回调可能读出监听队列里积压的
+	//全部合并包交给这个会话，真实网卡到发完才释放 wmem，sndbuf 装不下就 EAGAIN 丢掉整组。代价是出口持续过载时这个会话在 qdisc
+	//里常驻约 sndbuf 的数据（发送方向不计入 udp_mem）
+	int snd=socket_buf_size,snd_force=sock_buf_explicit;
+	if(udp_gro&&listen_fd_buf_size>socket_buf_size)
+	{
+		snd=listen_fd_buf_size;
+		snd_force=1;
+	}
+	set_udp_buf_dir(new_udp_fd,1,snd,snd_force);
+	set_udp_buf_dir(new_udp_fd,0,socket_buf_size,sock_buf_explicit);
 
 	mylog(log_debug, "created new udp_fd %d\n", new_udp_fd);
 	int ret = connect(new_udp_fd, (struct sockaddr *) &inner, get_len());

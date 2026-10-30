@@ -31,6 +31,7 @@ IPI_EV=""
 for e in sched:sched_waking ipi:ipi_raise ipi:ipi_send_cpu ipi:ipi_send_cpumask net:net_dev_xmit; do
   on fwd "$SUDO $PERF stat -e $e -- true >/dev/null 2>&1" && IPI_EV="$IPI_EV -e $e"
 done
+topo_up "$OUT/topo.txt" || exit 1
 start_backends || exit 1
 
 for spec in $RUNS; do

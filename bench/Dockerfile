@@ -1,6 +1,7 @@
-# 基准工具镜像：iperf3、jq、util-linux（taskset）、procps、rinetd 0.73、realm 2.9.6。
+# 基准工具镜像：iperf3、jq、util-linux（taskset）、procps、iproute2 与 ethtool（TOPO=veth 拓扑）、rinetd 0.73、realm 2.9.6。
 # 不含 tinymapper 与 fwdbench：两者在运行时从 build/ 只读挂载，改源码不需要重建镜像。
-# 构建（bench/run.sh 自动执行，无构建上下文）：docker build -t tinymapper-bench:1 - < bench/Dockerfile
+# 构建（bench/run.sh 自动执行，无构建上下文）：docker build -t tinymapper-bench:2 - < bench/Dockerfile
+# 标签随内容变化递增（:1 没有 iproute2/ethtool），bench/prof/Dockerfile 的 FROM 同步修改
 # realm 的 sha256 与 GitHub release 资产摘要一致；bench/host.sh 下载 realm 时也从这里读取。
 FROM ubuntu:24.04 AS fetch
 ARG RINETD_SHA256=da1fa70e75c2e5906ba55bb05a71da07d1e2a1cc4de2aa9bd30b1f753d8c345a
@@ -28,6 +29,6 @@ RUN a=$(uname -m) && case $a in \
 
 FROM ubuntu:24.04
 ENV DEBIAN_FRONTEND=noninteractive
-RUN apt-get update && apt-get install -y --no-install-recommends iperf3 jq util-linux procps \
+RUN apt-get update && apt-get install -y --no-install-recommends iperf3 jq util-linux procps iproute2 ethtool \
     && rm -rf /var/lib/apt/lists/*
 COPY --from=fetch /rinetd/rinetd /realm/realm /usr/local/bin/

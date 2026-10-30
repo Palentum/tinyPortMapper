@@ -142,6 +142,7 @@ type mapper struct {
 	done    chan struct{}
 	exitErr error
 	stopped sync.Once
+	groOff  bool // U5：--udp-gro 因第一个监听 socket 开不了 UDP_GRO 而整体关闭，统计行不带 GRO 计数（statsAfterSignal 据此核对）
 }
 
 // startMapper 启动 tinymapper，等待 wait 中的监听全部就绪；测试结束时自动停止。

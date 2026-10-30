@@ -2,7 +2,7 @@
 # 对 prof.sh 保存的 tinymapper perf.data 做源文件/源码行级归因（静态二进制含调试信息，内联代码按最内层源码位置归属）
 # 在 tinymapper-bench-prof 镜像内运行，/build 需挂载录制时的同一批二进制：
 #   docker run --rm -v "$PWD/build:/build:ro" -v "$PWD/bench:/bench:ro" -v "$PWD/bench/results/<时间戳>/prof:/d" \
-#     -e D=/d tinymapper-bench-prof:1 bash /bench/prof/analyze.sh
+#     -e D=/d tinymapper-bench-prof:2 bash /bench/prof/analyze.sh
 set -u
 . "$(dirname "$0")/../lib.sh"
 D=${D:-/results/prof}

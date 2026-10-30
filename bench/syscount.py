@@ -3,8 +3,11 @@
 
 "不含等待" = 总计减去 epoll_pwait 与 poll/select：等待类调用次数随负载变化，其余都是结构性次数，适合做回归门槛。
 单位：rr = 每个请求/响应对（tcp_rr、udp_rr 都取客户端报告的 ops），crr = 每个连接，udp = 转发器发出的每个包
-（fwd 上 /proc/net/snmp 的 OutDatagrams 增量，发送方与转发器同机时再减去发送方的发包数；发送方正向为客户端，
+（fwd 上 /proc/net/snmp 的 OutDatagrams 增量，发送方与转发器同机且同一网络命名空间时再减去发送方的发包数；发送方正向为客户端，
 _r 为后端），bw = 每 GB（iperf3 服务端收到的 1e9 字节）。
+udp 有 <前缀>.stat.stats.txt（被测的是 tinymapper，lib.sh 的 count_phase 在 perf 窗口前后各取一次 SIGUSR1 统计）时单位改用
+up_pkts+down_pkts 的增量：tinymapper 按数据报计，而 GSO 一次发出多个数据报时 OutDatagrams 只加 1（udp_send_skb）；
+OutDatagrams 的换算仍记在 JSON 的 snmp_units 里，两者相差超过 0.5% 时在明细里注明。
 
 用法：python3 -I bench/syscount.py <目录> [--json <输出.json>]   # markdown 表格打印到标准输出
 JSON 每个 (转发器, 负载) 一行、键序固定，便于 diff。
@@ -52,16 +55,30 @@ def snmp(p):
     return pairs, {r: f"# {r}_on_fwd=0" not in text for r in ("cli", "srv")}
 
 
+def tm_pkts(p):
+    """tinymapper SIGUSR1 统计前后两行的 up_pkts+down_pkts 增量；文件缺失或不足两行时返回 None。"""
+    if not p.exists():
+        return None
+    rows = [dict(kv.split("=", 1) for kv in l.split() if "=" in kv) for l in p.read_text().splitlines() if "up_pkts=" in l]
+    if len(rows) < 2:
+        return None
+    return sum(int(rows[-1][k]) - int(rows[0][k]) for k in ("up_pkts", "down_pkts"))
+
+
 def per_unit(pre, wl, phase="stat"):
-    """返回 (单位数, 单位名, 吞吐)。"""
+    """返回 (单位数, 单位名, 吞吐, 附加字段)。"""
     c = json.loads(Path(f"{pre}.{phase}.client.json").read_text())
     if wl.startswith(("tcp_rr", "tcp_crr", "udp_rr")):
-        return c["ops"], "conn" if wl.startswith("tcp_crr") else "op", c["ops_per_sec"]
+        return c["ops"], "conn" if wl.startswith("tcp_crr") else "op", c["ops_per_sec"], {}
     if wl.startswith("udp"):
         (b, a), same = snmp(Path(f"{pre}.{phase}.snmp.txt"))
         sender = "srv" if wl.endswith("_r") else "cli"
-        return a["OutDatagrams"] - b["OutDatagrams"] - (c["sent_pkts"] if same[sender] else 0), "pkt", c["recv_kpps"] * 1e3
-    return c["bytes"] / 1e9, "GB", c["gbps"]
+        n = a["OutDatagrams"] - b["OutDatagrams"] - (c["sent_pkts"] if same[sender] else 0)
+        tm = tm_pkts(Path(f"{pre}.{phase}.stats.txt"))
+        if tm:
+            return tm, "pkt", c["recv_kpps"] * 1e3, {"units_src": "tm_stats", "snmp_units": n}
+        return n, "pkt", c["recv_kpps"] * 1e3, {}
+    return c["bytes"] / 1e9, "GB", c["gbps"], {}
 
 
 def analyze(d, fwd, wl):
@@ -69,7 +86,7 @@ def analyze(d, fwd, wl):
     ev = load_stat(Path(f"{pre}.stat.csv"))
     if not ev.get("raw_syscalls:sys_enter"):
         return None
-    n, unit, rate = per_unit(pre, wl)
+    n, unit, rate, extra = per_unit(pre, wl)
     enter = {k.split("sys_enter_")[1]: v for k, v in ev.items() if "sys_enter_" in k and v}
     fails = {k.split("sys_exit_")[1]: v for k, v in ev.items() if "sys_exit_" in k and v}
     used = {x for _, names in GROUPS for x in names}
@@ -84,6 +101,7 @@ def analyze(d, fwd, wl):
         "other": r(sum(other.values())), "other_detail": {k: r(v) for k, v in sorted(other.items())},
         "fail": r(sum(fails.values())), "fail_detail": {k: r(v) for k, v in sorted(fails.items())},
         "ctx_sw": round(ev["context-switches"] / n, 5),
+        **extra,
     }
 
 
@@ -122,7 +140,10 @@ def main():
     for x in runs:
         detail = ", ".join(f"{k}={v:.3f}" for k, v in x["fail_detail"].items()) or "无"
         other = ", ".join(f"{k}={v:.4f}" for k, v in x["other_detail"].items())
-        print(f"- `{x['fwd']}.{x['workload']}`：失败返回明细 {detail}" + (f"；其他 syscall：{other}" if other else ""))
+        units = ""
+        if x.get("units_src") == "tm_stats" and abs(x["snmp_units"] - x["units"]) > 0.005 * x["units"]:
+            units = f"；单位取 SIGUSR1 统计 {x['units']:,.0f} 个数据报，OutDatagrams 增量 {x['snmp_units']:,.0f}（GSO 每次发送只计 1）"
+        print(f"- `{x['fwd']}.{x['workload']}`：失败返回明细 {detail}" + (f"；其他 syscall：{other}" if other else "") + units)
     for n in bad:
         print(f"- `{n}`：没有有效的 perf 计数（见转发器主机上的 perf-stat.log）")
 

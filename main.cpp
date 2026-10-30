@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <netinet/tcp.h>
+#include <netinet/udp.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -22,6 +23,9 @@ typedef int i32_t;
 int disable_conn_clear=0;
 int disable_tcp_nodelay=0;
 int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
+//--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
+//（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
+int udp_gro=0;
 
 int max_pending_packet=0;
 
@@ -252,6 +256,21 @@ static const int udp_batch_max=64;//U1：一次 recvmmsg 最多收这么多包�
 //转发器跟不上时每轮回程是"积压会话数 × 本值"，取 64 时入向只剩约 1/6（同进程 TCP 的往返也随轮长变慢），取 16 时与 U4 之前相当
 static const int udp_return_quota=16;
 static const int udp_slot_len=2048;
+#ifndef UDP_SEGMENT
+#define UDP_SEGMENT 103
+#endif
+#ifndef UDP_GRO
+#define UDP_GRO 104
+#endif
+//U5：一次 GSO 发送最多这么多段。UDP_MAX_SEGMENTS 在 4.18–6.8 是 64、6.9 起 128（部分 LTS 已回移），按最小值；GRO 本身最多聚合 64 段
+static const int udp_gso_max_segs=64;
+//收包的 cmsg（UDP_GRO，int）与发包的 cmsg（UDP_SEGMENT，u16）共用这个大小；union 保证 cmsghdr 的对齐。
+//64 位 musl 的 cmsghdr 在 cmsg_len 旁有填充，内核读的是 size_t：只按字段名写，缓冲在 BSS 里，填充恒为 0
+union udp_ctrl_t
+{
+	cmsghdr hdr;
+	char buf[CMSG_SPACE(sizeof(int))];
+};
 //UDP 监听 socket 的入向批（U1、U3，D34）。每条消息两段 iov：2 KB 的槽（64 个连续排列，MTU 级的包只碰这里）加本消息自己的溢出区，
 //合计 max_data_len_udp；溢出区是 BSS，只有大于 2 KB 的包才碰到它的页，常驻内存随大包增长，最多约 4 MiB
 struct udp_batch_t
@@ -277,6 +296,32 @@ struct udp_batch_t
 	mmsghdr rout[udp_batch_max];//对监听 socket 的 sendmmsg 用，一次放一个规则的组；填充同 out，必须保持 0
 	iovec rout_iov[udp_batch_max][2];
 	int rn;
+	//U5（--udp-gro）：ctrl[i] 收槽 i 的 cmsg，in[i] 与 rin[i] 共用（槽 i 同一时刻只属于一方）；gso[i] 是收包时从中取出的段长，
+	//槽 i 里不是 GRO 合并包时为 0。out_ctrl/rout_ctrl 给发送条目挂 UDP_SEGMENT；seg 把一个合并包切开重发（udp_send_split），
+	//填充同 out，必须保持 0。udp_gro 为 0 时都不用
+	udp_ctrl_t ctrl[udp_batch_max];
+	int gso[udp_batch_max];
+	unsigned char roff[udp_batch_max];//回包所属会话收包时的 gso_off[1]（D45），按槽
+	udp_ctrl_t out_ctrl[udp_batch_max];
+	udp_ctrl_t rout_ctrl[udp_batch_max];
+	unsigned char rout_off[udp_batch_max];//rout 第 i 条的 roff，udp_send_group 关掉 GSO 时也改它
+	mmsghdr seg[udp_batch_max];
+	iovec seg_iov[udp_batch_max][2];
+	udp_ctrl_t seg_ctrl[udp_batch_max];
+	static void init_segment(udp_ctrl_t &c)
+	{
+		c.hdr.cmsg_level=SOL_UDP;
+		c.hdr.cmsg_type=UDP_SEGMENT;
+		c.hdr.cmsg_len=CMSG_LEN(sizeof(uint16_t));//内核要求恰好是这个长度，否则 EINVAL
+	}
+	void attach_ctrl()//第一个监听 socket 开了 UDP_GRO 之后调用一次
+	{
+		for(int i=0;i<udp_batch_max;i++)
+		{
+			in[i].msg_hdr.msg_control=rin[i].msg_hdr.msg_control=&ctrl[i];
+			in[i].msg_hdr.msg_controllen=rin[i].msg_hdr.msg_controllen=sizeof(ctrl[i]);
+		}
+	}
 	udp_batch_t()
 	{
 		for(int i=0;i<udp_batch_max;i++)
@@ -293,6 +338,10 @@ struct udp_batch_t
 			rin[i].msg_hdr.msg_iov=in_iov[i];
 			rin[i].msg_hdr.msg_iovlen=2;
 			rout[i].msg_hdr.msg_iov=rout_iov[i];
+			seg[i].msg_hdr.msg_iov=seg_iov[i];
+			init_segment(out_ctrl[i]);
+			init_segment(rout_ctrl[i]);
+			init_segment(seg_ctrl[i]);
 		}
 		rn=0;
 	}
@@ -313,6 +362,53 @@ static inline void udp_batch_set_iov(mmsghdr &m,iovec *iov,int i,int len)
 		iov[1].iov_base=udp_batch.overflow[i];
 		iov[1].iov_len=len-udp_slot_len;
 		m.msg_hdr.msg_iovlen=2;
+	}
+}
+//U5：len 字节的包按段长 gso 切成的数据报数，gso 为 0 时是 1
+static inline int udp_segs(size_t len,int gso)
+{
+	return gso==0?1:(int)((len+gso-1)/gso);
+}
+//U5：收到的条目带 UDP_GRO cmsg 时返回其中的 gso_size，否则 0；控制数据被截断（MSG_CTRUNC）时返回 -1，调用方丢掉这个包：
+//段长可能就在被截掉的部分里，当成普通数据报会把合并包作为一个大数据报发出（审查 L4；内核先写 SO_TIMESTAMP 等 cmsg 再写 UDP_GRO，
+//将来给这些 socket 加别的 cmsg 时要加大 udp_ctrl_t）。同时把内核改写的 msg_controllen 恢复成缓冲大小，下一次收包之前必须做。
+//gso_size 是 int（按 u16 读在大端 MIPS 上得到 0）
+static inline int udp_recv_gso(msghdr &h)
+{
+	int g=0;
+	if(h.msg_flags&MSG_CTRUNC)
+		g=-1;
+	else
+	{
+		for(cmsghdr *c=CMSG_FIRSTHDR(&h);c!=0;c=CMSG_NXTHDR(&h,c))
+		{
+			if(c->cmsg_level==SOL_UDP&&c->cmsg_type==UDP_GRO)
+			{
+				memcpy(&g,CMSG_DATA(c),sizeof(g));
+				break;
+			}
+		}
+	}
+	h.msg_controllen=sizeof(udp_ctrl_t);
+	return g;
+}
+//U5：发送条目 m 发第 i 个槽里 len 字节的包，槽里是 GRO 合并包且多于 1 段时挂 UDP_SEGMENT（段长同收到的），否则不挂：
+//没有 TX 校验和 offload 的出口在 6.11 以前连单段的 GSO 也报 EIO（探针实测）
+static inline void udp_batch_set_gso(mmsghdr &m,udp_ctrl_t &c,int i,int len)
+{
+	int g=udp_batch.gso[i];
+	if(g!=0&&len>g)
+	{
+		DEBUG_ASSERT(g<=0xffff);
+		uint16_t v=(uint16_t)g;
+		memcpy(CMSG_DATA(&c.hdr),&v,sizeof(v));
+		m.msg_hdr.msg_control=&c;
+		m.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t));
+	}
+	else
+	{
+		m.msg_hdr.msg_control=0;
+		m.msg_hdr.msg_controllen=0;
 	}
 }
 
@@ -448,6 +544,9 @@ struct conn_manager_udp_t
 	//O1 累计计数，SIGUSR1 时输出：total 新建的会话数；pkts/bytes 发送成功的包数与字节数，drop 发送失败（含 EAGAIN）丢掉的包数。[0] 客户端→上游，[1] 上游→客户端
 	u64_t total;
 	u64_t pkts[2],bytes[2],drop[2];
+	//U5（D42、D45）：gro 以 GRO 合并包形式收到的数据报数，gso_fallback 某个会话在这个方向的 GSO 发送失败（EIO/EINVAL/EMSGSIZE）、改为逐包发送的次数
+	u64_t gro[2],gso_fallback[2];
+	unsigned char gso_logged[2];//U5：这个方向的 GSO 回退已写过一行 info，之后的写 debug（审查 L3）
 
 	conn_manager_udp_t()
 	{
@@ -458,6 +557,9 @@ struct conn_manager_udp_t
 		memset(pkts,0,sizeof(pkts));
 		memset(bytes,0,sizeof(bytes));
 		memset(drop,0,sizeof(drop));
+		memset(gro,0,sizeof(gro));
+		memset(gso_fallback,0,sizeof(gso_fallback));
+		memset(gso_logged,0,sizeof(gso_logged));
 	}
 	//没找到时返回 0，hash 为 addr 的哈希，供随后的 insert 用；命中 last_hit 时不算哈希
 	udp_pair_t *find(const address_t &addr,u32_t &hash)
@@ -1457,6 +1559,13 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
+//U5：给 UDP socket 开 UDP_GRO（5.0 起）：网卡 GRO 阶段为它聚合同一条流的包，收到时带 UDP_GRO cmsg。
+//副作用：任何一个 socket 开了它，内核就打开全局 static key，本机所有入站 UDP 在 GRO 阶段都多一次 socket 查找
+static int udp_gro_set(int fd)
+{
+	int one=1;
+	return setsockopt(fd,SOL_UDP,UDP_GRO,&one,sizeof(one));
+}
 static void udp_flush_return();
 //会话 socket 可读（回程，U4）：回包收进回程批，由 udp_flush_return 跨会话发给客户端
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -1498,11 +1607,23 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	for(int i=b.rn;i<b.rn+n;i++)
 	{
 		mylog(log_trace, "[udp]received data from udp fd %d, len=%d\n", udp_fd,(int)b.rin[i].msg_len);
+		if(udp_gro) b.gso[i]=udp_recv_gso(b.rin[i].msg_hdr);
 		if(b.rin[i].msg_hdr.msg_flags&MSG_TRUNC)
 		{
 			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",udp_pair.adress.get_str(),max_data_len_udp);
 			b.rrule[i]=0;
 			continue;
+		}
+		if(udp_gro)
+		{
+			if(b.gso[i]<0)
+			{
+				mylog(log_warn,"[udp]packet for {%s} dropped: control data truncated (MSG_CTRUNC), GRO segment size unknown\n",udp_pair.adress.get_str());
+				b.rrule[i]=0;
+				continue;
+			}
+			if(b.gso[i]!=0) conn_manager_udp.gro[1]+=udp_segs(b.rin[i].msg_len,b.gso[i]);
+			b.roff[i]=udp_pair.gso_off[1];
 		}
 		b.raddr[i]=udp_pair.adress;
 		b.rrule[i]=udp_pair.owner;
@@ -1535,6 +1656,9 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 		mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 		return 0;
 	}
+	//U5：回包经网卡时也聚合；失败时这个会话只是收不到合并包
+	if(udp_gro&&udp_gro_set(new_udp_fd)!=0)
+		mylog(log_debug,"[udp]setsockopt UDP_GRO failed on udp fd %d (%s)\n",new_udp_fd,get_sock_error());
 
 	udp_pair_t *new_pair=udp_pair_pool.get();
 	if(new_pair==0)
@@ -1562,33 +1686,253 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	conn_manager_udp.last_hit=&udp_pair;
 	return &udp_pair;
 }
+//U5：发送条目 m 带 UDP_SEGMENT 时返回段长，否则 0
+static inline int udp_msg_gso(const mmsghdr &m)
+{
+	if(m.msg_hdr.msg_controllen==0) return 0;
+	uint16_t g;
+	memcpy(&g,CMSG_DATA((cmsghdr *)m.msg_hdr.msg_control),sizeof(g));
+	return g;
+}
+static inline size_t udp_msg_len(const mmsghdr &m)
+{
+	size_t len=0;
+	for(int k=0;k<(int)m.msg_hdr.msg_iovlen;k++)
+		len+=m.msg_hdr.msg_iov[k].iov_len;
+	return len;
+}
+//条目 m 里的数据报数（O1 的 pkts/drop 按数据报计，U5）
+static inline int udp_msg_segs(const mmsghdr &m)
+{
+	if(m.msg_hdr.msg_controllen==0) return 1;
+	return udp_segs(udp_msg_len(m),udp_msg_gso(m));
+}
+static int udp_msgs_segs(const mmsghdr *msgs,int from,int to)
+{
+	if(!udp_gro) return to-from;
+	int n=0;
+	for(int i=from;i<to;i++)
+		n+=udp_msg_segs(msgs[i]);
+	return n;
+}
+static void udp_send_warn(int dir,int ret,int dropped)
+{
+	if(dir==0)
+		mylog(log_warn,"[udp]sendmmsg returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
+	else
+		mylog(log_warn,"[udp]sendmmsg to clients returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
+}
+//U5（审查 L1）：5.0–5.15 未打补丁的内核（v5.16 修复，回移到 5.4.151–180、5.10.81–100 之间）按含 IP/UDP 头的长度判断段数上限，
+//64 个满段必报 EINVAL。碰到一次就置 1，之后每次 GSO 至多 udp_gso_cap() 段，段数加头长不超过 64 段。6.13 以前段长超过路径 MTU
+//也报 EINVAL，段长 ≤1023 B 的 64 段合并包碰上它时会误置：只是此后 64 段的合并包拆成两块发，那个会话随后照常回退
+static int udp_gso_hdr_cap=0;
+static inline int udp_gso_cap(int gso)
+{
+	return udp_gso_hdr_cap?udp_gso_max_segs-(48+gso-1)/gso:udp_gso_max_segs;
+}
+//段长 gso、segs 段的 GSO 发送报 err 时：是上面的旧内核上限就记住并返回 1（按更小的块重发即可，不关 GSO），否则 0
+static int udp_gso_old_limit(int err,int gso,int segs)
+{
+	if(err!=EINVAL||udp_gso_hdr_cap||segs<=udp_gso_max_segs-(48+gso-1)/gso) return 0;
+	udp_gso_hdr_cap=1;
+	mylog(log_debug,"[udp]GSO send of %d segments failed with EINVAL (Linux 5.0-5.15 count the IP/UDP headers against UDP_MAX_SEGMENTS, or the path MTU is smaller), sending at most %d segments at a time from now on\n",segs,udp_gso_cap(gso));
+	return 1;
+}
+//U5：GSO 本身发不出去：6.11 以前出口没有 TX 校验和 offload、或带 IPsec 时 EIO；段长超过路径 MTU 时 6.13 以前 EINVAL、6.14 起 EMSGSIZE；
+//段数超过内核的 UDP_MAX_SEGMENTS 时 EINVAL
+static inline int udp_gso_errno(int err)
+{
+	return err==EIO||err==EINVAL||err==EMSGSIZE;
+}
+//U5：一组发送的 GSO 回退状态（D41、D45），都按会话：入向一组属于一个会话，off 指向它的 gso_off[0]、stride 为 0；回程一组是一个规则
+//发往各客户端的回包，off[i] 是第 i 条所属会话收包时的 gso_off[1]（udp_batch.rout_off，不持有会话指针，D36）、stride 为 1
+struct udp_send_ctx_t
+{
+	conn_manager_udp_t &mgr;
+	int fd;
+	int dir;
+	unsigned char *off;
+	int stride;
+	udp_pair_t *pair;//入向的会话；回程为 0
+};
+//第 i 条的 GSO 本身发不出去：这个会话这个方向此后不用 GSO。回程按客户端地址找到会话置位（会话已释放就只改本次发出的条目），
+//同一组里发往同一客户端的其余条目也改为逐包。计数；info 每条规则每个方向只写第一次，之后 debug（审查 L3）
+static void __attribute__((noinline,cold)) udp_gso_turn_off(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt)
+{
+	address_t *client;
+	if(c.dir==0)
+	{
+		c.pair->gso_off[0]=1;
+		client=&c.pair->adress;
+	}
+	else
+	{
+		client=(address_t *)msgs[i].msg_hdr.msg_name;//指向 udp_batch.raddr[j].inner，inner 是 address_t 唯一的数据成员
+		for(int k=i;k<cnt;k++)
+			if(udp_key_eq(*(address_t *)msgs[k].msg_hdr.msg_name,*client)) c.off[k]=1;
+		u32_t hash;
+		udp_pair_t *pair=c.mgr.find(*client,hash);
+		if(pair!=0) pair->gso_off[1]=1;
+	}
+	c.mgr.gso_fallback[c.dir]++;
+	int level=c.mgr.gso_logged[c.dir]?log_debug:log_info;
+	c.mgr.gso_logged[c.dir]=1;
+	mylog(level,"[udp]GSO send %s {%s} on %s fd %d failed (%s), sending its GRO packets datagram by datagram from now on\n",
+		c.dir==0?"from":"to",client->get_str(),c.dir==0?"session":"listen",c.fd,get_sock_error());
+}
+//U5：msg 的 iov（槽与溢出区）里 [off,off+len) 这一段写进 dst，返回用了几个 iovec（至多 2）
+static int udp_iov_range(const msghdr &src,size_t off,size_t len,iovec *dst)
+{
+	int n=0;
+	for(int k=0;k<(int)src.msg_iovlen&&len>0;k++)
+	{
+		size_t l=src.msg_iov[k].iov_len;
+		if(off>=l)
+		{
+			off-=l;
+			continue;
+		}
+		size_t take=min(l-off,len);
+		dst[n].iov_base=(char *)src.msg_iov[k].iov_base+off;
+		dst[n].iov_len=take;
+		n++;
+		len-=take;
+		off=0;
+	}
+	return n;
+}
+//U5：把第 i 条（GRO 合并包）切成每块至多 udp_gso_cap() 段（这个会话这个方向已关 GSO 时每块一个数据报）发出，用于：sendmmsg 发它失败之后、
+//已关 GSO、段数超过上限。一次 sendmmsg 至多 udp_batch_max 块，失败语义同 udp_send_group：GSO 本身的错误先关掉 GSO，这一块改为逐个
+//数据报重发；其他错误丢掉这一块；EAGAIN 时把这个包剩下的数据报数记进 left、返回 -1，由调用方连同本组剩下的包一起计入 drop、记一行 warn
+static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &left)
+{
+	udp_batch_t &b=udp_batch;
+	const mmsghdr &m=msgs[i];
+	const int gso=udp_msg_gso(m);
+	const size_t len=udp_msg_len(m);
+	DEBUG_ASSERT(gso>0);
+	size_t off=0;
+	while(off<len)
+	{
+		const size_t piece=(size_t)gso*(c.off[c.stride*i]?1:udp_gso_cap(gso));
+		int n=0;
+		for(size_t o=off;o<len&&n<udp_batch_max;o+=piece,n++)
+		{
+			mmsghdr &s=b.seg[n];
+			size_t l=min(piece,len-o);
+			s.msg_hdr.msg_name=m.msg_hdr.msg_name;
+			s.msg_hdr.msg_namelen=m.msg_hdr.msg_namelen;
+			s.msg_hdr.msg_iovlen=udp_iov_range(m.msg_hdr,o,l,b.seg_iov[n]);
+			if(l>(size_t)gso)
+			{
+				uint16_t v=(uint16_t)gso;
+				memcpy(CMSG_DATA(&b.seg_ctrl[n].hdr),&v,sizeof(v));
+				s.msg_hdr.msg_control=&b.seg_ctrl[n];
+				s.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t));
+			}
+			else
+			{
+				s.msg_hdr.msg_control=0;
+				s.msg_hdr.msg_controllen=0;
+			}
+		}
+		int ret=(int)syscall(SYS_sendmmsg,(long)c.fd,b.seg,(long)n,0L);
+		if(ret>0)
+		{
+			for(int k=0;k<ret;k++)
+			{
+				c.mgr.pkts[c.dir]+=udp_msg_segs(b.seg[k]);
+				c.mgr.bytes[c.dir]+=b.seg[k].msg_len;
+				off+=udp_msg_len(b.seg[k]);
+			}
+			continue;
+		}
+		if(errno==EAGAIN||errno==EWOULDBLOCK)
+		{
+			left=udp_segs(len-off,gso);
+			return -1;
+		}
+		if(b.seg[0].msg_hdr.msg_controllen!=0&&udp_gso_errno(errno))
+		{
+			if(!udp_gso_old_limit(errno,gso,udp_msg_segs(b.seg[0])))
+				udp_gso_turn_off(c,msgs,i,cnt);
+			continue;
+		}
+		int dropped=udp_msg_segs(b.seg[0]);
+		c.mgr.drop[c.dir]+=dropped;
+		udp_send_warn(c.dir,ret,dropped);
+		off+=udp_msg_len(b.seg[0]);
+	}
+	return 0;
+}
+//sendmmsg 不能直接发的条目（U5）：GRO 合并包，而它的会话这个方向已关 GSO，或段数超过上限
+static inline int udp_gso_split_needed(const mmsghdr &m,unsigned char gso_off)
+{
+	if(m.msg_hdr.msg_controllen==0) return 0;
+	return gso_off||udp_msg_segs(m)>udp_gso_cap(udp_msg_gso(m));
+}
 //一组 cnt 个包，dir 为 0 时是一个会话本批的入向包（U3，发往会话 socket），为 1 时是一个规则的回包（U4，发往监听 socket，
 //各包带客户端地址）：sendmmsg 只发出一部分时从断点接着发（内核不报断点处的错误，重发一次才知道它是否仍失败）。
 //EAGAIN 丢掉剩下的包，不排队（UDP 语义）；其他错误（EMSGSIZE 等）只丢断点处这一个包。入向时上一个包引来的 ICMP（ECONNREFUSED）
 //只让断点处的发送失败，错误随之被取走，重发就成功：只有一组的第一个包碰上它时才丢包、记 warn（逐包 send 时每次都丢）；
 //监听 socket 没有 connect，不收 ICMP 错误。
+//U5：带 UDP_SEGMENT 的条目（GRO 合并包）发送失败时不按一个包丢，交给 udp_send_split 重发：GSO 本身的错误（udp_gso_errno）
+//先关掉它所属会话这个方向的 GSO（udp_gso_turn_off）再逐个数据报发，其他错误按至多上限段再发一次。pkts/drop 按数据报计。
 //直接调 syscall：64 位 musl 的 sendmmsg() 是逐条 sendmsg() 的循环（它的 msghdr 用 int 加填充，内核用 size_t）；
-//udp_batch.out/rout 在 BSS 里，musl 的 __pad1/__pad2 从不写入、恒为 0，内核读到的 msg_iovlen/msg_controllen 就是本值
-static void udp_send_group(conn_manager_udp_t &conn_manager_udp,int udp_fd,mmsghdr *msgs,int cnt,int dir)
+//udp_batch.out/rout/seg 在 BSS 里，musl 的 __pad1/__pad2 从不写入、恒为 0，内核读到的 msg_iovlen/msg_controllen 就是本值
+static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 {
 	for(int sent=0;sent<cnt;)
 	{
-		int ret=(int)syscall(SYS_sendmmsg,(long)udp_fd,msgs+sent,(long)(cnt-sent),0L);//变参按 long 读
-		if(ret>0)
+		int end=cnt;
+		int left=0;
+		if(udp_gro)
 		{
-			conn_manager_udp.pkts[dir]+=ret;
-			for(int i=sent;i<sent+ret;i++)
-				conn_manager_udp.bytes[dir]+=msgs[i].msg_len;
-			sent+=ret;
+			end=sent;
+			while(end<cnt&&!udp_gso_split_needed(msgs[end],c.off[c.stride*end])) end++;
+			if(end==sent)
+			{
+				if(udp_send_split(c,msgs,sent,cnt,left)<0) goto eagain;
+				sent++;
+				continue;
+			}
+		}
+		{
+			int ret=(int)syscall(SYS_sendmmsg,(long)c.fd,msgs+sent,(long)(end-sent),0L);//变参按 long 读
+			if(ret>0)
+			{
+				c.mgr.pkts[c.dir]+=ret;
+				for(int i=sent;i<sent+ret;i++)
+				{
+					c.mgr.bytes[c.dir]+=msgs[i].msg_len;
+					if(msgs[i].msg_hdr.msg_controllen!=0)
+						c.mgr.pkts[c.dir]+=udp_msg_segs(msgs[i])-1;
+				}
+				sent+=ret;
+				continue;
+			}
+			if(errno==EAGAIN||errno==EWOULDBLOCK) goto eagain;
+			if(msgs[sent].msg_hdr.msg_controllen!=0)
+			{
+				if(udp_gso_errno(errno)&&!udp_gso_old_limit(errno,udp_msg_gso(msgs[sent]),udp_msg_segs(msgs[sent])))
+					udp_gso_turn_off(c,msgs,sent,cnt);
+				if(udp_send_split(c,msgs,sent,cnt,left)<0) goto eagain;
+				sent++;
+				continue;
+			}
+			c.mgr.drop[c.dir]+=1;
+			udp_send_warn(c.dir,ret,1);
+			sent++;
 			continue;
 		}
-		int dropped=(errno==EAGAIN||errno==EWOULDBLOCK)?cnt-sent:1;
-		conn_manager_udp.drop[dir]+=dropped;
-		if(dir==0)
-			mylog(log_warn,"[udp]sendmmsg returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
-		else
-			mylog(log_warn,"[udp]sendmmsg to clients returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
-		sent+=dropped;
+	eagain:
+		//left：udp_send_split 停下的那个合并包还没发的数据报，它本身已算在 sent 之前，所以本组剩下的从 sent+1 起
+		{
+			int dropped=left!=0?left+udp_msgs_segs(msgs,sent+1,cnt):udp_msgs_segs(msgs,sent,cnt);
+			c.mgr.drop[c.dir]+=dropped;
+			udp_send_warn(c.dir,-1,dropped);
+		}
+		break;
 	}
 }
 //发出回程批（U4，D36）：按规则分组，每组对该规则的监听 socket 一次 sendmmsg，msg_name 是收包时拷下的客户端地址。
@@ -1609,9 +1953,15 @@ static void udp_flush_return()
 			m.msg_hdr.msg_name=&b.raddr[j].inner;
 			m.msg_hdr.msg_namelen=b.raddr[j].get_len();
 			udp_batch_set_iov(m,b.rout_iov[cnt],j,b.rin[j].msg_len);
+			if(udp_gro)
+			{
+				udp_batch_set_gso(m,b.rout_ctrl[cnt],j,b.rin[j].msg_len);
+				b.rout_off[cnt]=b.roff[j];
+			}
 			cnt++;
 		}
-		udp_send_group(rule->udp_manager,rule->local_listen_fd_udp,b.rout,cnt,1);
+		udp_send_ctx_t c={rule->udp_manager,rule->local_listen_fd_udp,1,b.rout_off,1,0};
+		udp_send_group(c,b.rout,cnt);
 	}
 	b.rn=0;
 }
@@ -1636,6 +1986,8 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 		tmp_addr.from_sockaddr((sockaddr*)&b.addr[i],h.msg_namelen);
 		h.msg_namelen=sizeof(b.addr[i]);//内核按实际地址长度改写了它，下一次 recvmmsg 之前恢复
 		b.pair[i]=0;
+		int gso=0;
+		if(udp_gro) gso=b.gso[i]=udp_recv_gso(h);
 
 		//每包都走这里：地址只在记日志时格式化（T7）
 		mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",tmp_addr.get_str(),data_len);
@@ -1645,6 +1997,12 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
 			continue;
 		}
+		if(gso<0)
+		{
+			mylog(log_warn,"[udp]packet from {%s} dropped: control data truncated (MSG_CTRUNC), GRO segment size unknown\n",tmp_addr.get_str());
+			continue;
+		}
+		if(gso!=0) conn_manager_udp.gro[0]+=udp_segs(data_len,gso);
 
 		u32_t hash;
 		udp_pair_t *pair=conn_manager_udp.find(tmp_addr,hash);
@@ -1675,6 +2033,7 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 		if(b.pair[i]==0) continue;
 		int j=b.group_pos[b.pair[i]->batch_group]++;
 		udp_batch_set_iov(b.out[j],b.out_iov[j],i,b.in[i].msg_len);
+		if(udp_gro) udp_batch_set_gso(b.out[j],b.out_ctrl[j],i,b.in[i].msg_len);
 	}
 	for(int g=0;g<groups;g++)
 	{
@@ -1682,7 +2041,8 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 		udp_pair.batch_group=-1;
 		conn_manager_udp.lru.update(&udp_pair);
 		int cnt=b.group_cnt[g];
-		udp_send_group(conn_manager_udp,udp_pair.fd,b.out+b.group_pos[g]-cnt,cnt,0);
+		udp_send_ctx_t c={conn_manager_udp,udp_pair.fd,0,&udp_pair.gso_off[0],0,&udp_pair};
+		udp_send_group(c,b.out+b.group_pos[g]-cnt,cnt);
 	}
 }
 void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -1734,9 +2094,13 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 		if(rule.enable_tcp)
 			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu\n",
 				rule.index,tcp.lru.size(),tcp.total,half_closed,tcp.bytes[0],tcp.bytes[1]);
-		if(rule.enable_udp)
+		if(rule.enable_udp&&!udp_gro)
 			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu\n",
 				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1]);
+		if(rule.enable_udp&&udp_gro)//D42：只在 --udp-gro 时多这四项
+			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu up_gro=%llu down_gro=%llu up_gso_fallback=%llu down_gso_fallback=%llu\n",
+				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1],
+				udp.gro[0],udp.gro[1],udp.gso_fallback[0],udp.gso_fallback[1]);
 	}
 	int scratch=(tcp_scratch!=0);
 	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d\n",
@@ -1780,6 +2144,21 @@ static void check_and_record_listen(unordered_map<address_t,int,address_t::hash_
 		myexit(-1);
 	}
 	listen_rules[rule.local_addr]=rule.index;
+}
+
+//U5：监听 socket 开 UDP_GRO。第一个开成功时给 udp_batch 挂上收 cmsg 的控制缓冲；第一个就失败（5.0 以前的内核）时整个特性关闭，
+//这时还没有 socket 开着 UDP_GRO。之后的失败只记一行：那个监听 socket 收到的都是普通数据报
+static void udp_gro_listen(forward_rule_t &rule)
+{
+	static int gro_socks=0;
+	if(udp_gro_set(rule.local_listen_fd_udp)==0)
+	{
+		if(gro_socks++==0) udp_batch.attach_ctrl();
+		return;
+	}
+	mylog(log_warn,"rule %d [udp] setsockopt UDP_GRO failed (%s): --udp-gro needs Linux 5.0 or later%s\n",
+		rule.index,get_sock_error(),gro_socks==0?", UDP_GRO stays off":"");
+	if(gro_socks==0) udp_gro=0;
 }
 
 static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
@@ -1843,6 +2222,7 @@ static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
 		if(rcv<2*listen_fd_buf_size||snd<2*listen_fd_buf_size)
 			mylog(log_info,"rule %d [udp] listen socket buffers are rcv %d / snd %d bytes instead of %d: capped by net.core.rmem_max/wmem_max, raise them to at least %d or run with CAP_NET_ADMIN\n",
 				rule.index,rcv,snd,2*listen_fd_buf_size,listen_fd_buf_size);
+		if(udp_gro) udp_gro_listen(rule);
 
 		if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 		{
@@ -1985,6 +2365,8 @@ void print_help()
 	printf("                                          UDP buffers are capped by net.core.rmem_max/wmem_max unless running with CAP_NET_ADMIN\n");
 	printf("                                          (UDP sessions: only a --sock-buf value is set past the cap)\n");
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
+	printf("    --udp-gro                             receive UDP with UDP_GRO and forward merged packets with UDP_SEGMENT (GSO),\n");
+	printf("                                          Linux 5.0 or later, off by default\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
 	printf("    --log-position                        enable file name, function name, line number in log\n");
@@ -2011,6 +2393,7 @@ void process_arg(int argc, char *argv[])
 		{"sock-buf", required_argument,    0, 1},
 		{"udp-listen-buf", required_argument,    0, 1},
 		{"disable-tcp-nodelay", no_argument,    0, 1},
+		{"udp-gro", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
     int option_index = 0;
@@ -2166,6 +2549,10 @@ void process_arg(int argc, char *argv[])
 			else if(strcmp(long_options[option_index].name,"disable-tcp-nodelay")==0)
 			{
 				disable_tcp_nodelay=1;
+			}
+			else if(strcmp(long_options[option_index].name,"udp-gro")==0)
+			{
+				udp_gro=1;
 			}
 			else
 			{

@@ -11,7 +11,7 @@
 #   TPM_SLOW=1             同时运行慢速用例（TCP/UDP 空闲超时，约 7 分钟）
 #
 # 流程：docker/build.sh 编译 tinymapper → 宿主机交叉编译测试二进制 → 每个变体一个
-# `docker run --rm --network none --cap-add NET_ADMIN` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
+# `docker run --rm --network none --cap-add NET_ADMIN --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REF=${REF:-}
@@ -60,7 +60,8 @@ for v in $VARIANTS; do
 	# U6：--cap-add NET_ADMIN 让容器里以 root 运行的 tinymapper 像主机上的 root（OpenWRT 等）部署一样有 CAP_NET_ADMIN，
 	# UDP socket 缓冲用 SO_*BUFFORCE 设、不受 rmem_max/wmem_max 截断；没有这项能力的路径由 startMapperNoNetAdmin 覆盖
 	# （去掉 CAP_NET_ADMIN 后以 root 启动 tinymapper）
-	if docker run --rm --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN \
+	# U5：--device /dev/net/tun 供 GSO 回退用例建 tun 设备（没有 TX 校验和 offload 的出口，6.11 以前 GSO 发送返回 EIO）
+	if docker run --rm --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --device /dev/net/tun \
 		-v "$ROOT/build:/build:ro" -w /tmp \
 		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW \
 		"$img" "/build/$TESTBIN" -test.timeout=30m "$@"; then

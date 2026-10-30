@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
 # 主机模式冒烟：3 个容器（自建 bridge 网络，不发布端口）充当客户端/转发器/后端主机，用 RSH=docker、RCP="docker cp"
 # 依次跑 3 主机与 2 主机拓扑的短测，结束后删除容器与网络。只验证编排逻辑，数字没有参考价值。
-# 前置：bench/run.sh 至少跑过一次（tinymapper-bench-prof:1 镜像与 build/ 下的 tinymapper）
+# 前置：bench/run.sh 至少跑过一次（tinymapper-bench-prof:2 镜像与 build/ 下的 tinymapper）
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 NET=tpm-bench-smoke
-IMG=tinymapper-bench-prof:1
+IMG=tinymapper-bench-prof:2
 cleanup() {
   docker rm -f tpm-smoke-cli tpm-smoke-fwd tpm-smoke-srv >/dev/null 2>&1 || true
   docker network rm $NET >/dev/null 2>&1 || true

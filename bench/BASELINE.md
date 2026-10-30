@@ -169,7 +169,53 @@ QUICK=1 bench/run.sh                                           # 冒烟：1 轮�
 FWDS="tinymapper@4acc876 tinymapper" bench/run.sh              # 基线提交与工作区前后对比（缺失的二进制自动编译）
 STAGES=syscount SC_FWDS="tinymapper@4acc876 realm-1c" bench/run.sh   # 只做 syscall 计数（第 3 节）
 STAGES=prof bench/run.sh                                       # CPU 剖析：clean / stat / rec / ipi 四个阶段
+FWDS="tinymapper tinymapper+gro" bench/run.sh                  # 同一二进制不加 / 加 --udp-gro（U5），同一批交替
+TOPO=veth TESTS="udp_bw_1400 udp_bw_1400_r udp_pps_64" FWDS="direct tinymapper tinymapper+gro" \
+  SC_FWDS="tinymapper tinymapper+gro" SC_TESTS="udp_bw_1400 udp_bw_1400_r udp_pps_64" bench/run.sh   # veth 三命名空间拓扑（第 6 节）
 python3 -I bench/summarize.py bench/results/<时间戳>/raw.jsonl     # 重新汇总
 ```
 
-`REPS`、`DUR`、`TESTS`、`FWDS`、`SC_*`、`PROF_*` 等环境变量见 `bench/run.sh` 头部注释。各阶段的 tinymapper 默认都没有 `CAP_NET_ADMIN`（syscount/prof 容器是 `--privileged`，由 `TM_NOCAP` 去掉这一项），UDP socket 缓冲按 `rmem_max` 截断为 416 KiB，与本文的数据可比；`CAP_ADD=NET_ADMIN` 时各阶段统一带这项能力（U6：UDP 缓冲用 `SO_*BUFFORCE` 设，监听 4 MiB、会话 2 MiB），转发器名加 `+nocap` 后缀的同一二进制仍去掉它，可在同一批里对照。工具镜像 `tinymapper-bench:1` 不含 tinymapper，二进制在运行时从 `build/` 挂载，改源码不需要重建镜像。
+`REPS`、`DUR`、`TESTS`、`FWDS`、`SC_*`、`PROF_*` 等环境变量见 `bench/run.sh` 头部注释。各阶段的 tinymapper 默认都没有 `CAP_NET_ADMIN`（syscount/prof 容器是 `--privileged`，由 `TM_NOCAP` 去掉这一项），UDP socket 缓冲按 `rmem_max` 截断为 416 KiB，与本文的数据可比；`CAP_ADD=NET_ADMIN` 时各阶段统一带这项能力（U6：UDP 缓冲用 `SO_*BUFFORCE` 设，监听 4 MiB、会话 2 MiB），转发器名加 `+nocap` 后缀的同一二进制仍去掉它，可在同一批里对照。工具镜像 `tinymapper-bench:2`（U5 起加 iproute2、ethtool，152 → 159 MB；剖析镜像 `tinymapper-bench-prof:2` 254 → 261 MB）不含 tinymapper，二进制在运行时从 `build/` 挂载，改源码不需要重建镜像。
+
+## 6. veth 三命名空间拓扑（`TOPO=veth`，U5）
+
+loopback 的包不经过 NAPI，内核不做 GRO，`--udp-gro` 在那里只有开销、没有合并包。`TOPO=veth` 在同一个容器里（bench、syscount、prof 各阶段都是 `--privileged`）建三个网络命名空间，经两对 veth 相连，转发器一侧的两个 veth 模拟开了 GRO 和中断合并的网卡。绑核同 loopback；tinymapper 同 syscount 阶段去掉 `CAP_NET_ADMIN`（`TM_NOCAP=1`，UDP 缓冲 416 KiB，与 loopback 可比）。
+
+```
+ tpm-cli（CPU2-3）              tpm-fwd（CPU0）                                      tpm-srv（CPU4-5）
+ iperf3 -c / fwdbench           tinymapper -l10.201.1.2:20000 -r10.201.2.2:<端口>      iperf3 -s :5201 / fwdbench server :9000
+ c0 10.201.1.1 ──── veth ──── f0 10.201.1.2                 f1 10.201.2.1 ──── veth ──── s0 10.201.2.2
+ tso off，gro off（默认）        gro on，gro_flush_timeout 50000 ns，napi_defer_hard_irqs 2（f0、f1 相同）   tso off，gro off
+ 默认路由 → 10.201.1.2           ip_forward=1（direct = 内核转发）                                       默认路由 → 10.201.2.1
+```
+
+| 设置 | 机制 | 目的 |
+|---|---|---|
+| f0、f1 `ethtool -K gro on` | veth 默认关 GRO；接收端请求 GRO 后才建 NAPI，`veth_xmit` 把包放进对端的 ptr_ring 再调度 NAPI | 入口走 NAPI + GRO |
+| f0、f1 `gro_flush_timeout` 50000、`napi_defer_hard_irqs` 2（`VETH_FLUSH_NS`、`VETH_DEFER` 可改） | 一轮轮询结束后不重新"开中断"，挂 50 µs 定时器再轮询，连续 2 轮空才结束 | 模拟网卡中断合并：每轮积累一批包。只开 `gro on` 时发送方每次 send 返回前 softirq 就地轮询，每轮 1 个包，没有可合并的（探针：0 个合并包） |
+| c0、s0 `ethtool -K tso off` | `veth_skb_is_eligible_for_gro()`：发送端没有 TSO，或接收端开 `rx-udp-gro-forwarding`/`rx-gro-list`，veth 才走 NAPI | 让到达 f0、f1 的 UDP 包进 GRO |
+| 不开 `rx-udp-gro-forwarding` | 它让 GRO 在没有查到开 `UDP_GRO` 的 socket 时也聚合（全局 static key 关着时根本不查 socket），交给普通 socket 前再拆开 | 真实网卡没有这个行为；不开时只有 tinymapper `--udp-gro` 的 socket 收到合并包，开/关对照干净 |
+| fwd 命名空间 `ip_forward=1`，cli、srv 默认路由指向它 | `direct` 成为内核 IP 转发 | 给出发送端与路径的上限 |
+| 每个命名空间 `tcp_tw_reuse=1`、`ip_local_port_range 21000 65535` | 容器的 `--sysctl` 只作用于容器自己的命名空间 | 与 loopback 相同 |
+
+拓扑核对（各接口的 offload 开关、定时器参数、MTU）写入各阶段的 `topo.txt`，不符时阶段失败。
+
+**softirq 落点**（选择与理由）：veth 的 NAPI 在调度它的 CPU 上轮询，推迟用的定时器（`HRTIMER_MODE_REL_PINNED`）也挂在上一轮轮询的 CPU 上。
+- 转发器的入向收包（GRO、IP/UDP 收包、入 socket 队列、唤醒转发器）在发送方的 CPU：正向在客户端 CPU2-3，回程在后端 CPU4-5。冒烟（udp_bw_1400，3.5 s）：NET_RX softirq CPU2 55k 次、CPU3 5.7k 次（约 17k 次/s，即每 50 µs 一轮），CPU4-5 约 0。
+- 转发器发出的包：c0、s0 没开 GRO、没有 NAPI，`veth_xmit` 经 `netif_rx` 进 CPU0 的 backlog，在转发器 `sendmmsg` 的 `local_bh_enable` 里就地完成对端命名空间的收包（GSO 包交给普通 socket 时的 `udp_rcv_segment` 分段也在这里）。冒烟：不开 `--udp-gro` 时 CPU0 NET_RX 2.79M 次（每个包一次），开时 69k 次（每个 GSO 包一次）。
+- 没用 threaded NAPI：`napi/f0-*` 内核线程在容器的 PID 命名空间里看不见，绑核要 `--pid=host`，在多人共用的 Docker VM 上让基准容器看见并能给所有进程发信号，代价大于收益。没用 RPS：它只把 GRO 之后的协议处理挪到别的 CPU，多一次 IPI 与 backlog 排队，也不像网卡。
+- 后果：CPU0 替接收方付了它的收包开销（同 loopback），却不付转发器自己的入向收包开销（真实主机上在网卡中断所在的 CPU）；入向开销与负载工具挤在同一组 CPU 上，GRO 省下的 softirq 会让发送方发得更快。所以主指标是每 Gbit/s 的 CPU（进程 CPU% 与 CPU0 忙碌%），吞吐只作参考；发送方 CPU 的 softirq% 单独记录，用来看入向省了多少。
+
+**CPU 与统计字段**（每行 `raw.jsonl`，两种拓扑都有）：
+- `cpus`：客户端运行期间 `/proc/stat` 的差值，`fwd`（转发器所在 CPU）、`cli`、`srv` 各组的 busy（user+nice+system+irq+softirq）、usr、sys、softirq 百分比，组内相加。这个 VM 内核按 tick 采样记 softirq：在转发器上下文里执行的 softirq 同时记入进程的 stime 和 CPU0 的 softirq，所以进程 CPU%（`fwd_cpu_pct`）≈ CPU0 忙碌%（冒烟 94.8 / 95.2，其中 softirq 26.6）。`cli`、`srv` 的 busy 含 iperf3 自身（3.16 的接收方两个核都接近满），只看它们的 softirq。
+- `fwd_win_s`：CPU 统计窗口的秒数。`fwd_cpu_pct × fwd_win_s ÷ (up_pkts + down_pkts)` 是每个转发的数据报的 CPU 时间，分母是转发器实际发出的数据报，不受接收端丢包影响（`docs/bench/u5/ab.py` 的"ns/数据报"列）。
+- `tm_udp`：UDP 负载结束后给 tinymapper 发一次 SIGUSR1（只对含统计代码的二进制发，旧二进制收到会退出），记 `stats rule 1 udp:` 行；`--udp-gro` 时有 `up_gro`/`down_gro`（以合并包到达的数据报数）与 `up_gso_fallback`/`down_gso_fallback`。
+- `summary.md` 的 UDP 表在有这些字段时多出"所在 CPU 忙碌%（softirq）"、udp_bw 的"CPU% 每 Gbit/s（进程 / 所在 CPU）"与"合并%"。
+- syscount 的 UDP 单位：被测的是 tinymapper 时改用 perf 窗口前后两次 SIGUSR1 统计的 `up_pkts+down_pkts` 增量。GSO 一次发出多个数据报时 `OutDatagrams` 只加 1（`udp_send_skb`；实测 10 段的 GSO +1），veth 下开 `--udp-gro` 时 OutDatagrams 只有数据报数的约 1/46；loopback 下两者只差 2 个包。OutDatagrams 的换算仍记在 `syscalls.json` 的 `snmp_units`。
+
+**限制**：
+- iperf3 3.16 单流两端都是上限：1400 B 发送约 0.9–1.2 Mpps，接收约 0.86–0.98 Mpps（direct 也丢 15–26%）。转发器开 `--udp-gro` 后 CPU 有富余（冒烟约 45%），它转发的全部数据报（`up_drop`/`down_drop` 为 0）里有一部分在接收端 socket 丢掉，所以开/关之间的实收吞吐与丢包率不作主指标，每 Gbit/s（受接收端丢包影响）与每个数据报的 CPU 才是。
+- 每个 veth 一个接收队列（一个 NAPI）；ptr_ring 256 个包（`VETH_RING_SIZE`），50 µs 内积压超过 256 个才会在 veth 上丢包（1.2 Mpps 时约 60 个）。
+- MTU 1500：1400 B 每个合并包至多 46 个数据报（64 KiB），64 B 至多 64 个（`UDP_GRO_CNT_MAX`）。
+- 剖析阶段（`STAGES=prof`）可在 veth 拓扑下跑，但 `summarize_prof.py` 的每包换算仍用 OutDatagrams，开 `--udp-gro` 时偏大。
+- Docker VM 共用宿主 CPU；U5 能否默认开启以优化指导 §8.4 的主机门槛（真实网卡）为准。
