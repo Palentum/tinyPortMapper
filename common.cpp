@@ -63,18 +63,17 @@ u64_t get_current_time_us()
 }
 */
 
-//单调时钟，取默认 loop 本轮 epoll 返回时缓存的值，不再每次读时钟（T8）；墙钟跳变不影响超时（D16）。只能在事件循环线程、ev_default_loop() 之后调用
+//单调时钟，取 loop 本轮 epoll 返回时缓存的值，不再每次读时钟（T8）；墙钟跳变不影响超时（D16）。只能在该 loop 的线程上调用
 //mn_now 每轮才变，换算结果按它的位模式缓存：软浮点目标（mips24kc、arm）上 double 乘法与转换是库函数调用，每轮只做一次
-u64_t get_current_time()
+u64_t loop_clock_t::now()
 {
-        static u64_t last_bits=~0ull,last_ms=0;//~0ull 是 NaN 的位模式，不会等于真实时间
-        ev_tstamp now=my_ev_mono_now(EV_DEFAULT_UC);
+        ev_tstamp t=my_ev_mono_now(loop);
         u64_t bits;
-        memcpy(&bits,&now,sizeof(bits));
+        memcpy(&bits,&t,sizeof(bits));
         if(bits!=last_bits)
         {
                 last_bits=bits;
-                last_ms=(u64_t)(now*1000);
+                last_ms=(u64_t)(t*1000);
         }
         return last_ms;
 }

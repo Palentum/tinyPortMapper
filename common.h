@@ -311,7 +311,20 @@ struct tcp_pair_t:not_copy_able_t,lru_node_t
 	}
 };
 
-u64_t get_current_time();
+//单调时钟的毫秒值（T8、D16）：所属 loop 本轮 epoll 返回后缓存的 mn_now，按它的位模式缓存换算结果。每个 worker 一份（M1），
+//只能在该 loop 的线程上调用
+struct loop_clock_t
+{
+	struct ev_loop *loop;
+	u64_t last_bits,last_ms;
+	loop_clock_t()
+	{
+		loop=0;
+		last_bits=~0ull;//NaN 的位模式，不会等于真实时间
+		last_ms=0;
+	}
+	u64_t now();
+};
 u64_t pack_u64(u32_t a,u32_t b);
 u32_t get_u64_h(u64_t a);
 u32_t get_u64_l(u64_t a);

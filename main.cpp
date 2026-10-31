@@ -6,6 +6,7 @@
 #include <sys/stat.h>
 #include <sys/syscall.h>
 #include <sys/resource.h>
+#include <sys/mman.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <thread>
@@ -26,7 +27,7 @@ int disable_tcp_nodelay=0;
 int disable_splice=0;//--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe
 int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
 //--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
-//（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
+//（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时各 worker 的 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
 int udp_gro=0;
 
 int max_pending_packet=0;
@@ -52,12 +53,14 @@ struct lru_collector_t:not_copy_able_t
 	typedef lru_node_t* key_t;
 	lru_node_t head;//哨兵：head.next 是表头，head.prev 是表尾；指向自身，所以本对象不能复制或移动
 	int cnt;
+	loop_clock_t *clock;//所属 worker 的时间缓存（M1），规则建好时设置
 	lru_collector_t(const lru_collector_t &)=delete;
 	lru_collector_t & operator=(const lru_collector_t &)=delete;
 	lru_collector_t()
 	{
 		head.prev=head.next=&head;
 		cnt=0;
+		clock=0;
 	}
 	void link_front(key_t key)
 	{
@@ -75,7 +78,7 @@ struct lru_collector_t:not_copy_able_t
 	{
 		DEBUG_ASSERT(key->next!=0);
 
-		my_time_t value=get_current_time();
+		my_time_t value=clock->now();
 		DEBUG_ASSERT(value >=head.next->ts);
 		//距上次挪动不到 lru_move_interval 就不挪：链表仍按 ts 有序，ts 最多比实际最后活动早这么多，超时最多提前这么多（T8）
 		if(value-key->ts<lru_move_interval) return 0;
@@ -89,7 +92,7 @@ struct lru_collector_t:not_copy_able_t
 	{
 		DEBUG_ASSERT(key->next==0);
 
-		my_time_t value=get_current_time();
+		my_time_t value=clock->now();
 		if(!empty())
 		{
 			DEBUG_ASSERT(value >=head.next->ts);
@@ -263,6 +266,7 @@ static int splice_turn_max=256*1024;
 static const int splice_more_min=65536;//64K pipe（扩容失败）满一次、网卡来源 64 槽满一次都够这个数
 static int tcp_pipe_min_size=65536;//新 pipe 不到 16 槽（fs.pipe-user-pages-soft 已满时只有 2 页）就不用：每次 splice 只能搬 2 个片段。按槽数判断（D58），启动时按页大小设
 static const int tcp_pipe_pool_max_free=64;//同 D19；pipe 比 16 页大时按页数折算，见 tcp_pipe_pool_t::max_free
+static int tcp_pipe_max_free=tcp_pipe_pool_max_free;//tcp_pipe_pool_t::max_free 的值：启动时 tcp_pipe_probe() 按 pipe 大小算出，之后只读，worker 的 pipe 池构造时取它（M1）
 
 //pipe 里还有多少字节，只给 DEBUG_ASSERT 用：还池与复用的 pipe 必须是空的，计账错了就会把一个连接的数据写给另一个连接
 static inline int tcp_pipe_len(const tcp_pipe_t &p)
@@ -286,7 +290,7 @@ struct tcp_pipe_pool_t
 	u64_t resize_fail;//没能扩到 tcp_pipe_size 的新 pipe 个数（含 grow_blocked 期间没试的），stats pool 行输出
 	//空闲的最多留几个：合计不超过 64 个 16 页 pipe 的 1024 页（B3 审查 M1）。fs.pipe-user-pages-soft 按 uid、按容量计页，
 	//池里的空 pipe 也算，留多了同 uid 的其他进程（以 root 运行时含没有 CAP_SYS_RESOURCE 的容器 root）只能拿到 2 页的 pipe。
-	//256 KiB 时 16 个，1 MiB 时 4 个；tcp_pipe_probe() 设置
+	//256 KiB 时 16 个，1 MiB 时 4 个；构造时取 tcp_pipe_probe() 算出的 tcp_pipe_max_free
 	int max_free;
 	//新 pipe 因配额只有 2 页（不到 16 槽）之后，到下一个定时器周期之前不再建 pipe：这期间还回来的 pipe 马上会被别的方向借走，
 	//留到 64 个，否则超过 max_free 的被关掉、那些方向只能走拷贝（复审 R1：非 root 2000 条停读、--pipe-size 1024 时 63.4 → 73.2 Gbit/s）。
@@ -301,7 +305,7 @@ struct tcp_pipe_pool_t
 		grow_blocked=0;
 		grow_failures=0;
 		resize_fail=0;
-		max_free=tcp_pipe_pool_max_free;
+		max_free=tcp_pipe_max_free;
 		quota_hit=0;
 	}
 	int fail_level()//创建失败：到下一个定时器周期之前不再创建；只有第一次记 info
@@ -390,25 +394,6 @@ struct tcp_pipe_pool_t
 	}
 };
 
-//每个 worker 一份（P4 移进 worker_t）
-static obj_pool_t<tcp_pair_t> tcp_pair_pool;
-static obj_pool_t<udp_pair_t> udp_pair_pool;
-static tcp_buf_pool_t tcp_buf_pool;
-static char *tcp_scratch=0;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
-static tcp_pipe_pool_t tcp_pipe_pool;
-static tcp_pipe_t tcp_pipe_scratch={-1,-1};//splice 都读进它，用法同 tcp_scratch（D47）
-//fd 用完（accept4、上游 socket() 或 UDP 会话 socket() 返回 EMFILE/ENFILE）时关掉空闲 pipe 与 scratch pipe，给 socket 腾出 fd，
-//并暂停创建到下一个定时器周期（D52）；返回关掉的个数，不为 0 时调用方再试一次。方向持有的 pipe 里有数据，不动
-static int tcp_pipe_trim()
-{
-	int n=tcp_pipe_pool.free_cnt+(tcp_pipe_scratch.r>=0);
-	while(tcp_pipe_pool.free_cnt>0) tcp_pipe_pool.discard(tcp_pipe_pool.free_pipes[--tcp_pipe_pool.free_cnt]);
-	if(tcp_pipe_scratch.r>=0) tcp_pipe_pool.discard(tcp_pipe_scratch);
-	tcp_pipe_pool.blocked=1;
-	tcp_pipe_pool.quota_hit=0;//fd 不够时池不放宽到 64（复审 R1）
-	if(n>0) mylog(log_debug,"[tcp]out of file descriptors, closed %d idle pipes\n",n);
-	return n;
-}
 //启动时用一个 pipe 试一次 tcp_pipe_size（D57）：超过 fs.pipe-max-size 又没有 CAP_SYS_RESOURCE（只认初始 user namespace）时 EPERM，
 //降到 pipe-max-size：给了 --pipe-size 时 warn，默认值只记 info（同 D40）。别的失败（如配额已满）留给 create() 逐个回退
 static void tcp_pipe_probe()
@@ -448,7 +433,7 @@ static void tcp_pipe_probe()
 		close(fds[1]);
 	}
 	splice_turn_max=tcp_pipe_size<=256*1024?256*1024:tcp_pipe_size/(256*1024)*tcp_pipe_size;
-	tcp_pipe_pool.max_free=tcp_pipe_pool_max_free*16/max(16,tcp_pipe_size/page);
+	tcp_pipe_max_free=tcp_pipe_pool_max_free*16/max(16,tcp_pipe_size/page);
 }
 //splice 写不完时对目的端调用（D54）：主机越过 tcp_mem 压力线时内核把目的 socket 的 sndbuf 缩到当时队列的一半（sk_stream_moderate_sndbuf），
 //压力期间不再放大。回环这类 MSS 接近 64 KiB 的目的端缩完装不下 2 段，只有 1 段在途，接收方对单个满长段延迟 ACK（约 40 ms），
@@ -488,14 +473,15 @@ static const int udp_slot_len=2048;
 //U5：一次 GSO 发送最多这么多段。UDP_MAX_SEGMENTS 在 4.18–6.8 是 64、6.9 起 128（部分 LTS 已回移），按最小值；GRO 本身最多聚合 64 段
 static const int udp_gso_max_segs=64;
 //收包的 cmsg（UDP_GRO，int）与发包的 cmsg（UDP_SEGMENT，u16）共用这个大小；union 保证 cmsghdr 的对齐。
-//64 位 musl 的 cmsghdr 在 cmsg_len 旁有填充，内核读的是 size_t：只按字段名写，缓冲在 BSS 里，填充恒为 0
+//64 位 musl 的 cmsghdr 在 cmsg_len 旁有填充，内核读的是 size_t：只按字段名写，缓冲在 worker_new() 清零的页里，填充恒为 0
 union udp_ctrl_t
 {
 	cmsghdr hdr;
 	char buf[CMSG_SPACE(sizeof(int))];
 };
 //UDP 监听 socket 的入向批（U1、U3，D34）。每条消息两段 iov：2 KB 的槽（64 个连续排列，MTU 级的包只碰这里）加本消息自己的溢出区，
-//合计 max_data_len_udp；溢出区是 BSS，只有大于 2 KB 的包才碰到它的页，常驻内存随大包增长，最多约 4 MiB
+//合计 max_data_len_udp；每个 worker 一份（M1，原为 BSS），在 worker_new() 用 mmap 分配的页里：溢出区只有大于 2 KB 的包才碰到它的页，
+//常驻内存随大包增长，最多约 4 MiB
 struct udp_batch_t
 {
 	mmsghdr in[udp_batch_max];//recvmmsg 用：msg_name 指向 addr[i]，iov 固定指向 slot[i]、overflow[i]
@@ -537,7 +523,7 @@ struct udp_batch_t
 		c.hdr.cmsg_type=UDP_SEGMENT;
 		c.hdr.cmsg_len=CMSG_LEN(sizeof(uint16_t));//内核要求恰好是这个长度，否则 EINVAL
 	}
-	void attach_ctrl()//第一个监听 socket 开了 UDP_GRO 之后调用一次
+	void attach_ctrl()//所属 worker 的监听 socket 开了 UDP_GRO 之后调用（udp_gro_listen，可重复）
 	{
 		for(int i=0;i<udp_batch_max;i++)
 		{
@@ -569,11 +555,10 @@ struct udp_batch_t
 		rn=0;
 	}
 };
-static udp_batch_t udp_batch;
-//发送用的 iov：第 i 个包的前 2 KB 在 slot[i]，其余在 overflow[i]
-static inline void udp_batch_set_iov(mmsghdr &m,iovec *iov,int i,int len)
+//发送用的 iov：第 i 个包的前 2 KB 在 b.slot[i]，其余在 b.overflow[i]
+static inline void udp_batch_set_iov(udp_batch_t &b,mmsghdr &m,iovec *iov,int i,int len)
 {
-	iov[0].iov_base=udp_batch.slot[i];
+	iov[0].iov_base=b.slot[i];
 	if(len<=udp_slot_len)
 	{
 		iov[0].iov_len=len;
@@ -582,7 +567,7 @@ static inline void udp_batch_set_iov(mmsghdr &m,iovec *iov,int i,int len)
 	else
 	{
 		iov[0].iov_len=udp_slot_len;
-		iov[1].iov_base=udp_batch.overflow[i];
+		iov[1].iov_base=b.overflow[i];
 		iov[1].iov_len=len-udp_slot_len;
 		m.msg_hdr.msg_iovlen=2;
 	}
@@ -617,9 +602,9 @@ static inline int udp_recv_gso(msghdr &h)
 }
 //U5：发送条目 m 发第 i 个槽里 len 字节的包，槽里是 GRO 合并包且多于 1 段时挂 UDP_SEGMENT（段长同收到的），否则不挂：
 //没有 TX 校验和 offload 的出口在 6.11 以前连单段的 GSO 也报 EIO（探针实测）
-static inline void udp_batch_set_gso(mmsghdr &m,udp_ctrl_t &c,int i,int len)
+static inline void udp_batch_set_gso(udp_batch_t &b,mmsghdr &m,udp_ctrl_t &c,int i,int len)
 {
-	int g=udp_batch.gso[i];
+	int g=b.gso[i];
 	if(g!=0&&len>g)
 	{
 		DEBUG_ASSERT(g<=0xffff);
@@ -756,8 +741,10 @@ struct udp_table_t:not_copy_able_t
 	}
 };
 
+struct worker_t;
 struct conn_manager_udp_t
 {
+	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把会话还回它的池
 	udp_table_t sessions;
 	udp_pair_t *last_hit;//上一次查到的会话：同一客户端连续来包时不算哈希、不查表；释放这个会话时清零
 
@@ -773,6 +760,7 @@ struct conn_manager_udp_t
 
 	conn_manager_udp_t()
 	{
+		worker=0;
 		last_hit=0;
 		last_clear_time=0;
 		//clear_it=udp_pair_list.begin();
@@ -794,25 +782,7 @@ struct conn_manager_udp_t
 		return pair;
 	}
 
-	int erase(udp_pair_t *pair)
-	{
-		DEBUG_ASSERT(pair->batch_group<0);
-		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &pair->ev);
-
-		mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",pair->adress.get_str(),lru.size()-1);
-		mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
-
-		//归还后对象还留着旧地址：last_hit 不清零的话，这个客户端的下一个包会命中已归还的对象
-		if(last_hit==pair) last_hit=0;
-		sessions.erase(pair,udp_key_hash(pair->adress));
-
-		close(pair->fd);
-		lru.erase(pair);
-		udp_pair_pool.put(pair);
-
-		return 0;
-	}
+	int erase(udp_pair_t *pair);//定义在 worker_t 之后
 
 	int clear_remote_index(int remote_index)
 	{
@@ -833,9 +803,9 @@ struct conn_manager_udp_t
 
 	int clear_inactive()
 	{
-		if(get_current_time()-last_clear_time>conn_clear_interval)
+		if(lru.clock->now()-last_clear_time>conn_clear_interval)
 		{
-			last_clear_time=get_current_time();
+			last_clear_time=lru.clock->now();
 			return clear_inactive0();
 		}
 		return 0;
@@ -849,7 +819,7 @@ struct conn_manager_udp_t
 		int size=lru.size();
 		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
 
-		u64_t current_time=get_current_time();
+		u64_t current_time=lru.clock->now();
 		num_to_clean=min(num_to_clean,size);
 		for(;;)
 		{
@@ -870,6 +840,7 @@ struct conn_manager_udp_t
 
 struct conn_manager_tcp_t
 {
+	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把缓冲、pipe 与连接对还回它的池
 	long long last_clear_time;
 	lru_collector_t lru;
 	//O1 累计计数，SIGUSR1 时输出：total 建立的连接对数；bytes 发送成功的字节数，[0] 客户端→上游（从 local 读、发往 remote），[1] 上游→客户端；
@@ -880,51 +851,15 @@ struct conn_manager_tcp_t
 	u64_t splice_fallback;
 	conn_manager_tcp_t()
 	{
+		worker=0;
 		last_clear_time=0;
 		total=0;
 		memset(bytes,0,sizeof(bytes));
 		memset(splice_bytes,0,sizeof(splice_bytes));
 		splice_fallback=0;
 	}
-	int erase(tcp_pair_t *pair)
-	{
-		//两侧都 stop 之后才能归还：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，归还后不会再有它的回调。
-		//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11），
-		//fd_reify 对它直接 ADD，不受 libev 缓存的旧掩码影响（T13）
-		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &pair->local.ev);
-		ev_io_stop(loop, &pair->remote.ev);
-
-		close(pair->local.fd);
-		close(pair->remote.fd);
-		mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
-		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
-		lru.erase(pair);
-		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
-		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
-		if(pair->local.pipe.r>=0) tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
-		if(pair->remote.pipe.r>=0) tcp_pipe_pool.discard(pair->remote.pipe);
-		tcp_pair_pool.put(pair);
-		return 0;
-	}
-	int erase_closed(tcp_pair_t *pair)//just a copy of erase()
-	{
-		struct ev_loop * loop= ev_default_loop (0);
-		ev_io_stop(loop, &pair->local.ev);
-		ev_io_stop(loop, &pair->remote.ev);
-
-		close(pair->local.fd);
-		close(pair->remote.fd);
-		mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
-		mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
-		lru.erase(pair);
-		if(pair->local.buf) tcp_buf_pool.put(pair->local.buf);
-		if(pair->remote.buf) tcp_buf_pool.put(pair->remote.buf);
-		if(pair->local.pipe.r>=0) tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
-		if(pair->remote.pipe.r>=0) tcp_pipe_pool.discard(pair->remote.pipe);
-		tcp_pair_pool.put(pair);
-		return 0;
-	}
+	int erase(tcp_pair_t *pair);//定义在 worker_t 之后
+	int erase_closed(tcp_pair_t *pair);
 	int clear_remote_index(int remote_index)
 	{
 		int cnt=0;
@@ -944,9 +879,9 @@ struct conn_manager_tcp_t
 
 	int clear_inactive()
 	{
-		if(get_current_time()-last_clear_time>conn_clear_interval)
+		if(lru.clock->now()-last_clear_time>conn_clear_interval)
 		{
-			last_clear_time=get_current_time();
+			last_clear_time=lru.clock->now();
 			return clear_inactive0();
 		}
 		return 0;
@@ -961,7 +896,7 @@ struct conn_manager_tcp_t
 		int size=lru.size();
 		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
 
-		u64_t current_time=get_current_time();
+		u64_t current_time=lru.clock->now();
 		num_to_clean=min(num_to_clean,size);
 		for(;;)
 		{
@@ -1025,6 +960,7 @@ struct forward_rule_t:not_copy_able_t
 	balance_strategy_t balance_strategy;
 	vector<int> balance_weights;
 	vector<balance_rr_node_t> rr_nodes;
+	worker_t *worker;//所属 worker（M1）：本对象是这条规则在它那里的运行时，连接对与会话经 owner 找到它
 	int local_listen_fd_tcp;
 	int local_listen_fd_udp;
 	ev_io tcp_accept_watcher;
@@ -1037,13 +973,129 @@ struct forward_rule_t:not_copy_able_t
 		enable_tcp=0;
 		enable_udp=0;
 		balance_strategy=balance_strategy_off;
+		worker=0;
 		local_listen_fd_tcp=-1;
 		local_listen_fd_udp=-1;
 	}
 };
 
-static list<forward_rule_t> forward_rules;
+//每个 worker 的全部可变状态（M1，D59、D60）：自己的 loop 与时间缓存、规则运行时（监听 fd 与 watcher、管理器与计数、rr_nodes、
+//remote 地址副本，DNS 状态在 M3 之前也留在这里）、连接对象池、缓冲池与 scratch、pipe 池与 scratch pipe、UDP 批缓冲。
+//热路径经 forward_rule_t::worker（连接对与会话经 owner）取到它，不用 thread_local（mips24kc 上 TLS 指针是 rdhwr，可能由内核模拟，
+//T11 审查 F10），也不用 ev_userdata（ev.c 里的非内联函数）。threads=1 时只有一个 worker，用 ev_default_loop、在主线程运行（D59）
+struct worker_t:not_copy_able_t
+{
+	struct ev_loop *loop;
+	loop_clock_t clock;
+	char *tcp_scratch;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
+	tcp_pipe_t tcp_pipe_scratch;//splice 都读进它，用法同 tcp_scratch（D47）
+	tcp_buf_pool_t tcp_buf_pool;
+	tcp_pipe_pool_t tcp_pipe_pool;
+	obj_pool_t<tcp_pair_t> tcp_pair_pool;
+	obj_pool_t<udp_pair_t> udp_pair_pool;
+	list<forward_rule_t> rules;//各规则在本 worker 的运行时，按规则序号排列
+	ev_prepare udp_flush_watcher;//每轮阻塞之前发出回程批（U4），有规则开 UDP 时才 start
+	udp_batch_t udp_batch;
+	worker_t(struct ev_loop *l)
+	{
+		loop=l;
+		clock.loop=l;
+		tcp_scratch=0;
+		tcp_pipe_scratch.r=tcp_pipe_scratch.w=-1;
+		//清零等同 ev_init（同 T11 的 watcher），不用 ev_prepare_init 宏：不新增 strict-aliasing 告警；回调由 event_loop() 设
+		memset(&udp_flush_watcher,0,sizeof(udp_flush_watcher));
+	}
+};
+//worker_t 很大（udp_batch 约 4.2 MiB）：在 mmap 的匿名页上就地构造，进程生命周期内不释放（myexit 直接 _exit）。页面清零、按需分配：
+//udp_batch 的溢出区只有大包落到时才常驻；构造函数不写的字节（64 位 musl msghdr 的 __pad1/__pad2）恒为 0，udp_send_group 直接调
+//syscall(SYS_sendmmsg) 依赖这一点（原来靠 BSS 清零）。new 不保证清零，memset 会让溢出区全部常驻。
+//不用透明大页（M1 审查 L1）：THP=always 时，第一次写入整段落在映射内、按 2 MiB 对齐的区间就分配一个 2 MiB 大页，khugepaged
+//也会把只有一页常驻的这种区间合并成大页（原来的 BSS 同样如此）；有的内核把这么大的匿名映射按 2 MiB 对齐，构造函数的写入就在启动时
+//整页分配。溢出区于是不再按需常驻。没有 THP 的内核返回 EINVAL，不用管
+static worker_t *worker_new(struct ev_loop *loop)
+{
+	void *p=mmap(0,sizeof(worker_t),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
+	if(p==MAP_FAILED)
+	{
+		mylog(log_fatal,"mmap for a %d-byte worker failed, %s\n",(int)sizeof(worker_t),get_sock_error());
+		myexit(1);
+	}
+	madvise(p,sizeof(worker_t),MADV_NOHUGEPAGE);
+	return new(p) worker_t(loop);
+}
+//主线程的 worker 表（M1：threads=1 时只有一个）：定时器、SIGUSR1、DNS 结果经它找到各 worker 的规则。worker 的热路径不碰它
+static vector<worker_t *> workers;
 
+int conn_manager_tcp_t::erase(tcp_pair_t *pair)
+{
+	//两侧都 stop 之后才能归还：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，归还后不会再有它的回调。
+	//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11），
+	//fd_reify 对它直接 ADD，不受 libev 缓存的旧掩码影响（T13）
+	struct ev_loop * loop= worker->loop;
+	ev_io_stop(loop, &pair->local.ev);
+	ev_io_stop(loop, &pair->remote.ev);
+
+	close(pair->local.fd);
+	close(pair->remote.fd);
+	mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
+	mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
+	lru.erase(pair);
+	if(pair->local.buf) worker->tcp_buf_pool.put(pair->local.buf);
+	if(pair->remote.buf) worker->tcp_buf_pool.put(pair->remote.buf);
+	if(pair->local.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
+	if(pair->remote.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->remote.pipe);
+	worker->tcp_pair_pool.put(pair);
+	return 0;
+}
+int conn_manager_tcp_t::erase_closed(tcp_pair_t *pair)//just a copy of erase()
+{
+	struct ev_loop * loop= worker->loop;
+	ev_io_stop(loop, &pair->local.ev);
+	ev_io_stop(loop, &pair->remote.ev);
+
+	close(pair->local.fd);
+	close(pair->remote.fd);
+	mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
+	mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
+	lru.erase(pair);
+	if(pair->local.buf) worker->tcp_buf_pool.put(pair->local.buf);
+	if(pair->remote.buf) worker->tcp_buf_pool.put(pair->remote.buf);
+	if(pair->local.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
+	if(pair->remote.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->remote.pipe);
+	worker->tcp_pair_pool.put(pair);
+	return 0;
+}
+int conn_manager_udp_t::erase(udp_pair_t *pair)
+{
+	DEBUG_ASSERT(pair->batch_group<0);
+	struct ev_loop * loop= worker->loop;
+	ev_io_stop(loop, &pair->ev);
+
+	mylog(log_info,"[udp]inactive connection {%s} cleared, udp connections=%d\n",pair->adress.get_str(),lru.size()-1);
+	mylog(log_debug,"[udp] lru.size()=%d\n",(int)lru.size()-1);
+
+	//归还后对象还留着旧地址：last_hit 不清零的话，这个客户端的下一个包会命中已归还的对象
+	if(last_hit==pair) last_hit=0;
+	sessions.erase(pair,udp_key_hash(pair->adress));
+
+	close(pair->fd);
+	lru.erase(pair);
+	worker->udp_pair_pool.put(pair);
+
+	return 0;
+}
+//fd 用完（accept4、上游 socket() 或 UDP 会话 socket() 返回 EMFILE/ENFILE）时关掉空闲 pipe 与 scratch pipe，给 socket 腾出 fd，
+//并暂停创建到下一个定时器周期（D52）；返回关掉的个数，不为 0 时调用方再试一次。方向持有的 pipe 里有数据，不动
+static int tcp_pipe_trim(worker_t &w)
+{
+	int n=w.tcp_pipe_pool.free_cnt+(w.tcp_pipe_scratch.r>=0);
+	while(w.tcp_pipe_pool.free_cnt>0) w.tcp_pipe_pool.discard(w.tcp_pipe_pool.free_pipes[--w.tcp_pipe_pool.free_cnt]);
+	if(w.tcp_pipe_scratch.r>=0) w.tcp_pipe_pool.discard(w.tcp_pipe_scratch);
+	w.tcp_pipe_pool.blocked=1;
+	w.tcp_pipe_pool.quota_hit=0;//fd 不够时池不放宽到 64（复审 R1）
+	if(n>0) mylog(log_debug,"[tcp]out of file descriptors, closed %d idle pipes\n",n);
+	return n;
+}
 struct dns_refresh_request_t
 {
 	int rule_index;
@@ -1129,6 +1181,61 @@ static void dns_worker_main()
 	}
 }
 
+//把一条 DNS 结果写进一个 worker 的规则副本（D60：M3 之前 DNS 状态留在各 worker 的规则里，M3 改为主线程主表加消息下发）
+static void dns_apply_result(worker_t &w,dns_refresh_result_t &result)
+{
+	forward_rule_t *rule_p=0;
+	for(auto rule_it=w.rules.begin();rule_it!=w.rules.end();++rule_it)
+	{
+		if(rule_it->index==result.rule_index)
+		{
+			rule_p=&*rule_it;
+			break;
+		}
+	}
+	if(rule_p==0)
+	{
+		return;
+	}
+	forward_rule_t &rule=*rule_p;
+	if(result.remote_index<0||result.remote_index>=(int)rule.remote_targets.size())
+	{
+		return;
+	}
+	remote_target_t &target=rule.remote_targets[result.remote_index];
+	if(target.is_domain==0)
+	{
+		return;
+	}
+	if(strcmp(target.host,result.host)!=0||target.port!=result.port)
+	{
+		return;
+	}
+	target.dns_query_pending=0;
+
+	if(result.ok==0)
+	{
+		mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",rule.index,result.remote_index,target.host,target.port,result.err);
+		return;
+	}
+	if(result.current_still_valid)
+	{
+		return;
+	}
+	if(result.next_addr==target.addr)
+	{
+		return;
+	}
+	char old_addr[max_addr_len];
+	char new_addr[max_addr_len];
+	target.addr.to_str(old_addr);
+	result.next_addr.to_str(new_addr);
+	target.addr=result.next_addr;
+	int tcp_closed=rule.tcp_manager.clear_remote_index(result.remote_index);
+	int udp_closed=rule.udp_manager.clear_remote_index(result.remote_index);
+	mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,result.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
+}
+
 static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int revents)
 {
 	std::deque<dns_refresh_result_t> results;
@@ -1139,57 +1246,8 @@ static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int re
 
 	for(auto it=results.begin();it!=results.end();++it)
 	{
-		dns_refresh_result_t &result=*it;
-		forward_rule_t *rule_p=0;
-		for(auto rule_it=forward_rules.begin();rule_it!=forward_rules.end();++rule_it)
-		{
-			if(rule_it->index==result.rule_index)
-			{
-				rule_p=&*rule_it;
-				break;
-			}
-		}
-		if(rule_p==0)
-		{
-			continue;
-		}
-		forward_rule_t &rule=*rule_p;
-		if(result.remote_index<0||result.remote_index>=(int)rule.remote_targets.size())
-		{
-			continue;
-		}
-		remote_target_t &target=rule.remote_targets[result.remote_index];
-		if(target.is_domain==0)
-		{
-			continue;
-		}
-		if(strcmp(target.host,result.host)!=0||target.port!=result.port)
-		{
-			continue;
-		}
-		target.dns_query_pending=0;
-
-		if(result.ok==0)
-		{
-			mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",rule.index,result.remote_index,target.host,target.port,result.err);
-			continue;
-		}
-		if(result.current_still_valid)
-		{
-			continue;
-		}
-		if(result.next_addr==target.addr)
-		{
-			continue;
-		}
-		char old_addr[max_addr_len];
-		char new_addr[max_addr_len];
-		target.addr.to_str(old_addr);
-		result.next_addr.to_str(new_addr);
-		target.addr=result.next_addr;
-		int tcp_closed=rule.tcp_manager.clear_remote_index(result.remote_index);
-		int udp_closed=rule.udp_manager.clear_remote_index(result.remote_index);
-		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,result.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
+		for(size_t i=0;i<workers.size();i++)
+			dns_apply_result(*workers[i],*it);
 	}
 }
 
@@ -1200,7 +1258,7 @@ static void start_dns_worker(struct ev_loop *loop)
 		return;
 	}
 	int has_domain=0;
-	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	for(auto it=app_config.rules.begin();it!=app_config.rules.end();++it)
 	{
 		for(size_t i=0;i<it->remote_targets.size();i++)
 		{
@@ -1229,7 +1287,7 @@ static void start_dns_worker(struct ev_loop *loop)
 
 static void schedule_dns_refresh(forward_rule_t &rule)
 {
-	my_time_t now=get_current_time();
+	my_time_t now=rule.worker->clock.now();
 	for(size_t i=0;i<rule.remote_targets.size();i++)
 	{
 		remote_target_t &target=rule.remote_targets[i];
@@ -1364,6 +1422,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	tcp_pair_t &tcp_pair=*(tcp_pair_t *)watcher->data;
 	DEBUG_ASSERT(tcp_pair.owner!=0);
 	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
+	worker_t &w=*tcp_pair.owner->worker;
 
 	//epoll_ctl 失败（如 ADD 超过 fs.epoll.max_user_watches 的 ENOSPC、ENOMEM）：libev 的 fd_kill 已停掉这个 watcher，只释放这一对（C9）。
 	//两侧都失败时，另一侧还没回调的 EV_ERROR 由 erase_closed 里的 ev_io_stop 清除
@@ -1463,14 +1522,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		//上游建连中不写出，只走 recv
 		if(my_info.splice_next&&other_info.connected&&!disable_splice)
 		{
-			if(tcp_pipe_scratch.r<0&&tcp_pipe_pool.get(tcp_pipe_scratch)!=0)
+			if(w.tcp_pipe_scratch.r<0&&w.tcp_pipe_pool.get(w.tcp_pipe_scratch)!=0)
 			{
 				conn_manager_tcp.splice_fallback++;
 			}
 			else
 			{
-				DEBUG_ASSERT(tcp_pipe_len(tcp_pipe_scratch)==0);
-				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,tcp_pipe_size,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				DEBUG_ASSERT(tcp_pipe_len(w.tcp_pipe_scratch)==0);
+				recv_len=splice(my_fd,0,w.tcp_pipe_scratch.w,0,tcp_pipe_size,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 				spliced=1;
 				//队首是紧急数据（对端 MSG_OOB）时非阻塞 splice 返回 EAGAIN，epoll 却一直报可读，这一次改用 recv：
 				//它跳过紧急字节（没有 SO_OOBINLINE），与拷贝路径一致。别的原因（如页分配失败）同样交给 recv
@@ -1486,17 +1545,17 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		if(!spliced)
 		{
-			if(tcp_scratch==0)
+			if(w.tcp_scratch==0)
 			{
-				tcp_scratch=tcp_buf_pool.get();
-				if(tcp_scratch==0)
+				w.tcp_scratch=w.tcp_buf_pool.get();
+				if(w.tcp_scratch==0)
 				{
 					mylog(log_warn,"[tcp]connection {%s} closed bc of malloc for a %d-byte buffer failed\n",tcp_pair.addr.get_str(),max_data_len_tcp);
 					conn_manager_tcp.erase_closed(&tcp_pair);
 					return;
 				}
 			}
-			recv_len=recv(my_fd,tcp_scratch,max_data_len_tcp,0);
+			recv_len=recv(my_fd,w.tcp_scratch,max_data_len_tcp,0);
 		}
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
@@ -1549,7 +1608,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			for(int moved=recv_len;;moved+=recv_len)//moved：本回调读进 pipe 的字节
 			{
 				nodelay_before_send(other_info,my_info.data_len);
-				send_len=splice(tcp_pipe_scratch.r,0,other_fd,0,my_info.data_len,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				send_len=splice(w.tcp_pipe_scratch.r,0,other_fd,0,my_info.data_len,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 				if(send_len>0)
 				{
 					my_info.data_len-=send_len;
@@ -1559,14 +1618,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				if(my_info.data_len!=0)
 				{
 					//没写完（含 EAGAIN；出错时留给写分支，同 send）：scratch pipe 连同数据交给本方向，下一次 splice 前再从池里取一个
-					my_info.pipe=tcp_pipe_scratch;
-					tcp_pipe_scratch.r=tcp_pipe_scratch.w=-1;
+					my_info.pipe=w.tcp_pipe_scratch;
+					w.tcp_pipe_scratch.r=w.tcp_pipe_scratch.w=-1;
 					tcp_unshrink_sndbuf(other_info);
 					break;
 				}
 				//写完了：源端这次读够 splice_more_min 就接着搬，直到本回调搬满 splice_turn_max（D53、D55）
 				if(moved>=splice_turn_max||recv_len<splice_more_min) break;
-				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,min(tcp_pipe_size,splice_turn_max-moved),SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				recv_len=splice(my_fd,0,w.tcp_pipe_scratch.w,0,min(tcp_pipe_size,splice_turn_max-moved),SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 				if(recv_len<=0)
 				{
 					//EOF 与 EAGAIN（含紧急数据）留给下一次回调按第一轮处理：EOF 一直可读，下一次 splice 仍读到 0。
@@ -1585,7 +1644,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		else
 		{
-			my_info.begin=tcp_scratch;
+			my_info.begin=w.tcp_scratch;
 			if(other_info.connected)
 			{
 				DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
@@ -1601,8 +1660,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			if(my_info.data_len!=0)
 			{
 				//没发完（含上游还在建连）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
-				my_info.buf=tcp_scratch;
-				tcp_scratch=0;
+				my_info.buf=w.tcp_scratch;
+				w.tcp_scratch=0;
 			}
 		}
 
@@ -1686,11 +1745,11 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		{
 			if(other_info.pipe.r>=0)
 			{
-				tcp_pipe_pool.put(other_info.pipe);
+				w.tcp_pipe_pool.put(other_info.pipe);
 			}
 			else
 			{
-				tcp_buf_pool.put(other_info.buf);
+				w.tcp_buf_pool.put(other_info.buf);
 				other_info.buf=0;
 			}
 
@@ -1729,6 +1788,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
 	DEBUG_ASSERT(rule!=0);
 	conn_manager_tcp_t &conn_manager_tcp=rule->tcp_manager;
+	worker_t &w=*rule->worker;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
 	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
@@ -1749,7 +1809,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		if(err==EAGAIN||err==EWOULDBLOCK) return 0;//backlog 已取空，是一轮的正常结束，不记日志
 		mylog(log_warn,"[tcp]accept failed %d %s\n", new_fd,get_sock_error());
 		//fd 用完时先关掉空闲 pipe，关掉了就接着 accept（客户端还在 backlog 里），否则按 C6 停到下一个周期（D52）
-		if((err==EMFILE||err==ENFILE)&&tcp_pipe_trim()>0) return 1;
+		if((err==EMFILE||err==ENFILE)&&tcp_pipe_trim(w)>0) return 1;
 		if(err!=EINTR&&err!=ECONNABORTED)
 		{
 			//EMFILE/ENFILE/ENOMEM or an LSM denial: the connection stays in the backlog and the level-triggered watcher would fire again at once; clear_timer_cb restarts it
@@ -1769,7 +1829,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		//continue;
 	}
 	//先取对象再建上游 socket：分配失败时上游看不到这次连接，也不推进 roundrobin
-	tcp_pair_t *new_pair=tcp_pair_pool.get();
+	tcp_pair_t *new_pair=w.tcp_pair_pool.get();
 	if(new_pair==0)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
@@ -1781,12 +1841,12 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 
 
 	int new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
-	if(new_remote_fd<0&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim()>0)//fd 用完时关掉空闲 pipe 再试一次（D52）
+	if(new_remote_fd<0&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim(w)>0)//fd 用完时关掉空闲 pipe 再试一次（D52）
 		new_remote_fd = socket(remote_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
 	if(new_remote_fd<0)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",tmp_addr.get_str(),get_sock_error());
-		tcp_pair_pool.put(new_pair);
+		w.tcp_pair_pool.put(new_pair);
 		close(new_fd);
 		return 1;
 	}
@@ -1798,7 +1858,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	{
 		//立即失败（如无路由的 ENETUNREACH、本地端口耗尽的 EADDRNOTAVAIL）：不建连接对
 		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",tmp_addr.get_str(),rule->remote_targets[remote_index].remote_str,get_sock_error());
-		tcp_pair_pool.put(new_pair);
+		w.tcp_pair_pool.put(new_pair);
 		close(new_remote_fd);
 		close(new_fd);
 		//EADDRNOTAVAIL 要先扫完整个临时端口范围（每次可达数 ms）：结束本轮，端口耗尽时回到每次迭代拒绝一个
@@ -1872,30 +1932,39 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 }
 
-void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
+//一个 worker 每个定时器周期要做的事（M1）：清空闲连接、重启被停掉的监听 watcher、pipe 池标志复位与重扩。M2 起由每个 worker 自己 loop 上的定时器调用
+static void worker_tick(worker_t &w)
 {
-	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 	{
 		it->tcp_manager.clear_inactive();
 		it->udp_manager.clear_inactive();
-		schedule_dns_refresh(*it);
 		if(it->enable_tcp&&!ev_is_active(&it->tcp_accept_watcher))
 		{
-			ev_io_start(loop,&it->tcp_accept_watcher);
+			ev_io_start(w.loop,&it->tcp_accept_watcher);
 		}
 		if(it->enable_udp&&!ev_is_active(&it->udp_accept_watcher))
 		{
-			ev_io_start(loop,&it->udp_accept_watcher);
+			ev_io_start(w.loop,&it->udp_accept_watcher);
 		}
 	}
-	tcp_pipe_pool.blocked=0;//创建 pipe 失败后每个周期最多再试一次（每次失败都会重新置位）
-	tcp_pipe_pool.grow_blocked=0;//扩容同上
-	if(tcp_pipe_pool.quota_hit)//复审 R1：配额满期间多留的空闲 pipe 裁回 max_free
+	w.tcp_pipe_pool.blocked=0;//创建 pipe 失败后每个周期最多再试一次（每次失败都会重新置位）
+	w.tcp_pipe_pool.grow_blocked=0;//扩容同上
+	if(w.tcp_pipe_pool.quota_hit)//复审 R1：配额满期间多留的空闲 pipe 裁回 max_free
 	{
-		tcp_pipe_pool.quota_hit=0;
-		while(tcp_pipe_pool.free_cnt>tcp_pipe_pool.max_free) tcp_pipe_pool.discard(tcp_pipe_pool.free_pipes[--tcp_pipe_pool.free_cnt]);
+		w.tcp_pipe_pool.quota_hit=0;
+		while(w.tcp_pipe_pool.free_cnt>w.tcp_pipe_pool.max_free) w.tcp_pipe_pool.discard(w.tcp_pipe_pool.free_pipes[--w.tcp_pipe_pool.free_cnt]);
 	}
-	if(tcp_pipe_pool.resize_fail!=0&&tcp_pipe_scratch.r>=0) tcp_pipe_pool.regrow(tcp_pipe_scratch);
+	if(w.tcp_pipe_pool.resize_fail!=0&&w.tcp_pipe_scratch.r>=0) w.tcp_pipe_pool.regrow(w.tcp_pipe_scratch);
+}
+//threads=1 时 worker 与主线程共用默认 loop（D59）：这一个定时器先做各 worker 的事，再做主线程的事（DNS 调度、刷新日志）
+void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
+{
+	for(size_t i=0;i<workers.size();i++)
+		worker_tick(*workers[i]);
+	for(size_t i=0;i<workers.size();i++)
+		for(auto it=workers[i]->rules.begin();it!=workers[i]->rules.end();++it)
+			schedule_dns_refresh(*it);
 	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
@@ -1906,7 +1975,7 @@ static int udp_gro_set(int fd)
 	int one=1;
 	return setsockopt(fd,SOL_UDP,UDP_GRO,&one,sizeof(one));
 }
-static void udp_flush_return();
+static void udp_flush_return(udp_batch_t &b);
 //会话 socket 可读（回程，U4）：回包收进回程批，由 udp_flush_return 跨会话发给客户端
 void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
@@ -1931,7 +2000,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	}*/
 
-	udp_batch_t &b=udp_batch;
+	udp_batch_t &b=udp_pair.owner->worker->udp_batch;
 	DEBUG_ASSERT(b.rn<udp_batch_max);//批满时当场就发出了
 	//每次回调只收一次（D36，同 D35）：最多 udp_return_quota 个（D37），也不超过批里剩下的空位，没收完的由水平触发的 epoll 下一轮再报
 	int vlen=udp_batch_max-b.rn;
@@ -1971,12 +2040,13 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	b.rn+=n;
 	conn_manager_udp.lru.update(&udp_pair);
 	//udp_pair.last_active_time=get_current_time();
-	if(b.rn==udp_batch_max) udp_flush_return();
+	if(b.rn==udp_batch_max) udp_flush_return(b);
 }
 //客户端 tmp_addr 的第一个包：建会话。失败时返回 0，这个包丢弃；hash 是 find() 算出的 tmp_addr 的哈希。不内联进逐包的循环
 static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *loop,forward_rule_t *rule,address_t &tmp_addr,u32_t hash)
 {
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
+	worker_t &w=*rule->worker;
 	if(conn_manager_udp.lru.size()>=max_conn_num)
 	{
 		mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
@@ -1991,7 +2061,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	int remote_index=select_remote_index(*rule,tmp_addr);
 	address_t &remote_addr=rule->remote_targets[remote_index].addr;
 	int new_udp_fd=remote_addr.new_connected_udp_fd();
-	if(new_udp_fd==-1&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim()>0)//同 TCP：fd 用完时关掉空闲 pipe 再试一次（D52）
+	if(new_udp_fd==-1&&(errno==EMFILE||errno==ENFILE)&&tcp_pipe_trim(w)>0)//同 TCP：fd 用完时关掉空闲 pipe 再试一次（D52）
 		new_udp_fd=remote_addr.new_connected_udp_fd();
 	if(new_udp_fd==-1)
 	{
@@ -2002,7 +2072,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	if(udp_gro&&udp_gro_set(new_udp_fd)!=0)
 		mylog(log_debug,"[udp]setsockopt UDP_GRO failed on udp fd %d (%s)\n",new_udp_fd,get_sock_error());
 
-	udp_pair_t *new_pair=udp_pair_pool.get();
+	udp_pair_t *new_pair=w.udp_pair_pool.get();
 	if(new_pair==0)
 	{
 		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
@@ -2096,6 +2166,7 @@ struct udp_send_ctx_t
 	unsigned char *off;
 	int stride;
 	udp_pair_t *pair;//入向的会话；回程为 0
+	udp_batch_t &b;//所属 worker 的批：udp_send_split 用它的 seg
 };
 //第 i 条的 GSO 本身发不出去：这个会话这个方向此后不用 GSO。回程按客户端地址找到会话置位（会话已释放就只改本次发出的条目），
 //同一组里发往同一客户端的其余条目也改为逐包。计数；info 每条规则每个方向只写第一次，之后 debug（审查 L3）
@@ -2148,7 +2219,7 @@ static int udp_iov_range(const msghdr &src,size_t off,size_t len,iovec *dst)
 //数据报重发；其他错误丢掉这一块；EAGAIN 时把这个包剩下的数据报数记进 left、返回 -1，由调用方连同本组剩下的包一起计入 drop、记一行 warn
 static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &left)
 {
-	udp_batch_t &b=udp_batch;
+	udp_batch_t &b=c.b;
 	const mmsghdr &m=msgs[i];
 	const int gso=udp_msg_gso(m);
 	const size_t len=udp_msg_len(m);
@@ -2221,7 +2292,7 @@ static inline int udp_gso_split_needed(const mmsghdr &m,unsigned char gso_off)
 //U5：带 UDP_SEGMENT 的条目（GRO 合并包）发送失败时不按一个包丢，交给 udp_send_split 重发：GSO 本身的错误（udp_gso_errno）
 //先关掉它所属会话这个方向的 GSO（udp_gso_turn_off）再逐个数据报发，其他错误按至多上限段再发一次。pkts/drop 按数据报计。
 //直接调 syscall：64 位 musl 的 sendmmsg() 是逐条 sendmsg() 的循环（它的 msghdr 用 int 加填充，内核用 size_t）；
-//udp_batch.out/rout/seg 在 BSS 里，musl 的 __pad1/__pad2 从不写入、恒为 0，内核读到的 msg_iovlen/msg_controllen 就是本值
+//udp_batch.out/rout/seg 在 worker_new() 清零的页里，musl 的 __pad1/__pad2 从不写入、恒为 0，内核读到的 msg_iovlen/msg_controllen 就是本值
 static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 {
 	for(int sent=0;sent<cnt;)
@@ -2279,9 +2350,8 @@ static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 }
 //发出回程批（U4，D36）：按规则分组，每组对该规则的监听 socket 一次 sendmmsg，msg_name 是收包时拷下的客户端地址。
 //组按规则在批里首次出现的顺序，组内保持到达顺序；通常只有一个规则，扫一遍就放完
-static void udp_flush_return()
+static void udp_flush_return(udp_batch_t &b)
 {
-	udp_batch_t &b=udp_batch;
 	for(int i=0;i<b.rn;i++)
 	{
 		forward_rule_t *rule=b.rrule[i];
@@ -2294,15 +2364,15 @@ static void udp_flush_return()
 			mmsghdr &m=b.rout[cnt];
 			m.msg_hdr.msg_name=&b.raddr[j].inner;
 			m.msg_hdr.msg_namelen=b.raddr[j].get_len();
-			udp_batch_set_iov(m,b.rout_iov[cnt],j,b.rin[j].msg_len);
+			udp_batch_set_iov(b,m,b.rout_iov[cnt],j,b.rin[j].msg_len);
 			if(udp_gro)
 			{
-				udp_batch_set_gso(m,b.rout_ctrl[cnt],j,b.rin[j].msg_len);
+				udp_batch_set_gso(b,m,b.rout_ctrl[cnt],j,b.rin[j].msg_len);
 				b.rout_off[cnt]=b.roff[j];
 			}
 			cnt++;
 		}
-		udp_send_ctx_t c={rule->udp_manager,rule->local_listen_fd_udp,1,b.rout_off,1,0};
+		udp_send_ctx_t c={rule->udp_manager,rule->local_listen_fd_udp,1,b.rout_off,1,0,b};
 		udp_send_group(c,b.rout,cnt);
 	}
 	b.rn=0;
@@ -2311,14 +2381,15 @@ static void udp_flush_return()
 //反而在本轮的 I/O 回调之前执行
 static void udp_flush_cb(struct ev_loop *loop, ev_prepare *watcher, int revents)
 {
-	if(udp_batch.rn!=0) udp_flush_return();
+	udp_batch_t &b=((worker_t *)watcher->data)->udp_batch;
+	if(b.rn!=0) udp_flush_return(b);
 }
 //recvmmsg 收到的 n 个包（U1、U3）：逐包查找或新建会话，再按会话分组，每个会话一次 sendmmsg。会话内保持到达顺序，
 //各组按会话在本批首次出现的顺序发出
 static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 {
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
-	udp_batch_t &b=udp_batch;
+	udp_batch_t &b=rule->worker->udp_batch;
 	int groups=0;
 	for(int i=0;i<n;i++)
 	{
@@ -2374,8 +2445,8 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 	{
 		if(b.pair[i]==0) continue;
 		int j=b.group_pos[b.pair[i]->batch_group]++;
-		udp_batch_set_iov(b.out[j],b.out_iov[j],i,b.in[i].msg_len);
-		if(udp_gro) udp_batch_set_gso(b.out[j],b.out_ctrl[j],i,b.in[i].msg_len);
+		udp_batch_set_iov(b,b.out[j],b.out_iov[j],i,b.in[i].msg_len);
+		if(udp_gro) udp_batch_set_gso(b,b.out[j],b.out_ctrl[j],i,b.in[i].msg_len);
 	}
 	for(int g=0;g<groups;g++)
 	{
@@ -2383,7 +2454,7 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 		udp_pair.batch_group=-1;
 		conn_manager_udp.lru.update(&udp_pair);
 		int cnt=b.group_cnt[g];
-		udp_send_ctx_t c={conn_manager_udp,udp_pair.fd,0,&udp_pair.gso_off[0],0,&udp_pair};
+		udp_send_ctx_t c={conn_manager_udp,udp_pair.fd,0,&udp_pair.gso_off[0],0,&udp_pair,b};
 		udp_send_group(c,b.out+b.group_pos[g]-cnt,cnt);
 	}
 }
@@ -2400,11 +2471,12 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 
 	int local_listen_fd_udp=watcher->fd;
+	udp_batch_t &b=rule->worker->udp_batch;
 	//回程批占着同一组槽（D36）：先发出，入向这一批才能从 slot[0] 起收
-	if(udp_batch.rn!=0) udp_flush_return();
+	if(b.rn!=0) udp_flush_return(b);
 	//每次回调只收一批（D35）：没收完的由水平触发的 epoll 下一轮再报，一轮里入向最多占 udp_batch_max 个包，
 	//回程与 TCP 不会被长时间挤占
-	int n=recvmmsg(local_listen_fd_udp,udp_batch.in,udp_batch_max,MSG_DONTWAIT,0);//socket 本身也非阻塞；阻塞时会等凑满一批
+	int n=recvmmsg(local_listen_fd_udp,b.in,udp_batch_max,MSG_DONTWAIT,0);//socket 本身也非阻塞；阻塞时会等凑满一批
 	if(n<0)
 	{
 		//EAGAIN：唤醒本轮的包校验和错误、已被内核丢掉
@@ -2414,12 +2486,13 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 	udp_forward_batch(loop,rule,n);
 }
-//SIGUSR1 输出统计（O1，D25–D27）：每条规则的 TCP、UDP 各一行，再加一行进程级的池。当前连接数、半关闭对数、
-//持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上
-void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
+//SIGUSR1 输出统计（O1，D25–D27）：一个 worker 的每条规则 TCP、UDP 各一行，再加一行它的池。当前连接数、半关闭对数、
+//持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上。
+//threads=1 时只有一个 worker，输出与 M1 之前相同；多 worker 的格式在 M3 定（L8）
+static void worker_stats(worker_t &w)
 {
 	int held=0,pipes_held=0,tcp_conns=0,udp_conns=0;
-	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 	{
 		forward_rule_t &rule=*it;
 		conn_manager_tcp_t &tcp=rule.tcp_manager;
@@ -2445,20 +2518,25 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1],
 				udp.gro[0],udp.gro[1],udp.gso_fallback[0],udp.gso_fallback[1]);
 	}
-	int scratch=(tcp_scratch!=0);
-	int pipe_scratch=(tcp_pipe_scratch.r>=0);
+	int scratch=(w.tcp_scratch!=0);
+	int pipe_scratch=(w.tcp_pipe_scratch.r>=0);
 	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d resize_fail=%llu\n",
-		tcp_buf_pool.alloc,held,tcp_buf_pool.free_bufs.cnt,scratch,
-		tcp_pair_pool.slabs,tcp_pair_pool.free_objs.cnt,udp_pair_pool.slabs,udp_pair_pool.free_objs.cnt,
-		tcp_pipe_pool.alloc,pipes_held,tcp_pipe_pool.free_cnt,pipe_scratch,tcp_pipe_pool.resize_fail);
+		w.tcp_buf_pool.alloc,held,w.tcp_buf_pool.free_bufs.cnt,scratch,
+		w.tcp_pair_pool.slabs,w.tcp_pair_pool.free_objs.cnt,w.udp_pair_pool.slabs,w.udp_pair_pool.free_objs.cnt,
+		w.tcp_pipe_pool.alloc,pipes_held,w.tcp_pipe_pool.free_cnt,pipe_scratch,w.tcp_pipe_pool.resize_fail);
 	//先写出再检查：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
 	fflush(stdout);
-	DEBUG_ASSERT(tcp_buf_pool.alloc==held+tcp_buf_pool.free_bufs.cnt+scratch);
-	DEBUG_ASSERT(tcp_pipe_pool.alloc==pipes_held+tcp_pipe_pool.free_cnt+pipe_scratch);
-	DEBUG_ASSERT(tcp_pair_pool.slabs*obj_pool_slab_objs-tcp_pair_pool.free_objs.cnt==tcp_conns);
-	DEBUG_ASSERT(udp_pair_pool.slabs*obj_pool_slab_objs-udp_pair_pool.free_objs.cnt==udp_conns);
-	for(auto it=forward_rules.begin();it!=forward_rules.end();++it)
+	DEBUG_ASSERT(w.tcp_buf_pool.alloc==held+w.tcp_buf_pool.free_bufs.cnt+scratch);
+	DEBUG_ASSERT(w.tcp_pipe_pool.alloc==pipes_held+w.tcp_pipe_pool.free_cnt+pipe_scratch);
+	DEBUG_ASSERT(w.tcp_pair_pool.slabs*obj_pool_slab_objs-w.tcp_pair_pool.free_objs.cnt==tcp_conns);
+	DEBUG_ASSERT(w.udp_pair_pool.slabs*obj_pool_slab_objs-w.udp_pair_pool.free_objs.cnt==udp_conns);
+	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 		DEBUG_ASSERT(it->udp_manager.sessions.cnt==it->udp_manager.lru.size());
+}
+void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
+{
+	for(size_t i=0;i<workers.size();i++)
+		worker_stats(*workers[i]);
 }
 
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
@@ -2492,14 +2570,15 @@ static void check_and_record_listen(unordered_map<address_t,int,address_t::hash_
 	listen_rules[rule.local_addr]=rule.index;
 }
 
-//U5：监听 socket 开 UDP_GRO。第一个开成功时给 udp_batch 挂上收 cmsg 的控制缓冲；第一个就失败（5.0 以前的内核）时整个特性关闭，
-//这时还没有 socket 开着 UDP_GRO。之后的失败只记一行：那个监听 socket 收到的都是普通数据报
+//U5：监听 socket 开 UDP_GRO。开成功时给所属 worker 的 udp_batch 挂上收 cmsg 的控制缓冲（每个 worker 一份批，重复挂是同样的指针）；
+//第一个就失败（5.0 以前的内核）时整个特性关闭，这时还没有 socket 开着 UDP_GRO。之后的失败只记一行：那个监听 socket 收到的都是普通数据报
 static void udp_gro_listen(forward_rule_t &rule)
 {
 	static int gro_socks=0;
 	if(udp_gro_set(rule.local_listen_fd_udp)==0)
 	{
-		if(gro_socks++==0) udp_batch.attach_ctrl();
+		gro_socks++;
+		rule.worker->udp_batch.attach_ctrl();
 		return;
 	}
 	mylog(log_warn,"rule %d [udp] setsockopt UDP_GRO failed (%s): --udp-gro needs Linux 5.0 or later%s\n",
@@ -2594,8 +2673,10 @@ int event_loop()
 	udp_listen_rules.reserve(app_config.rules.size());
 
 
+	worker_t *w=worker_new(loop);//threads=1：唯一的 worker 用默认 loop（D59）
+	workers.push_back(w);
+
 	int any_udp=0;
-	forward_rules.clear();
 	if(app_config.rules.empty())
 	{
 		mylog(log_fatal,"no forward rules configured\n");
@@ -2604,8 +2685,11 @@ int event_loop()
 
 	for(size_t i=0;i<app_config.rules.size();i++)
 	{
-		forward_rules.emplace_back();
-		forward_rule_t &rule=forward_rules.back();
+		w->rules.emplace_back();
+		forward_rule_t &rule=w->rules.back();
+		rule.worker=w;
+		rule.tcp_manager.worker=rule.udp_manager.worker=w;
+		rule.tcp_manager.lru.clock=rule.udp_manager.lru.clock=&w->clock;
 		forward_rule_config_t &rule_config=app_config.rules[i];
 		rule.index=(int)i+1;
 		rule.local_addr=rule_config.local_addr;
@@ -2615,7 +2699,7 @@ int event_loop()
 		rule.balance_weights=rule_config.balance_weights;
 		assert(!rule_config.remote_targets.empty());
 		rule.remote_targets.reserve(rule_config.remote_targets.size());
-		my_time_t now=get_current_time();
+		my_time_t now=w->clock.now();
 		for(size_t j=0;j<rule_config.remote_targets.size();j++)
 		{
 			const remote_target_config_t &config_target=rule_config.remote_targets[j];
@@ -2657,7 +2741,7 @@ int event_loop()
 			check_and_record_listen(udp_listen_rules,rule,"udp");
 			any_udp=1;
 		}
-		start_forward_rule(loop,rule);
+		start_forward_rule(w->loop,rule);
 	}
 
 	start_dns_worker(loop);
@@ -2667,11 +2751,10 @@ int event_loop()
 	ev_timer_init(&clear_timer, clear_timer_cb, 0, timer_interval/1000.0);
 	ev_timer_start(loop, &clear_timer);
 
-	//清零等同 ev_init（同 T11 的 watcher），不用 ev_prepare_init 宏：不新增 strict-aliasing 告警
-	struct ev_prepare udp_flush_watcher={};
-	udp_flush_watcher.cb=udp_flush_cb;
+	w->udp_flush_watcher.cb=udp_flush_cb;
+	w->udp_flush_watcher.data=w;
 	if(any_udp)
-		ev_prepare_start(loop, &udp_flush_watcher);
+		ev_prepare_start(w->loop, &w->udp_flush_watcher);
 
 	ev_run(loop, 0);
 	myexit(0);
