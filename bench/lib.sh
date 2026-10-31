@@ -142,7 +142,7 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot] | rinetd | realm-1c | realm-2c
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；+ 开头的标记顺序任意，可组合：
 # +gro：同一二进制加 --udp-gro 启动（U5），同一批里对照开/关；
 # +nosplice：同一二进制加 --disable-splice 启动（B2），同一批里对照 splice 开/关；
@@ -151,6 +151,7 @@ iperf_udp() {
 # +nonroot（各转发器都可加，如 realm-1c+nonroot）：经 setpriv 以专用 uid/gid FWD_UID 启动，没有任何 capability，
 # fs.pipe-user-pages-soft 按这个 uid 计（容器里的 root 与 VM 里所有 root 进程同一 uid，--privileged 时还不受该限额约束）；
 # 只用于 loopback 容器（脚本以 root 运行）
+# +pipe<KiB>（tinymapper 与 realm 都可加）：pipe 容量（B3），tinymapper 加 --pipe-size <KiB>，realm 加 -p <KiB/4>（4 KiB 页数）
 tm_file() {
   local n=${1%%+*} v s=""
   v=${n%%@*}
@@ -161,10 +162,11 @@ tm_file() {
 
 # start_fwd <转发器> <后端端口>：启动转发器，设置 FWD_PID、FWD_NAME、所在 CPU FWD_SET 与客户端目标 TARGET_IP:TARGET_PORT
 start_fwd() {
-  local fwd=$1 bp=$2 l r c u=""
+  local fwd=$1 bp=$2 l r c u="" pipe=""
   FWD_PID=""; FWD_NAME=$fwd; FWD_SET=$FWD_CPUS; TARGET_IP=$FWD_IP; TARGET_PORT=$FPORT
   l=$(hp "$FWD_IP" $FPORT); r=$(hp "$SRV_IP" "$bp")
   case "$fwd+" in *+nonroot+*) u="setpriv --reuid=$FWD_UID --regid=$FWD_UID --clear-groups " ;; esac
+  case "$fwd+" in *+pipe[0-9]*) pipe=${fwd##*+pipe}; pipe=${pipe%%+*} ;; esac
   case ${fwd%%+*} in
     direct) TARGET_IP=$SRV_IP; TARGET_PORT=$bp; return 0 ;;
     tinymapper*)
@@ -172,12 +174,13 @@ start_fwd() {
       [ -n "$u" ] || case "${TM_NOCAP:-}:$fwd+" in 1:*|*+nocap+*) c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin" ;; esac
       c="$c $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL"
       case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac
-      case "$fwd+" in *+nosplice+*) c="$c --disable-splice" ;; esac ;;
+      case "$fwd+" in *+nosplice+*) c="$c --disable-splice" ;; esac
+      [ -z "$pipe" ] || c="$c --pipe-size $pipe" ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
       c="taskset -c $FWD_CPUS $u$RINETD -f -c $WORK/rinetd.conf" ;;
-    realm-1c) c="taskset -c $FWD_CPUS $u$REALM -l $l -r $r -u" ;;
-    realm-2c) c="taskset -c $FWD_CPUS2 $u$REALM -l $l -r $r -u"; FWD_SET=$FWD_CPUS2 ;;
+    realm-1c) c="taskset -c $FWD_CPUS $u$REALM -l $l -r $r -u${pipe:+ -p $((pipe / 4))}" ;;
+    realm-2c) c="taskset -c $FWD_CPUS2 $u$REALM -l $l -r $r -u${pipe:+ -p $((pipe / 4))}"; FWD_SET=$FWD_CPUS2 ;;
     *) log "未知转发器：$fwd"; return 1 ;;
   esac
   FWD_PID=$(spawn fwd fwd.log "$c")

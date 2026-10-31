@@ -67,12 +67,14 @@ type poolStat struct {
 	tcpSlabs, tcpFree, udpSlabs, udpFree int
 	// B2（D49）：pipe 池，pipeHeld 是持有 pipe 的方向数（沿 LRU 现数）
 	pipeAlloc, pipeHeld, pipeFree, pipeScratch int
+	// B3（D58）：累计没能扩到 --pipe-size 的新 pipe 个数（含扩容失败之后、下一个定时器周期之前没试的）
+	resizeFail uint64
 }
 
-// poolStatLine 按 sigusr1_cb 的格式重新写出 pool 行（从 "stats pool:" 起）：D49 只在行末加 pipes 四项
+// poolStatLine 按 sigusr1_cb 的格式重新写出 pool 行（从 "stats pool:" 起）：D49 只在行末加 pipes 四项，D58 再加 resize_fail
 func poolStatLine(p poolStat) string {
-	return fmt.Sprintf("stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d",
-		p.alloc, p.held, p.free, p.scratch, p.tcpSlabs, p.tcpFree, p.udpSlabs, p.udpFree, p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch)
+	return fmt.Sprintf("stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d resize_fail=%d",
+		p.alloc, p.held, p.free, p.scratch, p.tcpSlabs, p.tcpFree, p.udpSlabs, p.udpFree, p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch, p.resizeFail)
 }
 
 type statsDump struct {
@@ -122,9 +124,9 @@ func parseStatsBlock(block []string) (statsDump, error) {
 		case strings.Contains(line, "stats pool: "):
 			s := line[strings.Index(line, "stats pool: "):]
 			p := &d.pool
-			if _, err := fmt.Sscanf(s, "stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d",
+			if _, err := fmt.Sscanf(s, "stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d resize_fail=%d",
 				&p.alloc, &p.held, &p.free, &p.scratch, &p.tcpSlabs, &p.tcpFree, &p.udpSlabs, &p.udpFree,
-				&p.pipeAlloc, &p.pipeHeld, &p.pipeFree, &p.pipeScratch); err != nil {
+				&p.pipeAlloc, &p.pipeHeld, &p.pipeFree, &p.pipeScratch, &p.resizeFail); err != nil {
 				return d, fmt.Errorf("解析 pool 统计行失败：%q：%w", line, err)
 			}
 			if want := poolStatLine(*p); s != want {
@@ -233,6 +235,11 @@ func (m *mapper) statsAfterSignal(t testing.TB) statsDump {
 					idx, s.upSplice, s.downSplice, s.spliceFallback)
 			}
 		}
+	}
+	// D58：有 CAP_SYS_RESOURCE 的 tinymapper（tests/run.sh 的容器里以 root 启动的都有）扩容 pipe 不受 fs.pipe-max-size 与 pipe 限额约束，
+	// resize_fail 应为 0；故意让扩容失败的用例设 growFailOK
+	if dump.pool.resizeFail != 0 && !m.growFailOK && capEff(t, m.pid())&(1<<capSysResource) != 0 {
+		t.Errorf("resize_fail=%d：tinymapper 有 CAP_SYS_RESOURCE，扩容 pipe 不应失败", dump.pool.resizeFail)
 	}
 	// U5（D42）：udp 行带不带 GRO 四项只取决于 --udp-gro（以及它是否因第一个监听 socket 开不了 UDP_GRO 而整体关闭，groOff）
 	want := slices.Contains(m.cmd.Args, "--udp-gro") && !m.groOff
@@ -372,7 +379,8 @@ func TestStatsTCPHalfClose(t *testing.T) {
 // --sock-buf 32 把两侧 socket 缓冲锁小，慢读端（8 KiB 接收缓冲、小 MSS）让 tinymapper 持有并反复部分发送（走 write 分支）。
 //   - blocks（--disable-splice，拷贝路径）：每个方向持有一块 64 KiB 缓冲，排空后超过 64 的空闲块 free；
 //   - pipes（splice，B2）：后端以 32 KiB 一块写，每个方向第一次读（recv）就 ≥ 16 KiB、能整段发出，之后都 splice，发不完时持有 pipe：
-//     峰值恰好 m 个方向持有 pipe、0 个持有块；排空后 pipe 还池，超过 64 个空闲的 close（alloc 比峰值少），down_splice 非零，pipe fd 恰为 2×alloc
+//     峰值恰好 m 个方向持有 pipe、0 个持有块；排空后 pipe 还池，超过空闲上限的 close（默认 256 KiB 的 pipe 为 16 个，B3 审查 M1；
+//     alloc 比峰值少），down_splice 非零，pipe fd 恰为 2×alloc
 func TestStatsHeldBlocks(t *testing.T) {
 	t.Parallel()
 	for _, c := range []struct {
@@ -467,9 +475,9 @@ func heldBackpressure(t *testing.T, pipes bool, extra ...string) {
 	if !pipes {
 		return
 	}
-	if d.pool.pipeFree > pipePoolMaxFree || d.pool.pipeAlloc >= peak.pool.pipeAlloc {
+	if c := pipePoolCap(defaultPipeSize); d.pool.pipeFree > c || d.pool.pipeAlloc >= peak.pool.pipeAlloc {
 		t.Errorf("排空后 pipes alloc=%d free=%d（峰值 alloc %d）：空闲超过 %d 个的 pipe 应当 close", d.pool.pipeAlloc, d.pool.pipeFree,
-			peak.pool.pipeAlloc, pipePoolMaxFree)
+			peak.pool.pipeAlloc, c)
 	}
 	if d.tcp[1].downSplice == 0 {
 		t.Error("down_splice=0：持有 pipe 的方向排空时写出的是 splice 字节")

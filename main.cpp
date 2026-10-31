@@ -249,15 +249,20 @@ struct tcp_buf_pool_t
 
 //D46：本方向上一次读到这么多字节，下一次读就 splice（探针：每次 64 B 时 splice 比 recv+send 慢 3.7%，2 KB 持平，16 KB 快 19%，64 KB 快 58%）
 static const int splice_read_min=16384;
-//一次 splice 进 pipe 最多读这么多（D51，同 recv 的 64 KiB）：背压时它整段留在方向持有的 pipe 里，是不计入 tcp_mem 与 memcg 的内核页。
-//5.12 起内核按 pipe 剩余空间截断（默认 16 × PAGE_SIZE，4K 页上恰好 64 KiB）；更早的内核不截断，16 个槽可各放一个 32 KiB 的本机片段，约 512 KiB
-static const int splice_read_max=max_data_len_tcp;
-//D53：splice 时一次回调最多搬这么多轮（每轮至多 splice_read_max），源端读不满或目的端没写完就停。每轮写出都可能唤醒一次接收方，
-//转发器满载、源端积压时一轮一回调让每 64 KiB 唤醒一次：同进程 8 条大流量 1 轮 85、4 轮 113、8 轮 123 Gbit/s；代价是一次回调更长，
-//同一轮里其他连接多等：同时测的 64 B 往返 p50 1 轮 106、4 轮 297、8 轮 549 µs（realm-1c 3950 µs）
-static const int splice_rounds_max=4;
-static const int tcp_pipe_min_size=65536;//新 pipe 小于它（fs.pipe-user-pages-soft 已满时只有 2 页）就不用：每次 splice 只能搬 2 个片段
-static const int tcp_pipe_pool_max_free=64;//同 D19
+//pipe 大小（B3，D55、D57，--pipe-size）：新 pipe 不到这么大就用 F_SETPIPE_SZ 扩上去（只扩不缩：64K 页内核默认已是 1 MiB），
+//一次 splice 进 pipe 也最多读这么多：背压时它整段留在方向持有的 pipe 里，是不计入 tcp_mem 与 memcg 的内核页（D51 原为 64 KiB）。
+//5.5 起（4.19.y、5.4.y 回移）内核按 pipe 空闲槽数 × PAGE_SIZE 截断一次读，4.9/4.14 不截断。一个片段占一个槽：网卡来源每槽约 1 MSS，
+//16 槽一次只有约 22 KiB（B12 审查 M3），64 槽约 90 KB。启动时 tcp_pipe_probe() 换成实际值（内核向上取到 2 的幂页数）
+static int tcp_pipe_size=256*1024;
+static int pipe_size_explicit=0;//给了 --pipe-size
+//splice 时一次回调最多搬这么多（D53、D55、D56）：源端这次读够 splice_more_min 且整段写出就接着读，源端读得少或目的端没写完就停。
+//每次写出都可能唤醒一次接收方，一次回调搬得越多唤醒越少，同一轮里其他连接等得越久。同进程 8 条大流量与 64 B 往返：
+//64K × 4 次 115 Gbit/s、p50 295 µs，256K × 1 次 161、216 µs，256K × 4 次 173、774 µs。--pipe-size 大于 256 KiB 时每回调
+//(大小 ÷ 256 KiB) 个满 pipe，用其他连接的延迟换吞吐（D56）：1 MiB 时 4 MiB，207–213 Gbit/s，往返 p99 2.8 ms（同 realm -p 256）
+static int splice_turn_max=256*1024;
+static const int splice_more_min=65536;//64K pipe（扩容失败）满一次、网卡来源 64 槽满一次都够这个数
+static int tcp_pipe_min_size=65536;//新 pipe 不到 16 槽（fs.pipe-user-pages-soft 已满时只有 2 页）就不用：每次 splice 只能搬 2 个片段。按槽数判断（D58），启动时按页大小设
+static const int tcp_pipe_pool_max_free=64;//同 D19；pipe 比 16 页大时按页数折算，见 tcp_pipe_pool_t::max_free
 
 //pipe 里还有多少字节，只给 DEBUG_ASSERT 用：还池与复用的 pipe 必须是空的，计账错了就会把一个连接的数据写给另一个连接
 static inline int tcp_pipe_len(const tcp_pipe_t &p)
@@ -268,7 +273,7 @@ static inline int tcp_pipe_len(const tcp_pipe_t &p)
 }
 
 //pipe 池（B2，D47）：splice 都读进 tcp_pipe_scratch，整段写出就留着给下一次；没写完时连同数据交给该方向（tcp_info_t::pipe），
-//排空后还回来。空闲的最多留 tcp_pipe_pool_max_free 个，多出的 close；有残留数据的 pipe 不复用，释放连接对时直接 close
+//排空后还回来。空闲的最多留 max_free 个，多出的 close；有残留数据的 pipe 不复用，释放连接对时直接 close
 struct tcp_pipe_pool_t
 {
 	tcp_pipe_t free_pipes[tcp_pipe_pool_max_free];
@@ -276,12 +281,28 @@ struct tcp_pipe_pool_t
 	int alloc;//已创建还没关闭的 pipe 数（O1）：每个要么是 scratch，要么属于某个方向，要么在空闲表里
 	int blocked;//创建失败过：到下一个定时器周期（clear_timer_cb 清零）之前不再创建，免得每次读都试
 	int failures;//创建失败次数，只有第一次记 info
+	int grow_blocked;//扩容失败过（D58）：到下一个定时器周期之前新建的 pipe 不再试扩
+	int grow_failures;//扩容失败次数，只有第一次记 info
+	u64_t resize_fail;//没能扩到 tcp_pipe_size 的新 pipe 个数（含 grow_blocked 期间没试的），stats pool 行输出
+	//空闲的最多留几个：合计不超过 64 个 16 页 pipe 的 1024 页（B3 审查 M1）。fs.pipe-user-pages-soft 按 uid、按容量计页，
+	//池里的空 pipe 也算，留多了同 uid 的其他进程（以 root 运行时含没有 CAP_SYS_RESOURCE 的容器 root）只能拿到 2 页的 pipe。
+	//256 KiB 时 16 个，1 MiB 时 4 个；tcp_pipe_probe() 设置
+	int max_free;
+	//新 pipe 因配额只有 2 页（不到 16 槽）之后，到下一个定时器周期之前不再建 pipe：这期间还回来的 pipe 马上会被别的方向借走，
+	//留到 64 个，否则超过 max_free 的被关掉、那些方向只能走拷贝（复审 R1：非 root 2000 条停读、--pipe-size 1024 时 63.4 → 73.2 Gbit/s）。
+	//clear_timer_cb 清标志时裁回 max_free。fd 不够时不放宽（D52）
+	int quota_hit;
 	tcp_pipe_pool_t()
 	{
 		free_cnt=0;
 		alloc=0;
 		blocked=0;
 		failures=0;
+		grow_blocked=0;
+		grow_failures=0;
+		resize_fail=0;
+		max_free=tcp_pipe_pool_max_free;
+		quota_hit=0;
 	}
 	int fail_level()//创建失败：到下一个定时器周期之前不再创建；只有第一次记 info
 	{
@@ -323,9 +344,24 @@ struct tcp_pipe_pool_t
 		{
 			close(fds[0]);
 			close(fds[1]);
+			quota_hit=1;
 			int level=fail_level();
 			mylog(level,"[tcp]new pipe has only %d bytes (fs.pipe-user-pages-soft reached?), forwarding by copy instead of splice until the next timer tick\n",size);
 			return -1;
+		}
+		//扩到 tcp_pipe_size（D55）。失败（非特权用户到了 fs.pipe-user-pages-soft 时 EPERM，或 ENOMEM）时这个 pipe 保持原大小照常用（D58）
+		if(size<tcp_pipe_size)
+		{
+			if(grow_blocked||fcntl(fds[1],F_SETPIPE_SZ,tcp_pipe_size)<0)
+			{
+				resize_fail++;
+				if(!grow_blocked)
+				{
+					grow_blocked=1;
+					int level=grow_failures++==0?log_info:log_debug;//mylog 会把级别参数求值两次
+					mylog(level,"[tcp]enlarging a new pipe to %d bytes failed (%s), new pipes keep %d bytes until the next timer tick (fs.pipe-user-pages-soft reached?)\n",tcp_pipe_size,get_sock_error(),size);
+				}
+			}
 		}
 		p.r=fds[0];
 		p.w=fds[1];
@@ -335,9 +371,15 @@ struct tcp_pipe_pool_t
 	void put(tcp_pipe_t &p)//p 已排空
 	{
 		DEBUG_ASSERT(tcp_pipe_len(p)==0);
-		if(free_cnt>=tcp_pipe_pool_max_free) discard(p);
+		if(free_cnt>=(quota_hit?tcp_pipe_pool_max_free:max_free)) discard(p);
 		else free_pipes[free_cnt++]=p;
 		p.r=p.w=-1;
+	}
+	//扩容失败过之后，没扩上去的 pipe 会一直当 scratch、在池里循环使用（B3 审查 M2）：clear_timer_cb 每个周期对 scratch 调一次，
+	//池里的小 pipe 轮到当 scratch 时也会扩上。失败就到下一个周期之前不再试扩新 pipe
+	void regrow(tcp_pipe_t &p)
+	{
+		if(fcntl(p.w,F_GETPIPE_SZ)<tcp_pipe_size&&fcntl(p.w,F_SETPIPE_SZ,tcp_pipe_size)<0) grow_blocked=1;
 	}
 	void discard(tcp_pipe_t &p)//可能还有数据：直接关掉
 	{
@@ -363,8 +405,50 @@ static int tcp_pipe_trim()
 	while(tcp_pipe_pool.free_cnt>0) tcp_pipe_pool.discard(tcp_pipe_pool.free_pipes[--tcp_pipe_pool.free_cnt]);
 	if(tcp_pipe_scratch.r>=0) tcp_pipe_pool.discard(tcp_pipe_scratch);
 	tcp_pipe_pool.blocked=1;
+	tcp_pipe_pool.quota_hit=0;//fd 不够时池不放宽到 64（复审 R1）
 	if(n>0) mylog(log_debug,"[tcp]out of file descriptors, closed %d idle pipes\n",n);
 	return n;
+}
+//启动时用一个 pipe 试一次 tcp_pipe_size（D57）：超过 fs.pipe-max-size 又没有 CAP_SYS_RESOURCE（只认初始 user namespace）时 EPERM，
+//降到 pipe-max-size：给了 --pipe-size 时 warn，默认值只记 info（同 D40）。别的失败（如配额已满）留给 create() 逐个回退
+static void tcp_pipe_probe()
+{
+	int page=(int)sysconf(_SC_PAGESIZE);
+	tcp_pipe_min_size=16*page;
+	//内核把 F_SETPIPE_SZ 的大小向上取到 2 的幂页数（如 300 KiB → 512 KiB），先按同样规则取整：探测没设成功时读上限与每回调预算也与之后的 pipe 一致（审查 L2）
+	int pages=1;
+	while(pages*page<tcp_pipe_size) pages*=2;
+	tcp_pipe_size=pages*page;
+	int fds[2];
+	if(pipe2(fds,O_CLOEXEC)==0)
+	{
+		int size=fcntl(fds[1],F_GETPIPE_SZ);
+		if(size>0&&size<tcp_pipe_size)
+		{
+			int r=fcntl(fds[1],F_SETPIPE_SZ,tcp_pipe_size);
+			if(r>0) tcp_pipe_size=r;
+			else if(errno==EPERM)
+			{
+				int max_size=0;
+				FILE *f=fopen("/proc/sys/fs/pipe-max-size","r");
+				if(f!=0)
+				{
+					if(fscanf(f,"%d",&max_size)!=1) max_size=0;
+					fclose(f);
+				}
+				if(max_size>0&&tcp_pipe_size>max_size)
+				{
+					mylog(pipe_size_explicit?log_warn:log_info,"%s %d KiB is above fs.pipe-max-size (%d KiB) and CAP_SYS_RESOURCE is missing, using %d KiB\n",
+						pipe_size_explicit?"--pipe-size":"default pipe size",tcp_pipe_size/1024,max_size/1024,max_size/1024);
+					tcp_pipe_size=max_size;
+				}
+			}
+		}
+		close(fds[0]);
+		close(fds[1]);
+	}
+	splice_turn_max=tcp_pipe_size<=256*1024?256*1024:tcp_pipe_size/(256*1024)*tcp_pipe_size;
+	tcp_pipe_pool.max_free=tcp_pipe_pool_max_free*16/max(16,tcp_pipe_size/page);
 }
 //splice 写不完时对目的端调用（D54）：主机越过 tcp_mem 压力线时内核把目的 socket 的 sndbuf 缩到当时队列的一半（sk_stream_moderate_sndbuf），
 //压力期间不再放大。回环这类 MSS 接近 64 KiB 的目的端缩完装不下 2 段，只有 1 段在途，接收方对单个满长段延迟 ACK（约 40 ms），
@@ -1386,7 +1470,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			else
 			{
 				DEBUG_ASSERT(tcp_pipe_len(tcp_pipe_scratch)==0);
-				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,splice_read_max,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,tcp_pipe_size,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 				spliced=1;
 				//队首是紧急数据（对端 MSG_OOB）时非阻塞 splice 返回 EAGAIN，epoll 却一直报可读，这一次改用 recv：
 				//它跳过紧急字节（没有 SO_OOBINLINE），与拷贝路径一致。别的原因（如页分配失败）同样交给 recv
@@ -1462,7 +1546,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(spliced)
 		{
 			DEBUG_ASSERT((other_info.ev.events & EV_WRITE)==0);
-			for(int round=1;;round++)
+			for(int moved=recv_len;;moved+=recv_len)//moved：本回调读进 pipe 的字节
 			{
 				nodelay_before_send(other_info,my_info.data_len);
 				send_len=splice(tcp_pipe_scratch.r,0,other_fd,0,my_info.data_len,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
@@ -1480,9 +1564,9 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 					tcp_unshrink_sndbuf(other_info);
 					break;
 				}
-				//写完了：源端这一轮读满就接着搬（D53）
-				if(round>=splice_rounds_max||recv_len<splice_read_max) break;
-				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,splice_read_max,SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
+				//写完了：源端这次读够 splice_more_min 就接着搬，直到本回调搬满 splice_turn_max（D53、D55）
+				if(moved>=splice_turn_max||recv_len<splice_more_min) break;
+				recv_len=splice(my_fd,0,tcp_pipe_scratch.w,0,min(tcp_pipe_size,splice_turn_max-moved),SPLICE_F_MOVE|SPLICE_F_NONBLOCK);
 				if(recv_len<=0)
 				{
 					//EOF 与 EAGAIN（含紧急数据）留给下一次回调按第一轮处理：EOF 一直可读，下一次 splice 仍读到 0。
@@ -1805,6 +1889,13 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 		}
 	}
 	tcp_pipe_pool.blocked=0;//创建 pipe 失败后每个周期最多再试一次（每次失败都会重新置位）
+	tcp_pipe_pool.grow_blocked=0;//扩容同上
+	if(tcp_pipe_pool.quota_hit)//复审 R1：配额满期间多留的空闲 pipe 裁回 max_free
+	{
+		tcp_pipe_pool.quota_hit=0;
+		while(tcp_pipe_pool.free_cnt>tcp_pipe_pool.max_free) tcp_pipe_pool.discard(tcp_pipe_pool.free_pipes[--tcp_pipe_pool.free_cnt]);
+	}
+	if(tcp_pipe_pool.resize_fail!=0&&tcp_pipe_scratch.r>=0) tcp_pipe_pool.regrow(tcp_pipe_scratch);
 	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
@@ -2356,10 +2447,10 @@ void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 	}
 	int scratch=(tcp_scratch!=0);
 	int pipe_scratch=(tcp_pipe_scratch.r>=0);
-	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d\n",
+	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d resize_fail=%llu\n",
 		tcp_buf_pool.alloc,held,tcp_buf_pool.free_bufs.cnt,scratch,
 		tcp_pair_pool.slabs,tcp_pair_pool.free_objs.cnt,udp_pair_pool.slabs,udp_pair_pool.free_objs.cnt,
-		tcp_pipe_pool.alloc,pipes_held,tcp_pipe_pool.free_cnt,pipe_scratch);
+		tcp_pipe_pool.alloc,pipes_held,tcp_pipe_pool.free_cnt,pipe_scratch,tcp_pipe_pool.resize_fail);
 	//先写出再检查：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
 	fflush(stdout);
 	DEBUG_ASSERT(tcp_buf_pool.alloc==held+tcp_buf_pool.free_bufs.cnt+scratch);
@@ -2622,6 +2713,8 @@ void print_help()
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
 	printf("    --disable-splice                      forward TCP by recv/send copies only; by default a direction whose last read\n");
 	printf("                                          was at least 16 KiB moves the next one with splice through a pipe\n");
+	printf("    --pipe-size           <number>        pipe size for TCP splice, >=64 and <=1024, unit: kbyte, default 256\n");
+	printf("                                          above 256, bulk throughput rises and other connections wait longer\n");
 	printf("    --udp-gro                             receive UDP with UDP_GRO and forward merged packets with UDP_SEGMENT (GSO),\n");
 	printf("                                          Linux 5.0 or later, off by default\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
@@ -2651,6 +2744,7 @@ void process_arg(int argc, char *argv[])
 		{"udp-listen-buf", required_argument,    0, 1},
 		{"disable-tcp-nodelay", no_argument,    0, 1},
 		{"disable-splice", no_argument,    0, 1},
+		{"pipe-size", required_argument,    0, 1},
 		{"udp-gro", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
@@ -2812,6 +2906,21 @@ void process_arg(int argc, char *argv[])
 			{
 				disable_splice=1;
 			}
+			else if(strcmp(long_options[option_index].name,"pipe-size")==0)
+			{
+				int tmp=-1;
+				sscanf(optarg,"%d",&tmp);
+				if(64<=tmp&&tmp<=1024)
+				{
+					tcp_pipe_size=tmp*1024;
+					pipe_size_explicit=1;
+				}
+				else
+				{
+					mylog(log_fatal,"pipe-size value must be between 64 and 1024 (kbyte)\n");
+					myexit(-1);
+				}
+			}
 			else if(strcmp(long_options[option_index].name,"udp-gro")==0)
 			{
 				udp_gro=1;
@@ -2963,6 +3072,7 @@ int main(int argc, char *argv[])
 	dup2(1, 2);		//redirect stderr to stdout
 	int i, j, k;
 	process_arg(argc,argv);
+	if(!disable_splice) tcp_pipe_probe();
 
 	event_loop();
 
