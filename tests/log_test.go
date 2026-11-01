@@ -3,6 +3,7 @@ package tests
 import (
 	"errors"
 	"fmt"
+	"io"
 	"maps"
 	"net"
 	"os"
@@ -370,6 +371,84 @@ func TestLogClientAddrUDP(t *testing.T) {
 				sent = append(sent, c.LocalAddr().String())
 			}
 			waitClientAddrs(t, m, map[string][]string{"udp_listen_fd from": sent, "[udp]new connection from": sent[:2]})
+		})
+	}
+}
+
+// 启动时关着的 std fd：main() 在 libev 分配任何 fd 之前用 /dev/null 补上关着的 0/1/2，再 dup2(1,2)。不补时 epoll fd、eventfd 落到
+// 这几个号上：2>&- 时 epoll fd 被 dup2 换成 stdout，首次 epoll_wait 返回 EINVAL 而中止；>&- 2>&- 时 eventfd 被换成 epoll fd 的副本，
+// libev 停掉它的 watcher（fd_kill），信号、DNS 结果、统计都送不到主线程；<&- 2>&- 时 eventfd 被换成 stdout，stdout 是文件则
+// epoll_ctl 返回 EPERM、主线程空转，是管道则写端永远不可读、信号送不到；<&- >&- 2>&- 时日志写进 eventfd。每种组合：fd 0 与关着的 1
+// 指向 /dev/null，fd 2 与 fd 1 相同，能转发连接，空闲时不空转，SIGTERM 后 2 s 内以状态 0 退出，stdout 开着时日志里有退出行
+func TestLogClosedStdFDs(t *testing.T) {
+	t.Parallel()
+	be := serveTCP(t, loopback4(t), echoHandler(""))
+	for _, c := range []struct {
+		name         string
+		redir        string // sh exec tinymapper 时的重定向
+		stdoutClosed bool
+		pipe         bool // stdout 接管道而不是文件
+	}{
+		{"stderr", "2>&-", false, false},
+		{"stdout-stderr", ">&- 2>&-", true, false},
+		{"stdin-stderr", "<&- 2>&-", false, false},
+		{"stdin-stderr-pipe", "<&- 2>&-", false, true},
+		{"all", "<&- >&- 2>&-", true, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			listen := loopback4(t)
+			logPath := filepath.Join(t.TempDir(), "tinymapper.log")
+			f, err := os.Create(logPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { f.Close() }) // 管道时由 exec 的 goroutine 拷进 f，要等 tinymapper 停止（runMapper 注册的清理）之后才关
+			argv := mapperArgv("-l", listen, "-r", be.addr, "-t")
+			cmd := exec.Command("sh", append([]string{"-c", `exec "$0" "$@" ` + c.redir, mapperBin}, argv...)...)
+			cmd.Stdout, cmd.Stderr = f, f
+			if c.pipe {
+				w := struct{ io.Writer }{f} // 不是 *os.File：exec 建管道接到子进程的 stdout，Wait 等拷贝结束
+				cmd.Stdout, cmd.Stderr = w, w
+			}
+			m := runMapper(t, cmd, logPath, listenPoints("t", portOf(listen)))
+			var got [3]string
+			for fd := range got {
+				if got[fd], err = os.Readlink(fmt.Sprintf("/proc/%d/fd/%d", m.pid(), fd)); err != nil {
+					got[fd] = err.Error()
+				}
+			}
+			want1 := logPath
+			if c.stdoutClosed {
+				want1 = "/dev/null"
+			} else if c.pipe {
+				want1 = "pipe:"
+			}
+			// exec 给 stdin 接 /dev/null，关掉的 0 也补成 /dev/null
+			if got[0] != "/dev/null" || !strings.HasPrefix(got[1], want1) || got[2] != got[1] {
+				t.Errorf("fd 0、1、2 分别指向 %q，期望 /dev/null、%s…、与 fd 1 相同", got, want1)
+			}
+			if err := cycleConn(listen); err != nil {
+				t.Errorf("经 tinymapper 转发连接失败：%v", err)
+			}
+			m.fatalIfExited(t, "转发连接后：")
+			ticks0 := m.cpuTicks(t)
+			time.Sleep(idleCPUWindow)
+			if ticks := m.cpuTicks(t) - ticks0; ticks > idleCPUMaxTicks {
+				t.Errorf("空闲时 tinymapper %v 内消耗 CPU %.2f s（上限 %.2f s）：主线程空转", idleCPUWindow, float64(ticks)/100,
+					float64(idleCPUMaxTicks)/100)
+			}
+			m.cmd.Process.Signal(syscall.SIGTERM)
+			if m.aliveAfter(2 * time.Second) {
+				t.Fatal("SIGTERM 后 2 s 内未退出：信号没有送到主线程")
+			}
+			m.stop(t, true)
+			if m.exitErr != nil {
+				t.Fatalf("SIGTERM 后退出状态异常：%v", m.exitErr)
+			}
+			if !c.stdoutClosed && m.logLines("got sigterm, exit") != 1 {
+				t.Errorf("stdout 开着，日志中却没有 \"got sigterm, exit\"：\n%s", m.logTail(5))
+			}
 		})
 	}
 }

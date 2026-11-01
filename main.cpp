@@ -3685,6 +3685,18 @@ int unit_test()
 
 int main(int argc, char *argv[])
 {
+	//启动时关着的 0/1/2 先用 /dev/null 补上，再把 stderr 并到 stdout，之后 libev 的 epoll fd、eventfd 与各 socket 都从 3 起分配。
+	//不补时它们会落到这几个号上，被 dup2(1,2) 覆盖或被当成 stdout：2>&- 时首次 epoll_wait 中止，>&- 2>&- 时信号、DNS 结果、统计都送不到主线程
+	for(int fd=0;fd<=2;fd++)
+	{
+		if(fcntl(fd,F_GETFD)!=-1||errno!=EBADF) continue;
+		if(open("/dev/null",O_RDWR)!=fd)//按 0、1、2 的顺序补，open 返回最小的空闲号
+		{
+			mylog(log_fatal,"failed to open /dev/null for fd %d\n",fd);
+			myexit(-1);
+		}
+	}
+	dup2(1, 2);		//redirect stderr to stdout
     struct ev_loop* loop=ev_default_loop(0);
     if(loop==NULL)
     {
@@ -3713,7 +3725,6 @@ int main(int argc, char *argv[])
 	assert(sizeof(i64_t)==8);
 	assert(sizeof(u32_t)==4);
 	assert(sizeof(i32_t)==4);
-	dup2(1, 2);		//redirect stderr to stdout
 	int i, j, k;
 	process_arg(argc,argv);
 	if(!disable_splice) tcp_pipe_probe();

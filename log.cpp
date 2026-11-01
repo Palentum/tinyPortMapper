@@ -15,7 +15,7 @@ void log0(const char * file,const char * function,int line,int level,const char*
 
 	//时间戳和各级别的"颜色[时间][级别]"前缀按秒缓存，每个线程一份（M2，L6：主线程与各 worker 线程都写日志，DNS 线程不写）。
 	//用 localtime_r：glibc 的 localtime 每次调用都重新检查 /etc/localtime，每行多一次 stat。
-	//enable_log_color 只在 process_arg 开头的预扫描里设置，之后不再改（在它之前只有 main() 里 ev_default_loop 失败会写一行，随即退出），不作为缓存的键
+	//enable_log_color 只在 process_arg 开头的预扫描里设置，之后不再改（在它之前只有 main() 里补 0/1/2 时打不开 /dev/null、ev_default_loop 失败会写一行，随即退出），不作为缓存的键
 	static thread_local time_t time_buf_sec=-1;
 	static thread_local char time_buf[100];
 	static thread_local char prefix_buf[log_end][sizeof(log_color[0])+sizeof(time_buf)+sizeof(log_text[0])+4];//放得下最长的前缀，snprintf 不会截断
