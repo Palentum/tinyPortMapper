@@ -8,6 +8,13 @@
 //	TPM_VARIANT       被测构建的 libc（glibc 或 musl），用于只在某一变体上预期失败的已知缺陷
 //	TPM_THREADS=N     M2：没有自带 --threads 的 tinymapper 启动都加上 --threads N（1–64 或 auto），在多 worker 下跑全套件；
 //	                  本身假设只有一个 worker 的用例经 singleWorkerOnly 跳过
+//	TPM_AFFINITY=1    M5：没有自带 --cpu-affinity 的 tinymapper 启动都加上 --cpu-affinity（mapperArgv）。TestMain 把测试进程自己的线程绑到
+//	                  tinymapper 的 worker 用不到的 CPU 上（mapperCPUs 里前 affinityReserve() 个之后的），tinymapper 仍以完整的掩码启动
+//	                  （startCmd），worker k 在第 k 个 CPU 上：测试客户端的新 TCP 连接都在非 worker CPU 上收包、走 cBPF 的哈希回退，与不开时
+//	                  一样按四元组分配（客户端 goroutine 若一直在某个 worker 的 CPU 上，它建的连接会全落到那个 worker，"每个 worker 都分到"
+//	                  一类断言就不确定了）；UDP 组不挂 cBPF（D73），本来就按哈希。按 CPU 分流本身由 affinity_test.go 绑发送线程确定性地测；
+//	                  worker 数多于 CPU 数的用例经 affinityTooMany 跳过；自带 --threads N、N 超出 affinityReserve() 又断言新 TCP 连接分到各
+//	                  worker 的用例经 affinityOverlap 跳过
 package tests
 
 import (
@@ -56,6 +63,18 @@ func TestMain(m *testing.M) {
 			os.Exit(2)
 		}
 	}
+	mapperCPUs() // 在 pinTestThreads 改测试线程的掩码之前取
+	switch s := os.Getenv("TPM_AFFINITY"); s {
+	case "":
+	case "1":
+		if err := pinTestThreads(); err != nil {
+			fmt.Fprintf(os.Stderr, "TPM_AFFINITY=1：%v\n", err)
+			os.Exit(2)
+		}
+	default:
+		fmt.Fprintf(os.Stderr, "TPM_AFFINITY=%q 无效：应为 1 或不设\n", s)
+		os.Exit(2)
+	}
 	nextPort.Store(20000)
 	os.Exit(m.Run())
 }
@@ -80,22 +99,145 @@ func heavy(t testing.TB) {
 	t.Cleanup(func() { <-heavySem })
 }
 
-// autoThreads 是 --threads auto 的 worker 数（S1）：sched_getaffinity 的 CPU 数，上限 8。测试进程与它启动的 tinymapper 在同一个容器里，
-// 亲和掩码相同
-var autoThreads = sync.OnceValue(func() int {
+// schedGetaffinity 返回线程 tid（0 为调用线程）的 CPU 亲和掩码里的 CPU，升序
+func schedGetaffinity(tid int) ([]int, error) {
 	var mask [16]uint64 // 1024 个 CPU
-	n, _, e := syscall.RawSyscall(syscall.SYS_SCHED_GETAFFINITY, 0, unsafe.Sizeof(mask), uintptr(unsafe.Pointer(&mask[0])))
+	n, _, e := syscall.RawSyscall(syscall.SYS_SCHED_GETAFFINITY, uintptr(tid), unsafe.Sizeof(mask), uintptr(unsafe.Pointer(&mask[0])))
 	if e != 0 {
-		panic(fmt.Sprintf("sched_getaffinity：%v", e))
+		return nil, e
 	}
-	cpus := 0
-	for _, w := range mask[:n/8] {
-		for ; w != 0; w &= w - 1 {
-			cpus++
+	var cpus []int
+	for i, w := range mask[:n/8] {
+		for b := range 64 {
+			if w&(1<<b) != 0 {
+				cpus = append(cpus, i*64+b)
+			}
 		}
 	}
-	return min(max(cpus, 1), 8)
+	return cpus, nil
+}
+
+// schedSetaffinity 把线程 tid（0 为调用线程）的 CPU 亲和掩码设为 cpus
+func schedSetaffinity(tid int, cpus []int) error {
+	var mask [16]uint64
+	for _, c := range cpus {
+		mask[c/64] |= 1 << (c % 64)
+	}
+	if _, _, e := syscall.RawSyscall(syscall.SYS_SCHED_SETAFFINITY, uintptr(tid), unsafe.Sizeof(mask), uintptr(unsafe.Pointer(&mask[0]))); e != 0 {
+		return e
+	}
+	return nil
+}
+
+// mapperCPUs 是测试进程启动时 sched_getaffinity 的 CPU（升序），也是 tinymapper 启动时的掩码（测试进程与它启动的 tinymapper 在同一个
+// 容器里）。TestMain 在 TPM_AFFINITY=1 绑走测试线程之前先取一次，之后得到的仍是完整的掩码
+var mapperCPUs = sync.OnceValue(func() []int {
+	cpus, err := schedGetaffinity(0)
+	if err != nil {
+		panic(fmt.Sprintf("sched_getaffinity：%v", err))
+	}
+	return cpus
 })
+
+// autoThreads 是 --threads auto 的 worker 数（S1）：tinymapper 的可用 CPU 数（mapperCPUs），上限 8
+var autoThreads = sync.OnceValue(func() int { return min(max(len(mapperCPUs()), 1), 8) })
+
+// testCPUs 是 TPM_AFFINITY=1 时测试进程自己的线程所绑的 CPU；为空表示没有绑（没设 TPM_AFFINITY，或 CPU 都留给了 worker）
+var testCPUs []int
+
+// affinityReserve 是 TPM_AFFINITY=1 时留给 tinymapper worker、测试线程不用的 CPU 数（mapperCPUs 的前这么多个）：TPM_THREADS 的 worker 数，
+// 至少 2（自带 --threads 2 的用例），不超过可用 CPU 数。没有自带 --threads 的 tinymapper 的 worker 恰好都绑在这些 CPU 上
+func affinityReserve() int { return min(max(envThreads(), 2), len(mapperCPUs())) }
+
+// pinTestThreads（TPM_AFFINITY=1，TestMain 里调用）：TPM_THREADS 多于可用 CPU 时每次启动都会以 A2 的 fatal 退出，直接报错；否则把测试进程
+// 的每个线程绑到 mapperCPUs 的前 affinityReserve() 个之后的 CPU（一个都不剩时不绑，并提示）。之后新建的线程继承创建者的掩码；遍历
+// /proc/self/task 期间可能有线程正由还没绑的线程创建，所以重复到一遍下来每个线程都已绑好为止
+func pinTestThreads() error {
+	cpus := mapperCPUs()
+	if n := envThreads(); n > len(cpus) {
+		return fmt.Errorf("TPM_THREADS=%d 多于可用的 %d 个 CPU（%v），--cpu-affinity 会拒绝启动", n, len(cpus), cpus)
+	}
+	want := cpus[affinityReserve():]
+	if len(want) == 0 {
+		fmt.Fprintf(os.Stderr, "TPM_AFFINITY=1：%d 个 CPU 都留给了 worker，测试线程不绑核，客户端线程在 worker 的 CPU 上建的 TCP 连接按 CPU 分流\n", len(cpus))
+		return nil
+	}
+	for range 100 {
+		tasks, err := os.ReadDir("/proc/self/task")
+		if err != nil {
+			return err
+		}
+		done := true
+		for _, e := range tasks {
+			tid, _ := strconv.Atoi(e.Name())
+			cur, err := schedGetaffinity(tid)
+			if errors.Is(err, syscall.ESRCH) {
+				continue // 线程已退出
+			}
+			if err != nil {
+				return fmt.Errorf("sched_getaffinity(%d)：%w", tid, err)
+			}
+			if slices.Equal(cur, want) {
+				continue
+			}
+			done = false
+			if err := schedSetaffinity(tid, want); err != nil && !errors.Is(err, syscall.ESRCH) {
+				return fmt.Errorf("sched_setaffinity(%d, %v)：%w", tid, want, err)
+			}
+		}
+		if done {
+			testCPUs = want
+			return nil
+		}
+	}
+	return errors.New("重复 100 遍之后仍有线程没绑好")
+}
+
+// startCmd 启动 cmd（tinymapper，或经测试二进制自身再 exec 它）：子进程的 CPU 掩码继承自发起 fork 的线程（Go 在调用 cmd.Start 的 goroutine
+// 所在线程上 clone），所以要指定掩码（cpus，同 taskset -c）或测试线程已被绑走（TPM_AFFINITY=1，cpus 为 nil 时用 mapperCPUs）时，锁定当前
+// 线程、改成这个掩码再 fork，之后改回。改不回去时不解锁：这个 goroutine 结束时 Go 连同线程一起退出，不让掩码不对的线程回到线程池。
+// 锁定的线程上要新建线程时 Go 交给模板线程去建（runtime.newm），不会继承这里临时的掩码
+func startCmd(cmd *exec.Cmd, cpus []int) error {
+	if cpus == nil {
+		if len(testCPUs) == 0 {
+			return cmd.Start()
+		}
+		cpus = mapperCPUs()
+	}
+	runtime.LockOSThread()
+	old, err := schedGetaffinity(0)
+	if err == nil {
+		err = schedSetaffinity(0, cpus)
+	}
+	if err != nil {
+		runtime.UnlockOSThread()
+		return fmt.Errorf("把发起 fork 的线程绑到 CPU %v：%w", cpus, err)
+	}
+	err = cmd.Start()
+	if schedSetaffinity(0, old) == nil {
+		runtime.UnlockOSThread()
+	}
+	return err
+}
+
+// affinityOverlap 用于自带 --threads n、断言新 TCP 连接分到每个（或至少两个）worker 的用例：TPM_AFFINITY=1 时 n 超出 affinityReserve()
+// 的话，多出的 worker 绑到的 CPU 上也跑着测试线程，客户端 goroutine 在这些 CPU 上建的连接按 CPU 全给那个 worker（A4 的正确行为），分配
+// 不再是哈希，跳过（v3 实测：--threads 4 时 64 条并发连接都从 CPU 2 发起，全落在 worker 2 上）
+func affinityOverlap(t testing.TB, n int) {
+	t.Helper()
+	if os.Getenv("TPM_AFFINITY") == "1" && (len(testCPUs) == 0 || n > affinityReserve()) {
+		t.Skipf("TPM_AFFINITY=1：%d 个 worker 绑到的 CPU 有测试线程也在用（留给 worker 的是前 %d 个），这些 CPU 上建的 TCP 连接按 CPU 分流、不按哈希",
+			n, affinityReserve())
+	}
+}
+
+// affinityTooMany 用于自带 --threads n 的用例：TPM_AFFINITY=1 时 n 多于 tinymapper 的可用 CPU 数，--cpu-affinity 按 A2 拒绝启动，跳过
+func affinityTooMany(t testing.TB, n int) {
+	t.Helper()
+	if os.Getenv("TPM_AFFINITY") == "1" && n > len(mapperCPUs()) {
+		t.Skipf("TPM_AFFINITY=1：%d 个 worker 多于可用的 %d 个 CPU，--cpu-affinity 拒绝启动（A2）", n, len(mapperCPUs()))
+	}
+}
 
 // envThreads 返回 TPM_THREADS 给的 worker 数（auto 按 autoThreads 换算），没设时为 0
 func envThreads() int {
@@ -116,11 +258,15 @@ func hasThreadsArg(args []string) bool {
 }
 
 // mapperArgv 返回启动 tinymapper 的参数（不含程序名）：--disable-color，TPM_THREADS 设了且 args 里没有 --threads 时接着是 --threads N，
-// 然后是 args。插在用例参数之前而不是末尾：以缺值选项结尾的参数（如 "--pipe-size"）后面接上 --threads 会变成别的错误
+// TPM_AFFINITY=1 且 args 里没有 --cpu-affinity 时再接 --cpu-affinity，然后是 args。插在用例参数之前而不是末尾：以缺值选项结尾的参数
+// （如 "--pipe-size"）后面接上 --threads 会变成别的错误
 func mapperArgv(args ...string) []string {
 	argv := []string{"--disable-color"}
 	if s := os.Getenv("TPM_THREADS"); s != "" && !hasThreadsArg(args) {
 		argv = append(argv, "--threads", s)
+	}
+	if os.Getenv("TPM_AFFINITY") == "1" && !slices.Contains(args, "--cpu-affinity") {
+		argv = append(argv, "--cpu-affinity")
 	}
 	return append(argv, args...)
 }
@@ -260,7 +406,13 @@ func startMapperLimit(t testing.TB, nofile int, wait []listenPoint, args ...stri
 // runMapper 启动已设好输出的 cmd（其输出最终落到 logPath），等待 wait 中的监听全部就绪；测试结束时自动停止。
 func runMapper(t testing.TB, cmd *exec.Cmd, logPath string, wait []listenPoint) *mapper {
 	t.Helper()
-	if err := cmd.Start(); err != nil {
+	return runMapperOn(t, cmd, nil, logPath, wait)
+}
+
+// runMapperOn 同 runMapper，cpus 非空时 tinymapper 以这个 CPU 掩码启动（startCmd）
+func runMapperOn(t testing.TB, cmd *exec.Cmd, cpus []int, logPath string, wait []listenPoint) *mapper {
+	t.Helper()
+	if err := startCmd(cmd, cpus); err != nil {
 		t.Fatalf("启动 tinymapper 失败：%v", err)
 	}
 	m := &mapper{cmd: cmd, logPath: logPath, done: make(chan struct{})}
@@ -1023,10 +1175,16 @@ func (m *mapper) pause(t testing.TB) {
 // runExpectFail 运行 tinymapper 并期望它以非零状态退出，返回其输出
 func runExpectFail(t testing.TB, timeout time.Duration, args ...string) string {
 	t.Helper()
+	return runExpectFailOn(t, nil, timeout, args...)
+}
+
+// runExpectFailOn 同 runExpectFail，cpus 非空时 tinymapper 以这个 CPU 掩码启动（startCmd）
+func runExpectFailOn(t testing.TB, cpus []int, timeout time.Duration, args ...string) string {
+	t.Helper()
 	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
-	if err := cmd.Start(); err != nil {
+	if err := startCmd(cmd, cpus); err != nil {
 		t.Fatal(err)
 	}
 	done := make(chan error, 1)

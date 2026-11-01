@@ -408,9 +408,34 @@ remote = %q
 	m := startMapperTopPad0(t, wait, "-c", cfg, "--disable-splice")
 	baseFd := fdCount(t, m.pid())
 
-	// 规则 1 上建一条既有回显流（顺便分配 scratch），保持空闲
-	preA := dial(t, l1)
-	mustEcho(t, preA, "x")
+	// M2 起每个 worker 一个 loop，各有一份按 fd 号索引的 libev 数组，fd 号却是全进程共用的：一个 worker 拿到比它见过的都大的 fd 时数组要
+	// 增长（范围外的分配），在压低的 RLIMIT_DATA 下失败就 libev abort（TPM_THREADS=2 时 musl 上 d67de1f 实测 8/20 次）。所以降限之前先建
+	// 64 条回显连接（128 个 fd，散到各 worker）再全部关掉，等 fd 回到基线：每个 worker 的数组都已覆盖这些 fd 号，之后的连接复用它们
+	warm := make([]net.Conn, 64)
+	for i := range warm {
+		warm[i] = dial(t, l1)
+		mustEcho(t, warm[i], "w")
+	}
+	closeAll(warm)
+	eventually(t, 2*ioTimeout, 20*time.Millisecond, func() error {
+		if got := fdCount(t, m.pid()); got != baseFd {
+			return fmt.Errorf("预热连接关闭后 fd=%d，基线 %d", got, baseFd)
+		}
+		return nil
+	})
+	// 规则 1 上建既有回显流（顺便分配 scratch），保持空闲；每个 worker 一份 scratch，逐条建到每个 worker 都有一条
+	var pre []*net.TCPConn
+	for {
+		c := dial(t, l1)
+		mustEcho(t, c, "x")
+		pre = append(pre, c)
+		if n := m.threads(); n == 1 || busyWorkers(m.statsAfterSignal(t), "tcp") == n {
+			break
+		}
+		if len(pre) == 64 {
+			t.Fatalf("规则 1 上建了 %d 条连接，仍有 worker 没分到", len(pre))
+		}
+	}
 
 	restore := lowerDataLimit(t, m.pid(), 0)
 	defer restore()
@@ -444,9 +469,13 @@ remote = %q
 	restore()
 
 	// 既有回显流仍可用（还原后 recv 能取到缓冲块）
-	mustEcho(t, preA, "afterpre")
+	for _, c := range pre {
+		mustEcho(t, c, "afterpre")
+	}
 	// 新回显流转发正确（较大往返，跨多个缓冲块）
-	preA.Close()
+	for _, c := range pre {
+		c.Close()
+	}
 	nb := dial(t, l1)
 	payload := strings.Repeat("Z", 200<<10)
 	nb.SetDeadline(time.Now().Add(ioTimeout))

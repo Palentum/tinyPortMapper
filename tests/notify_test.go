@@ -4,7 +4,8 @@
 // 审查 L1（splice 不可用时整个进程改走拷贝）；epoll 等待也经过它，测试能按事件循环的轮次给调用分组（D53）。B3 起 fcntl(F_SETPIPE_SZ、
 // F_GETPIPE_SZ)、pipe2 与 open/openat 也经过它：fcntl 用于数扩容次数、注入扩容失败（D58）、假造新 pipe 的容量（复审 R1），pipe2 用于注入
 // 创建失败，open/openat 用于把 /proc/sys/fs/pipe-max-size 换成测试给的文件（D57 的启动探测，经 SECCOMP_IOCTL_NOTIF_ADDFD 把测试进程的 fd
-// 装进 tinymapper 作为 openat 的返回值，不改 VM 全局的 sysctl）。
+// 装进 tinymapper 作为 openat 的返回值，不改 VM 全局的 sysctl）。M5 起 setsockopt(SOL_SOCKET, SO_ATTACH_REUSEPORT_CBPF) 与
+// sched_getaffinity、sched_setaffinity 也经过它：读出挂上的 cBPF 程序、数调用次数，注入挂载、绑核与取掩码失败（A10）。
 //
 // 做法同 TPM_EPOLL_ADD_FAIL：startMapperNotify 以环境变量 notifyEnv 重新执行测试二进制自身，init() 见到它就不跑测试，改由 execNotify 在当前线程上
 // 设 no_new_privs、以 SECCOMP_FILTER_FLAG_NEW_LISTENER 装过滤器得到监听 fd，经 fd 3（与测试进程相连的 unix socket，ExtraFiles）用 SCM_RIGHTS
@@ -56,6 +57,7 @@ const (
 	// 若落在 notifier 收到与回应之间，回应得到 ENOENT、系统调用被重启，notifier 把同一次调用看成两次（B3 实测：同一轮里同一个 splice 出现两次）
 	seccompFlagWaitKillableRecv = 1 << 5
 	fSetpipeSz                  = 1031 // F_SETPIPE_SZ：fcntl 只在 args[1] 为它或 F_GETPIPE_SZ（fGetpipeSz）时通知
+	soAttachReuseportCBPF       = 51   // SO_ATTACH_REUSEPORT_CBPF：setsockopt 只在 level 为 SOL_SOCKET、optname 为它时通知
 )
 
 func isSetPipeSz(c notifyCall) bool { return c.nr == syscall.SYS_FCNTL && c.args[1] == fSetpipeSz }
@@ -77,9 +79,10 @@ var openNR = map[string]map[uint32]int{
 }
 
 // notifyAlways 返回每次都通知的系统调用：splice、getsockopt（D54 的用例假造 SO_SNDBUF）、epoll 等待，以及 pipe2、open/openat（B3，只在
-// 新建 pipe 与启动时调用）
+// 新建 pipe 与启动时调用）、sched_getaffinity / sched_setaffinity（M5，启动时与 worker 线程开始时）
 func notifyAlways() []uint32 {
-	always := append([]uint32{uint32(syscall.SYS_SPLICE), uint32(syscall.SYS_GETSOCKOPT), uint32(syscall.SYS_PIPE2)}, epollWaitNR[runtime.GOARCH]...)
+	always := append([]uint32{uint32(syscall.SYS_SPLICE), uint32(syscall.SYS_GETSOCKOPT), uint32(syscall.SYS_PIPE2),
+		uint32(syscall.SYS_SCHED_GETAFFINITY), uint32(syscall.SYS_SCHED_SETAFFINITY)}, epollWaitNR[runtime.GOARCH]...)
 	for nr := range openNR[runtime.GOARCH] {
 		always = append(always, nr)
 	}
@@ -97,19 +100,22 @@ func isEpollWait(nr uint32) bool {
 }
 
 // notifyFilter 返回 BPF 程序：arch 相符时 notifyAlways() 里的调用一律通知；fcntl 的 cmd（args[1] 低 32 位）为 F_SETPIPE_SZ 或 F_GETPIPE_SZ 时通知；
-// sendto、sendmsg 的 fd（args[0] 低 32 位）不是 3 时通知；其余放行
+// setsockopt 的 level、optname（args[1]、args[2] 低 32 位）为 SOL_SOCKET、SO_ATTACH_REUSEPORT_CBPF 时通知（M5，每个 reuseport 组启动时一次；
+// 别的 setsockopt 不通知，热路径上的 TCP_NODELAY 等不必绕道 notifier）；sendto、sendmsg 的 fd（args[0] 低 32 位）不是 3 时通知；其余放行
 func notifyFilter(arch uint32) []syscall.SockFilter {
 	const (
 		ld   = syscall.BPF_LD | syscall.BPF_W | syscall.BPF_ABS
 		jeq  = syscall.BPF_JMP | syscall.BPF_JEQ | syscall.BPF_K
 		ret  = syscall.BPF_RET | syscall.BPF_K
-		nr   = 0      // struct seccomp_data：int nr; u32 arch; u64 ip; u64 args[6]
-		arg0 = 16 + 0 // args[0]
-		arg1 = 16 + 8 // args[1]
+		nr   = 0       // struct seccomp_data：int nr; u32 arch; u64 ip; u64 args[6]
+		arg0 = 16 + 0  // args[0]
+		arg1 = 16 + 8  // args[1]
+		arg2 = 16 + 16 // args[2]
 	)
 	always := notifyAlways()
-	// 布局：0 arch，1 比较 arch，2 nr，3.. 每个 always 一条，然后 fcntl、取 cmd、两次比较 cmd，sendto、sendmsg、取 fd、比较 fd、通知、放行
-	notif := uint8(3 + len(always) + 4 + 4)
+	// 布局：0 arch，1 比较 arch，2 nr，3.. 每个 always 一条，然后 fcntl、取 cmd、两次比较 cmd，setsockopt、取 level、比较 level、取 optname、
+	// 比较 optname，sendto、sendmsg、取 fd、比较 fd、通知、放行
+	notif := uint8(3 + len(always) + 4 + 5 + 4)
 	allow := notif + 1
 	prog := []syscall.SockFilter{
 		{Code: ld, K: 4},
@@ -126,6 +132,14 @@ func notifyFilter(arch uint32) []syscall.SockFilter {
 		syscall.SockFilter{Code: ld, K: arg1},
 		syscall.SockFilter{Code: jeq, K: fSetpipeSz, Jt: notif - pc - 3},
 		syscall.SockFilter{Code: jeq, K: fGetpipeSz, Jt: notif - pc - 4, Jf: allow - pc - 4},
+	)
+	pc = uint8(len(prog))
+	prog = append(prog,
+		syscall.SockFilter{Code: jeq, K: uint32(syscall.SYS_SETSOCKOPT), Jf: 4}, // 不是 setsockopt → 跳过下面四条
+		syscall.SockFilter{Code: ld, K: arg1},
+		syscall.SockFilter{Code: jeq, K: syscall.SOL_SOCKET, Jf: allow - pc - 3},
+		syscall.SockFilter{Code: ld, K: arg2},
+		syscall.SockFilter{Code: jeq, K: soAttachReuseportCBPF, Jt: notif - pc - 5, Jf: allow - pc - 5},
 	)
 	pc = uint8(len(prog))
 	prog = append(prog,
@@ -356,8 +370,8 @@ func (n *notifier) loop() {
 	}
 }
 
-// startMapperNotify 同 startMapper，但 tinymapper 的 sendto、sendmsg、splice、getsockopt、fcntl(F_SETPIPE_SZ)、open/openat 与 epoll 等待
-// 都经 notifier（初值全部照常执行）
+// startMapperNotify 同 startMapper，但 tinymapper 的 sendto、sendmsg、splice、getsockopt、fcntl(F_SETPIPE_SZ)、open/openat、
+// setsockopt(SO_ATTACH_REUSEPORT_CBPF)、sched_getaffinity/sched_setaffinity 与 epoll 等待都经 notifier（初值全部照常执行）
 func startMapperNotify(t testing.TB, wait []listenPoint, args ...string) (*mapper, *notifier) {
 	t.Helper()
 	return startMapperNotifyWith(t, nil, wait, args...)
@@ -389,7 +403,7 @@ func startMapperNotifyWith(t testing.TB, setup func(*notifier), wait []listenPoi
 	cmd.Env = append(os.Environ(), notifyEnv+"=1")
 	cmd.ExtraFiles = []*os.File{child}
 	cmd.Stdout, cmd.Stderr = f, f
-	err = cmd.Start()
+	err = startCmd(cmd, nil)
 	child.Close()
 	if err != nil {
 		syscall.Close(pair[0])

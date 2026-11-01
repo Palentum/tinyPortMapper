@@ -14,6 +14,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <sched.h>
+#include <linux/filter.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
@@ -53,6 +54,10 @@ static const my_time_t lru_move_interval=1000;
 static int worker_count=1;
 static const int worker_count_max=64;
 static const int worker_count_auto_max=8;//auto：可用 CPU 数，最多这么多（D5）
+//CPU 亲和（M5，D70，--cpu-affinity）：worker k 绑到启动时可用 CPU 里的第 k 个；N>1 时每个 TCP reuseport 组挂按 CPU 分流的 cBPF（cpu_steer_code，D73：UDP 不挂）
+static int cpu_affinity=0;
+static vector<int> worker_cpus;//主线程在 pthread_create 之前写好，worker 线程只在启动时读自己那一项（A7：不进 worker_t）
+static vector<struct sock_filter> cpu_steer_code;//空：不挂
 static const size_t worker_stack_size=256*1024;//musl 1.1.16（OpenWRT SDK）默认线程栈 80 KiB；回调里最大的栈上数组是 log0 的 1 KiB 行缓冲
 //上游第一次 send 不超过这么多字节时才不设 TCP_NODELAY（T15）。536 是 TCP_MSS_DEFAULT：对端初始窗口比它大时，这么多数据整段落在窗口内；
 //比它小时内核把 MSS 截到窗口（tcp_bound_to_half_wnd），也不会在窗口边沿切出小段。更大的第一次写入可能被没对齐 MSS 的窗口边沿
@@ -2829,6 +2834,14 @@ static void *worker_main(void *arg)
 	char name[16];
 	snprintf(name,sizeof(name),"worker%d",w.id);
 	prctl(PR_SET_NAME,name,0,0,0);//top -H、/proc/<pid>/task/<tid>/comm 里认得出
+	if(cpu_affinity)//A3：绑不上只影响分流后的局部性，照常转发
+	{
+		cpu_set_t set;
+		CPU_ZERO(&set);
+		CPU_SET(worker_cpus[w.id],&set);
+		if(sched_setaffinity(0,sizeof(set),&set)!=0)
+			mylog(log_warn,"worker %d: sched_setaffinity to cpu %d failed, %s, running unpinned\n",w.id,worker_cpus[w.id],get_sock_error());
+	}
 	ev_run(w.loop,0);
 	if(w.udp_batch.rn!=0) udp_flush_return(w.udp_batch);//本轮收下的回包照发：ev_break 之后不再有 ev_prepare
 	sem_post(&workers_exited);
@@ -2984,7 +2997,62 @@ static void listen_probe(forward_rule_t &rule,int type,const char *protocol,cons
 	close(probe);
 }
 
-//建第 i 条规则的监听（M2，S2）：每个 worker 一个 socket；N>1 时都设 SO_REUSEPORT，内核按四元组哈希把新连接与 UDP 流分给它们。由主线程在启动
+//--cpu-affinity（M5，A2/A4）：可用 CPU（taskset/cpuset 之后的）按升序取前 worker_count 个，不够就退出（D70）。此时主线程还是进程里唯一的线程。
+//N>1 时建分流程序：SYN 的 softirq 在 worker k 的 CPU 上就选组里第 k 个 socket，否则返回越界值，内核回退到原来的四元组哈希（不返回 N：
+//同 uid 后来加入组的 socket 排在第 N 个，返回 N 会把非 worker CPU 上的连接全给它）
+static void cpu_affinity_init()
+{
+	cpu_set_t set;
+	CPU_ZERO(&set);
+	if(sched_getaffinity(0,sizeof(set),&set)!=0)
+	{
+		mylog(log_fatal,"--cpu-affinity: sched_getaffinity failed, %s\n",get_sock_error());
+		myexit(-1);
+	}
+	char list[512];
+	int len=0;
+	for(int c=0;c<(int)(8*sizeof(set))&&(int)worker_cpus.size()<worker_count;c++)//不用 CPU_SETSIZE：musl 1.2.4 以前是 128，cpu_set_t 却有 1024 位
+	{
+		if(!CPU_ISSET(c,&set)) continue;
+		worker_cpus.push_back(c);
+		len+=snprintf(list+len,sizeof(list)-len,"%s%d",len?",":"",c);//64 个 4 位数也放得下
+	}
+	if((int)worker_cpus.size()<worker_count)
+	{
+		mylog(log_fatal,"--cpu-affinity: %d worker threads but only %d usable cpus\n",worker_count,(int)worker_cpus.size());
+		myexit(-1);
+	}
+	mylog(log_info,"cpu affinity: workers on cpus %s\n",list);
+	if(worker_count==1) return;//A6：没有 reuseport 组（D67）
+	struct sock_filter ld=BPF_STMT(BPF_LD|BPF_W|BPF_ABS,(u32_t)(SKF_AD_OFF+SKF_AD_CPU));
+	cpu_steer_code.push_back(ld);
+	for(int k=0;k<worker_count;k++)
+	{
+		struct sock_filter jeq=BPF_JUMP(BPF_JMP|BPF_JEQ|BPF_K,(u32_t)worker_cpus[k],0,1);
+		struct sock_filter ret=BPF_STMT(BPF_RET|BPF_K,(u32_t)k);
+		cpu_steer_code.push_back(jeq);
+		cpu_steer_code.push_back(ret);
+	}
+	struct sock_filter hash=BPF_STMT(BPF_RET|BPF_K,0xffffffffu);
+	cpu_steer_code.push_back(hash);
+}
+
+//A5：组里全部成员已入组（TCP 在 listen 时，按 worker 次序，下标 k 即 worker k）之后挂到任一成员上即作用于整组。
+//只挂 TCP（D73）：UDP 每个数据报都要选一次，WireGuard 入口、分片、veth 等情形下同一客户端的收包 CPU 不断变化，会在几个 worker 上各建会话。
+//失败（要 4.6）只是按哈希分配：第一次 warn，之后 debug
+static void cpu_steer_attach(forward_rule_t &rule)
+{
+	static int warned=0;
+	struct sock_fprog prog;
+	prog.len=(unsigned short)cpu_steer_code.size();
+	prog.filter=&cpu_steer_code[0];
+	if(setsockopt(rule.local_listen_fd_tcp,SOL_SOCKET,SO_ATTACH_REUSEPORT_CBPF,&prog,sizeof(prog))==0) return;
+	mylog(warned?log_debug:log_warn,"rule %d [tcp] setsockopt SO_ATTACH_REUSEPORT_CBPF failed (%s): steering by cpu needs Linux 4.6 or later, new connections are spread by hash\n",
+		rule.index,get_sock_error());
+	warned=1;
+}
+
+//建第 i 条规则的监听（M2，S2）：每个 worker 一个 socket；N>1 时都设 SO_REUSEPORT，内核按四元组哈希（--cpu-affinity 时 TCP 先按 CPU，M5）把新连接与 UDP 流分给它们。由主线程在启动
 //worker 线程之前全部建好、bind 完，组成员在进程生命周期内固定：成员一变，UDP 四元组到 socket 的映射就整体重排。
 //N=1 时与 M2 之前一样只设 SO_REUSEADDR（D67）：一个监听用不着分流，reuseport 却让发往监听的每个 SYN 与数据报在 softirq 里多一次选择
 //（loopback 实测 1400 B 单流正向客户端发包 −3%、转发器每数据报 CPU +2.5%）
@@ -3038,6 +3106,7 @@ static void start_forward_rule(size_t i)
 			rule.tcp_accept_watcher.data=&rule;
 			ev_io_start(w.loop, &rule.tcp_accept_watcher);
 		}
+		if(!cpu_steer_code.empty()) cpu_steer_attach(rule0);
 	}
 
 	if(rule0.enable_udp)
@@ -3108,6 +3177,7 @@ int event_loop()
 		myexit(-1);
 	}
 	rule_shared=new rule_shared_t[app_config.rules.size()];
+	if(cpu_affinity) cpu_affinity_init();
 
 	for(int k=0;k<worker_count;k++)
 	{
@@ -3258,6 +3328,9 @@ void print_help()
 	printf("                                          Linux 5.0 or later, off by default\n");
 	printf("    --threads             <number|auto>   worker threads, >=1 and <=64, default 1; auto: the usable CPUs, at most 8.\n");
 	printf("                                          above 1, every rule gets one SO_REUSEPORT listener per worker (Linux 3.9+)\n");
+	printf("    --cpu-affinity                        pin worker i to the i-th usable CPU; above 1 worker, also send each new TCP\n");
+	printf("                                          connection to the worker on the CPU that received it (Linux 4.6+),\n");
+	printf("                                          off by default; needs the NIC's receive queues spread over those CPUs\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
 	printf("    --log-position                        enable file name, function name, line number in log\n");
@@ -3288,6 +3361,7 @@ void process_arg(int argc, char *argv[])
 		{"pipe-size", required_argument,    0, 1},
 		{"udp-gro", no_argument,    0, 1},
 		{"threads", required_argument,    0, 1},
+		{"cpu-affinity", no_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
     int option_index = 0;
@@ -3466,6 +3540,10 @@ void process_arg(int argc, char *argv[])
 			else if(strcmp(long_options[option_index].name,"udp-gro")==0)
 			{
 				udp_gro=1;
+			}
+			else if(strcmp(long_options[option_index].name,"cpu-affinity")==0)
+			{
+				cpu_affinity=1;
 			}
 			else if(strcmp(long_options[option_index].name,"threads")==0)
 			{

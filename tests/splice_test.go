@@ -1584,7 +1584,7 @@ func startMapperAsUID(t testing.TB, uid uint32, port int, args ...string) *mappe
 	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid}}
 	cmd.Stdout, cmd.Stderr = f, f
-	if err := cmd.Start(); err != nil {
+	if err := startCmd(cmd, nil); err != nil {
 		t.Fatalf("以 uid %d 启动 tinymapper 失败：%v", uid, err)
 	}
 	m := &mapper{cmd: cmd, logPath: logPath, done: make(chan struct{})}

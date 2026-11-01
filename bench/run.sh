@@ -15,7 +15,8 @@
 #            加 +gro 后缀（tinymapper+gro、tinymapper-musl@<后缀>+gro，可与 +nocap 组合）为同一二进制加 --udp-gro 启动（U5），
 #            +nosplice 为加 --disable-splice 启动（B2）；+nonroot（任何转发器，如 realm-1c+nonroot）以专用 uid FWD_UID（4242）启动，
 #            fs.pipe-user-pages-soft 按它计（见 lib.sh 的 start_fwd）；+t<N>（tinymapper）加 --threads N 启动（P4 多 worker），
-#            N ≥ 2 时同 realm-2c 绑 FWD_CPUS2（0,1），CPU 统计按这组 CPU（如 tinymapper@<后缀>+t2、tinymapper-musl+t2+nonroot）
+#            N ≥ 2 时同 realm-2c 绑 FWD_CPUS2（0,1），CPU 统计按这组 CPU（如 tinymapper@<后缀>+t2、tinymapper-musl+t2+nonroot）；
+#            +aff（tinymapper）加 --cpu-affinity 启动（M5，可与 +t<N> 组合，如 tinymapper@<后缀>+t2+aff）
 #   TESTS    测试项，默认全部 8 项；REPS 轮数（3）；DUR 每项秒数（10）
 #            tcp_rr_<N> / tcp_crr_<N> 的 N 是并发连接数（默认列表里是 64、1000 / 32，其他 N 同样可用，如 tcp_rr_128、tcp_crr_128）
 #            另有不在默认列表里的 UDP 负载（TESTS / SC_TESTS 里显式指定）：
@@ -41,6 +42,11 @@
 #            napi_defer_hard_irqs=VETH_DEFER（2）模拟网卡中断合并，对端关 TSO，开了 UDP_GRO 的 socket 才收到 GRO 合并包。
 #            容器为 --privileged（bench 阶段也是），tinymapper 同 syscount 阶段去掉 CAP_NET_ADMIN。softirq 落点与限制见
 #            lib.sh 的 topo_up 与 BASELINE.md 第 6 节。结果每行多 topo 字段，拓扑核对写入各阶段的 topo.txt
+#   VETH_RPS   TOPO=veth 时给转发器一侧的 f0、f1 各接收队列设 rps_cpus（十六进制 CPU 掩码，如 3 = CPU0-1，M5）：转发器的入向协议处理
+#            按流哈希改在这些 CPU 上做（模拟队列中断固定在 worker CPU 的多队列网卡）；不设（默认）时不做 RPS，与以前相同
+#   IPI_STATS  1：bench 阶段每行另记 irq（转发器所在 CPU 与全部 CPU 的 IPI、NET_RX softirq 次数）与 tm_aff（tinymapper 各线程的 CPU），
+#            见 lib.sh 的 irq_json、tm_aff；loopback 的 bench 容器另加 --security-opt systempaths=unconfined（Docker 默认遮住 /proc/interrupts）
+#   ALT / WARMUP  1：偶数轮按 FWDS 倒序运行 / 正式轮次前先跑一次预热（rep 0），见 bench.sh
 #   CNAME    容器名前缀（默认不命名）：各阶段容器名为 <CNAME>-<阶段>，便于识别与只停自己的容器
 #   GATE_LOCK  共用 Docker VM 时的锁文件（默认无）：开始编译之前与每个阶段的容器启动前，该文件存在就每 30 s 查一次，直到它消失
 #   BULK_SNDBUF / BULK_STALL / FWD_UID  传给容器（tcp_bulk_* 与 +nonroot，见 lib.sh）
@@ -61,6 +67,7 @@ PROF_DUR=${PROF_DUR:-8}
 PHASES=${PHASES:-clean stat rec ipi}
 TOPO=${TOPO:-loopback}
 case $TOPO in loopback|veth) ;; *) echo "未知 TOPO：$TOPO（loopback | veth）"; exit 2 ;; esac
+[ -z "${VETH_RPS:-}" ] || [ "$TOPO" = veth ] || { echo "VETH_RPS 只用于 TOPO=veth"; exit 2; }
 IMG=tinymapper-bench:2
 PIMG=tinymapper-bench-prof:2
 R=$ROOT/bench/results/$(date +%Y%m%d-%H%M%S)
@@ -104,8 +111,8 @@ esac
   echo "时间：$(date '+%F %T %z')"
   echo "源码：$(git -C "$ROOT" describe --always --dirty)"
   echo "Docker VM：$(docker info -f '{{.KernelVersion}} {{.Architecture}} {{.NCPU}} vCPU {{.MemTotal}} B')"
-  echo "拓扑：$TOPO$([ "$TOPO" = veth ] && echo "（VETH_FLUSH_NS=${VETH_FLUSH_NS:-50000} VETH_DEFER=${VETH_DEFER:-2}）")"
-  echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL CAP_ADD=${CAP_ADD:-} REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR"
+  echo "拓扑：$TOPO$([ "$TOPO" = veth ] && echo "（VETH_FLUSH_NS=${VETH_FLUSH_NS:-50000} VETH_DEFER=${VETH_DEFER:-2}${VETH_RPS:+ VETH_RPS=$VETH_RPS}）")"
+  echo "参数：STAGES=$STAGES TM_LOG_LEVEL=$TM_LOG_LEVEL CAP_ADD=${CAP_ADD:-} REPS=$REPS DUR=$DUR FWDS=$FWDS TESTS=$TESTS SC_FWDS=$SC_FWDS SC_TESTS=$SC_TESTS SC_DUR=$SC_DUR${IPI_STATS:+ IPI_STATS=$IPI_STATS}${ALT:+ ALT=$ALT}${WARMUP:+ WARMUP=$WARMUP}"
   echo "二进制 sha256："
   (cd "$ROOT/build" && shasum -a 256 tinymapper-* "fwdbench-linux-$ARCH" || true)
   docker run --rm ${CNAME:+--name "$CNAME-env"} $IMG sh -c 'iperf3 --version | head -1; realm --version; rinetd --version; ip -V; ethtool --version
@@ -120,9 +127,10 @@ COMMON=(--rm --init --network none --ulimit nofile=65536:65536
 [ -z "${VETH_FLUSH_NS:-}" ] || COMMON+=(-e VETH_FLUSH_NS="$VETH_FLUSH_NS")
 [ -z "${VETH_DEFER:-}" ] || COMMON+=(-e VETH_DEFER="$VETH_DEFER")
 for c in ${CAP_ADD:-}; do COMMON+=(--cap-add "$c"); done
-for v in BULK_SNDBUF BULK_STALL FWD_UID; do [ -z "${!v:-}" ] || COMMON+=(-e "$v=${!v}"); done
+for v in BULK_SNDBUF BULK_STALL FWD_UID VETH_RPS IPI_STATS ALT WARMUP; do [ -z "${!v:-}" ] || COMMON+=(-e "$v=${!v}"); done
 PRIV=(--privileged); case " ${CAP_ADD:-} " in *" NET_ADMIN "*) ;; *) PRIV+=(-e TM_NOCAP=1) ;; esac
 BPRIV=(); [ "$TOPO" = veth ] && BPRIV=("${PRIV[@]}")   # bench 阶段只在 veth 时 --privileged
+[ "${IPI_STATS:-}" != 1 ] || [ "$TOPO" = veth ] || BPRIV=(--security-opt systempaths=unconfined)   # 只解除 /proc 的遮挡，权限不变
 for s in $STAGES; do
   gate_lock
   log "阶段 $s"

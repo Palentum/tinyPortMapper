@@ -179,6 +179,7 @@ func TestWorkerThreadsOption(t *testing.T) {
 	infoRe := regexp.MustCompile(`\[INFO\]worker threads: (\d+)$`)
 	accept := func(t *testing.T, n int, args ...string) {
 		t.Helper()
+		affinityTooMany(t, n)
 		remote := loopback4(t)
 		serveTCP(t, remote, echoHandler(""))
 		serveUDP(t, remote, "")
@@ -392,6 +393,7 @@ func TestWorkerTCPIntegrity(t *testing.T) {
 	for _, n := range []int{2, 4} {
 		t.Run(strconv.Itoa(n), func(t *testing.T) {
 			t.Parallel()
+			affinityOverlap(t, n) // 每个 worker 都分到了连接
 			const conns, short = 64, 1000
 			be := serveTCP(t, loopback4(t), streamHandler)
 			listen := loopback4(t)
@@ -941,6 +943,7 @@ func TestWorkerStats(t *testing.T) {
 }
 
 func workerStats(t *testing.T, n int) {
+	affinityOverlap(t, n) // 连接分到至少两个 worker
 	be := serveTCP(t, loopback4(t), streamHandler)
 	ube := serveUDP(t, loopback4(t), "")
 	p1, p2 := loopback4(t), loopback4(t)
@@ -1469,6 +1472,7 @@ func TestWorkerPipePoolCap(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
+			affinityTooMany(t, c.n)
 			const S = 512 << 10
 			perWorker := max(1, pipePoolCap(c.size)/c.n)
 			be := serveTCP(t, loopback4(t), sizedStreamHandler(S))

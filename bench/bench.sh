@@ -9,6 +9,10 @@
 # tm_w0、tm_w1…（`stats worker W:` 行：tcp_conns、tcp_total、udp_sessions、udp_total）；tcp_bulk_* 另记测量窗口中点的 tm_tcp_mid/tm_pool_mid，
 # _stall 时还有 sink 停顿中途的 tm_tcp_stall/tm_pool_stall（这时所有方向都积压在转发器里），
 # fwd_win_s 是 CPU 统计窗口的秒数（fwd_cpu_pct × fwd_win_s ÷ 转发的数据报数 = 每个数据报的 CPU 时间，不受接收端丢包影响）
+# IPI_STATS=1（M5）时除 tcp_mem_5000 外每行另记 irq（同一 CPU 统计窗口内的 IPI 与 NET_RX softirq 次数，见 lib.sh 的 irq_json）与
+# tm_aff（tinymapper 各线程的 CPU 与 M5 相关日志行，见 lib.sh 的 tm_aff）
+# ALT=1：偶数轮按 FWDS 的倒序运行（开/关两臂轮流在前，抵消先后次序的偏差）；WARMUP=1：正式轮次前先用第一个转发器跑一次第一个负载，
+# 记为 rep 0（容器里第一次运行偏慢，各 ab.py 丢掉 raw.jsonl 的第一行，有了这一行就不丢正式轮次）
 # 主机模式：bench/host.sh 在开发机上调用，三个角色经 RSH 在各自主机执行（见 lib.sh）
 set -u
 . "$(dirname "$0")/lib.sh"
@@ -76,7 +80,7 @@ bulk_test() {
 }
 
 one() {
-  local rep=$1 t=$2 fwd=$3 res a b c0 u0 r0 c1 u1 r1 thr hpid cpu win sa sb cpus st ex='{}'
+  local rep=$1 t=$2 fwd=$3 res a b c0 u0 r0 c1 u1 r1 thr hpid cpu win sa sb cpus st ex='{}' irq=null aff=null
   if ! start_fwd "$fwd" "$(backend_for "$t")"; then
     jq -nc --arg fwd "$fwd" --arg t "$t" --argjson rep "$rep" '{rep: $rep, test: $t, fwd: $fwd, err: "start failed"}' | tee -a "$OUT"
     stop_fwd; return
@@ -105,6 +109,7 @@ one() {
       tcp_*) st=$(tm_stats); ex=$(echo "$ex" | jq -c --argjson f "$(tm_json "$st" "" tcp pool $(tm_workers "$st"))" '. + $f') ;;
       udp_*) st=$(tm_stats); ex=$(tm_json "$st" "" udp pool $(tm_workers "$st")) ;;
     esac
+    [ "$IPI_STATS" != 1 ] || { irq=$(irq_json "$sa" "$sb"); aff=$(tm_aff); }
   fi
   cpu=$(awk -v a="${c0:-0}" -v b="${c1:-0}" -v s="${u0:-0}" -v e="${u1:-0}" 'BEGIN{printf "%.1f", (e > s ? (b-a)/(e-s) : 0)}')
   win=$(awk -v s="${u0:-0}" -v e="${u1:-0}" 'BEGIN{printf "%.2f", e - s}')
@@ -114,8 +119,10 @@ one() {
   fi
   echo "$res" | jq -c --arg fwd "$fwd" --arg t "$t" --argjson rep "$rep" \
     --argjson cpu "$cpu" --argjson rss "${r1:-0}" --argjson thr "${thr:-0}" --argjson cpus "${cpus:-null}" --argjson ex "$ex" --argjson win "$win" --arg topo "$TOPO" \
+    --argjson irq "${irq:-null}" --argjson aff "${aff:-null}" \
     '{rep: $rep, test: $t, fwd: $fwd} + (if $topo != "loopback" then {topo: $topo} else {} end) + . + {fwd_cpu_pct: (if $fwd == "direct" then null else $cpu end), fwd_rss_kb: (if $fwd == "direct" then null else $rss end), fwd_threads: (if $fwd == "direct" then null else $thr end)}
-      + (if $fwd == "direct" then {} else {fwd_win_s: $win} end) + (if $cpus then {cpus: $cpus} else {} end) + $ex' | tee -a "$OUT"
+      + (if $fwd == "direct" then {} else {fwd_win_s: $win} end) + (if $cpus then {cpus: $cpus} else {} end) + $ex
+      + (if $irq then {irq: $irq} else {} end) + (if $aff then {tm_aff: $aff} else {} end)' | tee -a "$OUT"
   stop_fwd
 }
 
@@ -124,9 +131,16 @@ trap 'exit 130' INT TERM
 mkdir -p "$(dirname "$OUT")"
 topo_up "$(dirname "$OUT")/topo.txt" || exit 1
 start_backends || exit 1
+first() { echo "$1"; }
+if [ "${WARMUP:-}" = 1 ]; then
+  log "预热 rep=0 test=$(first $TESTS) fwd=$(first $FWDS)"
+  one 0 "$(first $TESTS)" "$(first $FWDS)"
+fi
 for rep in $(seq 1 "$REPS"); do
+  fl=$FWDS
+  if [ "${ALT:-}" = 1 ] && [ $((rep % 2)) = 0 ]; then fl=""; for f in $FWDS; do fl="$f $fl"; done; fi
   for t in $TESTS; do
-    for fwd in $FWDS; do
+    for fwd in $fl; do
       log "rep=$rep test=$t fwd=$fwd"
       one "$rep" "$t" "$fwd"
     done

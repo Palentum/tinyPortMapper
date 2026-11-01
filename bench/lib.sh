@@ -18,6 +18,8 @@ FWDBENCH=${FWDBENCH:-fwdbench}; IPERF3=${IPERF3:-iperf3}; REALM=${REALM:-realm};
 PERF=${PERF:-perf}; SUDO=${SUDO:-}   # fwd 上的 perf 与提权前缀
 TOPO=${TOPO:-loopback}           # loopback | veth（见 topo_up）
 VETH_FLUSH_NS=${VETH_FLUSH_NS:-50000}; VETH_DEFER=${VETH_DEFER:-2}   # veth 拓扑转发器一侧的 gro_flush_timeout / napi_defer_hard_irqs
+VETH_RPS=${VETH_RPS:-}           # veth 拓扑转发器一侧 f0、f1 各接收队列的 rps_cpus（十六进制 CPU 掩码，如 3 = CPU0-1；空 = 不设，见 topo_up）
+IPI_STATS=${IPI_STATS:-}         # 1：每行另记 irq（IPI 与 NET_RX softirq 次数，见 irq_json）与 tm_aff（tinymapper 各线程的 CPU，见 tm_aff）
 FPORT=20000; IPERF_PORT=5201; ECHO_PORT=9000; SINK_PORT=9001
 FWD_UID=${FWD_UID:-4242}         # +nonroot 转发器的 uid/gid（专用、不与其他进程共用，pipe-user-pages-soft 按 uid 计）
 BULK_SNDBUF=${BULK_SNDBUF:-32768}; BULK_STALL=${BULK_STALL:-1}   # tcp_bulk_*：客户端 SO_SNDBUF（字节）、_stall 时 sink 的停顿（秒）
@@ -46,6 +48,9 @@ on() {
 # softirq 落点：veth 的 NAPI 在发送方的 CPU 上轮询，转发器的入向收包（GRO、IP/UDP、入队、唤醒）正向在客户端 CPU、回程在后端 CPU；
 # c0、s0 没有 NAPI，转发器发出的包由 netif_rx 在 CPU0 的 softirq 里完成对端的收包（GSO 包到普通 socket 时在这里分段）。
 # fwd 命名空间开 ip_forward，cli、srv 的默认路由指向它，direct 即内核转发。命名空间随容器退出销毁。
+# VETH_RPS（M5）：f0、f1 每个接收队列的 rps_cpus 设为该掩码（只在 tpm-fwd 命名空间里的这两个 veth 上，不改全局 sysctl，不开 RFS），
+# 转发器的入向协议处理（正向与回程）按流哈希改在掩码里的 CPU 上做，模拟"多队列网卡、队列中断固定在 worker 的 CPU"；
+# 检查结果里 f0/f1 行另记 rps_cpus（读回的值须等于掩码）。不设时 rps_cpus 保持内核默认（0，不做 RPS），检查结果不变
 topo_up() {
   local n d t
   [ "$TOPO" = veth ] || return 0
@@ -63,6 +68,7 @@ topo_up() {
     for d in f0 f1; do
       ip netns exec tpm-fwd sh -c "ethtool -K $d gro on && echo $VETH_FLUSH_NS > /sys/class/net/$d/gro_flush_timeout &&
         echo $VETH_DEFER > /sys/class/net/$d/napi_defer_hard_irqs" || return 1
+      [ -z "$VETH_RPS" ] || ip netns exec tpm-fwd sh -c "for q in /sys/class/net/$d/queues/rx-*; do echo $VETH_RPS > \$q/rps_cpus || exit 1; done" || return 1
     done
     ip -n tpm-cli link set c0 up && ip -n tpm-srv link set s0 up && ip -n tpm-fwd link set f0 up && ip -n tpm-fwd link set f1 up &&
       ip -n tpm-cli route add default via 10.201.1.2 && ip -n tpm-srv route add default via 10.201.2.1 &&
@@ -72,7 +78,7 @@ topo_up() {
   t=$({
     for d in f0 f1; do
       ip netns exec tpm-fwd sh -c "echo $d \$(ethtool -k $d | grep -E '^(generic-receive-offload|rx-udp-gro-forwarding|rx-gro-list|tcp-segmentation-offload):' | tr '\n' ' ')\
-gro_flush_timeout: \$(cat /sys/class/net/$d/gro_flush_timeout) napi_defer_hard_irqs: \$(cat /sys/class/net/$d/napi_defer_hard_irqs) mtu: \$(cat /sys/class/net/$d/mtu)"
+gro_flush_timeout: \$(cat /sys/class/net/$d/gro_flush_timeout) napi_defer_hard_irqs: \$(cat /sys/class/net/$d/napi_defer_hard_irqs) mtu: \$(cat /sys/class/net/$d/mtu)${VETH_RPS:+ rps_cpus: \$(cat /sys/class/net/$d/queues/rx-*/rps_cpus)}"
     done
     ip netns exec tpm-cli sh -c "echo c0 \$(ethtool -k c0 | grep -E '^(generic-receive-offload|tcp-segmentation-offload):' | tr '\n' ' ')"
     ip netns exec tpm-srv sh -c "echo s0 \$(ethtool -k s0 | grep -E '^(generic-receive-offload|tcp-segmentation-offload):' | tr '\n' ' ')"
@@ -82,6 +88,12 @@ gro_flush_timeout: \$(cat /sys/class/net/$d/gro_flush_timeout) napi_defer_hard_i
   echo "$t" | grep '^f' | grep -v -q 'generic-receive-offload: on' && { log "f0/f1 没有开 GRO"; return 1; }
   echo "$t" | grep '^f' | grep -q -E '(rx-udp-gro-forwarding|rx-gro-list): on' && { log "f0/f1 开了 rx-udp-gro-forwarding 或 rx-gro-list"; return 1; }
   echo "$t" | grep -E '^[cs]0' | grep -v -q 'tcp-segmentation-offload: off' && { log "c0/s0 没有关 TSO"; return 1; }
+  if [ -n "$VETH_RPS" ]; then
+    [ "$(echo "$t" | grep -c '^f[01] .* rps_cpus: ')" = 2 ] || { log "f0/f1 没有读到 rps_cpus"; return 1; }
+    for v in $(echo "$t" | sed -n 's/^f[01] .* rps_cpus: //p'); do
+      [ $((16#${v//,/})) = $((16#$VETH_RPS)) ] || { log "f0/f1 的 rps_cpus 是 $v，不是 $VETH_RPS"; return 1; }
+    done
+  fi
   CLI_NS=tpm-cli; FWD_NS=tpm-fwd; SRV_NS=tpm-srv; FWD_IP=10.201.1.2; SRV_IP=10.201.2.2
 }
 
@@ -142,7 +154,7 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>][+t<N>] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>][+t<N>][+aff] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；+ 开头的标记顺序任意，可组合：
 # +gro：同一二进制加 --udp-gro 启动（U5），同一批里对照开/关；
 # +nosplice：同一二进制加 --disable-splice 启动（B2），同一批里对照 splice 开/关；
@@ -154,6 +166,8 @@ iperf_udp() {
 # +pipe<KiB>（tinymapper 与 realm 都可加）：pipe 容量（B3），tinymapper 加 --pipe-size <KiB>，realm 加 -p <KiB/4>（4 KiB 页数）
 # +t<N>（tinymapper）：加 --threads N 启动（P4 多 worker）；N ≥ 2 时绑 FWD_CPUS2（同 realm-2c），FWD_SET 随之，cpus.fwd 是这组 CPU 之和；
 # 不带时不传 --threads（二进制的默认值），绑 FWD_CPUS
+# +aff（tinymapper）：加 --cpu-affinity 启动（M5：worker k 绑 taskset 掩码里的第 k 个 CPU，N ≥ 2 时 reuseport 组按 softirq 所在 CPU 分流），
+# 可与 +t<N> 等组合，如 tinymapper@<后缀>+t2+aff
 tm_file() {
   local n=${1%%+*} v s=""
   v=${n%%@*}
@@ -180,7 +194,8 @@ start_fwd() {
       case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac
       case "$fwd+" in *+nosplice+*) c="$c --disable-splice" ;; esac
       [ -z "$pipe" ] || c="$c --pipe-size $pipe"
-      [ -z "$thr" ] || c="$c --threads $thr" ;;
+      [ -z "$thr" ] || c="$c --threads $thr"
+      case "$fwd+" in *+aff+*) c="$c --cpu-affinity" ;; esac ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
       c="taskset -c $FWD_CPUS $u$RINETD -f -c $WORK/rinetd.conf" ;;
@@ -203,8 +218,18 @@ fwd_stat() {
     END {printf \"%d %s %d %d\n\", c, (u == \"\" ? \"0\" : u), r, t}' /proc/$FWD_PID/stat /proc/uptime /proc/$FWD_PID/status 2>/dev/null"
 }
 
-# cpu_snap：fwd 主机 /proc/stat 里每个 CPU 一行：cpuN user nice system idle iowait irq softirq steal（USER_HZ）
-cpu_snap() { on fwd "grep '^cpu[0-9]' /proc/stat"; }
+# cpu_snap：fwd 主机 /proc/stat 里每个 CPU 一行：cpuN user nice system idle iowait irq softirq steal（USER_HZ）；
+# IPI_STATS=1 时其后另有 /proc/interrupts 的表头与 IPI 行（行首加 "i "）、/proc/softirqs 的表头与 NET_RX 行（行首加 "s "），与 CPU 时间同一时刻取，
+# 由 irq_json 换算（cpu_json 只看 cpuN 行）。Docker 默认把容器里的 /proc/interrupts 遮成空文件，非 --privileged 的容器要
+# --security-opt systempaths=unconfined（run.sh 在 IPI_STATS=1 时加）
+cpu_snap() {
+  if [ "$IPI_STATS" = 1 ]; then
+    on fwd "grep '^cpu[0-9]' /proc/stat; grep -E '^ *(CPU0|IPI[0-9]+:|RES:|CAL:|TLB:|IWI:)' /proc/interrupts | sed 's/^/i /'
+      grep -E '^ *(CPU0|NET_RX:)' /proc/softirqs | sed 's/^/s /'"
+  else
+    on fwd "grep '^cpu[0-9]' /proc/stat"
+  fi
+}
 
 # cpu_json <前> <后>（两次 cpu_snap）：转发器所在 CPU（fwd = FWD_SET），以及与转发器同机时客户端（cli）、后端（srv）各组 CPU 的
 # 占用百分比 JSON：busy = user+nice+system+irq+softirq，另列 usr（user+nice）、sys、softirq；组内各 CPU 相加，满 = 100 × CPU 数。
@@ -220,7 +245,7 @@ cpu_json() {
       for (i = 1; i <= np; i++) if (split(p[i], r, "-") == 2) { for (a = r[1] + 0; a <= r[2] + 0; a++) C[++m] = a } else C[++m] = p[i] + 0
       return m
     }
-    { k = substr($1, 4) + 0; n[k]++; for (i = 2; i <= 9; i++) v[k, n[k], i] = $i }
+    $1 ~ /^cpu[0-9]+$/ { k = substr($1, 4) + 0; n[k]++; for (i = 2; i <= 9; i++) v[k, n[k], i] = $i }
     END {
       ns = split(sets, S, " "); printf "{"
       for (s = 1; s <= ns; s++) {
@@ -236,6 +261,60 @@ cpu_json() {
       }
       print "}"
     }'
+}
+
+# irq_json <前> <后>（两次 IPI_STATS=1 的 cpu_snap）：IPI 与 NET_RX softirq 次数的增量 JSON（M5）。IPI 记在接收它的 CPU 上：
+#   ipi、ipi_cpu：转发器所在 CPU（FWD_SET）收到的全部 IPI（arm64 的 IPIn 各行，x86 的 RES CAL TLB IWI）之和、按 FWD_SET 次序的各 CPU 值；
+#   res、call：其中 Rescheduling 与 Function call 两行（跨 CPU 唤醒走 wakelist 时与 RPS 把包交给另一个 CPU 时都是 Function call）；
+#   ipi_all、res_all、call_all：全部 CPU 之和；net_rx、net_rx_cpu、net_rx_all：/proc/softirqs 的 NET_RX 执行次数（不是时间）。
+# 计数是每 CPU 的 32 位无符号数，回绕按 2^32 补；某个文件没有取到（如被 Docker 遮住）时对应字段为 null
+irq_json() {
+  printf '%s\n%s\n' "$1" "$2" | awk -v sets="$FWD_SET" '
+    function expand(spec, C,   p, np, i, r, a, m) {
+      m = 0; np = split(spec, p, ",")
+      for (i = 1; i <= np; i++) if (split(p[i], r, "-") == 2) { for (a = r[1] + 0; a <= r[2] + 0; a++) C[++m] = a } else C[++m] = p[i] + 0
+      return m
+    }
+    function d(x, y) { return y >= x ? y - x : y - x + 4294967296 }
+    function arr(A,   j, s) { s = "["; for (j = 1; j <= m; j++) s = s (j > 1 ? "," : "") sprintf("%d", A[C[j]]); return s "]" }
+    function num(ok, x) { return ok ? sprintf("%d", x) : "null" }
+    $1 != "i" && $1 != "s" { next }
+    $2 ~ /^CPU[0-9]+$/ { nc[$1] = NF - 1; for (i = 2; i <= NF; i++) col[$1, i - 1] = substr($i, 4) + 0; next }
+    {
+      k = $1 " " $2; o = ++seen[k]
+      if (o == 1) { s = ""; for (i = nc[$1] + 3; i <= NF; i++) s = s " " $i; desc[k] = s; keys[++nk] = k }
+      for (j = 1; j <= nc[$1]; j++) v[k, o, col[$1, j]] = $(j + 2)
+    }
+    END {
+      m = expand(sets, C); for (j = 1; j <= m; j++) inset[C[j]] = 1
+      for (q = 1; q <= nk; q++) {
+        k = keys[q]; if (seen[k] < 2) continue
+        split(k, kk, " ")
+        for (j = 1; j <= nc[kk[1]]; j++) {
+          c = col[kk[1], j]; x = d(v[k, 1, c], v[k, 2, c])
+          if (kk[1] == "i") {
+            ia += x; if (desc[k] ~ /Rescheduling/) ra += x; if (desc[k] ~ /Function call/) ca += x
+            if (c in inset) { ip += x; ic[c] += x; if (desc[k] ~ /Rescheduling/) rs += x; if (desc[k] ~ /Function call/) cl += x }
+          } else if (kk[2] == "NET_RX:") {
+            na += x; if (c in inset) { nr += x; nx[c] += x }
+          }
+        }
+      }
+      oi = nc["i"] > 0; os = nc["s"] > 0
+      printf "{\"ipi\":%s,\"res\":%s,\"call\":%s,\"ipi_cpu\":%s,\"ipi_all\":%s,\"res_all\":%s,\"call_all\":%s,\"net_rx\":%s,\"net_rx_cpu\":%s,\"net_rx_all\":%s}\n",
+        num(oi, ip), num(oi, rs), num(oi, cl), (oi ? arr(ic) : "null"), num(oi, ia), num(oi, ra), num(oi, ca), num(os, nr), (os ? arr(nx) : "null"), num(os, na)
+    }'
+}
+
+# tm_aff：IPI_STATS=1 时被测 tinymapper 各线程的 Cpus_allowed_list（按线程号，即创建次序：主线程在前）与 fwd.log 里 M5 相关的行
+# （--cpu-affinity 的报错、sched_setaffinity 与 SO_ATTACH_REUSEPORT_CBPF 失败的 warn；--log-level 3 时看不到 info 行），
+# JSON {"thr_cpus": [...], "log": [...]}；其他转发器为 null
+tm_aff() {
+  case $FWD_NAME in tinymapper*) ;; *) echo null; return 0 ;; esac
+  [ -n "$FWD_PID" ] || { echo null; return 0; }
+  on fwd "for t in \$(ls /proc/$FWD_PID/task | sort -n); do awk '/^Cpus_allowed_list/ {print \"c \" \$2}' /proc/$FWD_PID/task/\$t/status 2>/dev/null; done
+    grep -a -e 'cpu affinity' -e 'cpu-affinity' -e sched_setaffinity -e SO_ATTACH_REUSEPORT_CBPF $WORK/fwd.log | sed 's/\x1b\[[0-9;]*m//g; s/^/l /'" |
+    jq -R -s -c 'split("\n") | map(select(length > 0)) | {thr_cpus: map(select(startswith("c ")) | .[2:]), log: map(select(startswith("l ")) | .[2:])}'
 }
 
 # tm_stats：被测 tinymapper 支持 SIGUSR1 统计（O1 起）时让它输出一次，打印其中（单规则）`stats rule N tcp:`、`stats rule N udp:`、

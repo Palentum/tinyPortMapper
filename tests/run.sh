@@ -11,6 +11,8 @@
 #   TPM_SLOW=1             同时运行慢速用例（TCP/UDP 空闲超时，约 7 分钟）
 #   TPM_DOCKER_NAME=<名字> 容器名取 <名字>-<变体>（并行的成员据此只停自己的容器）
 #   TPM_THREADS=N          M2：没有自带 --threads 的 tinymapper 启动都加上 --threads N（1–64 或 auto），在多 worker 下跑全套件
+#   TPM_AFFINITY=1         M5：没有自带 --cpu-affinity 的 tinymapper 启动都加上 --cpu-affinity；测试进程的线程绑到 worker 用不到的 CPU 上
+#                          （见 tests/harness_test.go），一般与 TPM_THREADS=2 一起用
 #
 # 流程：docker/build.sh 编译 tinymapper → 宿主机交叉编译测试二进制 → 每个变体一个
 # `docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
@@ -69,14 +71,14 @@ for v in $VARIANTS; do
 	# （needPipeQuotaExempt）；限额本身由 TestSpliceFallbackPipeQuota 以专用的非 root uid 测
 	if docker run --rm ${TPM_DOCKER_NAME:+--name "$TPM_DOCKER_NAME-$v"} --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun \
 		-v "$ROOT/build:/build:ro" -w /tmp \
-		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW -e TPM_THREADS \
+		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW -e TPM_THREADS -e TPM_AFFINITY \
 		"$img" "/build/$TESTBIN" -test.timeout=30m "$@"; then
 		result=PASS
 	else
 		result=FAIL
 		status=1
 	fi
-	summary+=("${v}${TPM_THREADS:+（TPM_THREADS=${TPM_THREADS}）}: ${result}（$(($(date +%s) - start)) s，build/${bin}）")
+	summary+=("${v}${TPM_THREADS:+（TPM_THREADS=${TPM_THREADS}）}${TPM_AFFINITY:+（TPM_AFFINITY=${TPM_AFFINITY}）}: ${result}（$(($(date +%s) - start)) s，build/${bin}）")
 done
 printf '%s\n' "${summary[@]}"
 exit $status
