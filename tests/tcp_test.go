@@ -1322,6 +1322,7 @@ const everrorWithin = 2 * time.Second
 // lru.size() 相同；最后关闭一个正常连接对，新连接复用它低于失败区间的 fd 号，正常转发
 func TestTCPEpollAddFail(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "日志里的连接数与 lru.size() 是本 worker 的（S7），释放后的计数随连接落在哪个 worker 而不同")
 	const k, attempts, burst = 3, 4, 3
 	for _, c := range []struct {
 		name   string
@@ -1526,6 +1527,7 @@ func acceptRuns(log string) (runs []int, firstEnd string) {
 // 先于第 batch+1 个 new_connection。第一段长 1：每次回调只 accept 一个（1ba64a2）；长 n：一直 accept 到 EAGAIN
 func TestTCPAcceptBatch(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "max_accept_per_round 是每个 worker 一次 accept 回调的上限，积压的连接分在各 worker 的监听队列里")
 	// 每轮上限，与 main.cpp 的 max_accept_per_round 保持一致（4–64 均适用）
 	const batch = 8
 	// 大于两轮的上限，且不是 batch 的整数倍：最后一次回调接受余下 1 个后必然遇到 EAGAIN；远小于 listen backlog（截到 somaxconn，默认 4096）
@@ -1620,6 +1622,7 @@ func TestTCPAcceptBatch(t *testing.T) {
 // 日志里没有 EBADF（对已关闭的 fd 收发），每行 closed connection 的连接数与下一行的 lru.size() 相同，tinymapper 没有退出
 func TestTCPFdReuseBurst(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "同一轮事件循环里释放的 fd 被新连接复用；accept 队列经 sock_diag 只查得到 reuseport 组里一个监听 socket")
 	const nOld = 24
 	const nNew = 2*8 + 1
 	type reg struct {
@@ -1874,6 +1877,7 @@ func TestTCPFdReuseBurst(t *testing.T) {
 //   - 恢复后每个连接都被接受并转发：各回显一次，new_connection 恰好 n 行
 func TestTCPListenBacklog(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "accept 队列长度经 sock_diag 按地址查，只查得到 reuseport 组里一个监听 socket，2048 个连接散列到各 worker 的队列里")
 	const n = 2048
 	data, err := os.ReadFile("/proc/sys/net/core/somaxconn")
 	if err != nil {

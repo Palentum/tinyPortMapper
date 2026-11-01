@@ -16,9 +16,11 @@ int about_to_exit=0;
 int socket_buf_size=1024*1024;
 
 #include <netdb.h>
+#include <atomic>
+//每个线程一份（M2，L6）：worker 线程与主线程都会在 mylog 参数里调用它
 char *get_sock_error()
 {
-	static char buf[1000];
+	static thread_local char buf[1000];
 	sprintf(buf, "%d:%s", errno,strerror(errno));
 	return buf;
 }
@@ -232,17 +234,18 @@ int set_buf_size(int fd,int socket_buf_size)
 
 //UDP socket 的缓冲（U6）：*BUFFORCE 不受 net.core.rmem_max/wmem_max 截断，需要初始 user namespace 里的 CAP_NET_ADMIN
 //（内核用 capable() 检查：主机上的 root 有，user namespace 里的 root 没有）。
-//权限在进程运行期间不变，第一次失败（EPERM）后就只用普通选项，没有权限时每个新会话不多花 syscall
-static int udp_buf_force=1;
+//权限在进程运行期间不变，第一次失败（EPERM）后就只用普通选项，没有权限时每个新会话不多花 syscall。
+//各 worker 线程建会话时都读写它（M2）：relaxed 原子，只有把它从 1 换成 0 的那个线程记日志
+static std::atomic<int> udp_buf_force(1);
 //一个方向：force 时先试 *BUFFORCE；普通选项失败同 set_buf_size，退出
 static void set_udp_buf_dir(int fd,int snd,int size,int force)
 {
-	if(force&&udp_buf_force)
+	if(force&&udp_buf_force.load(std::memory_order_relaxed))
 	{
 		if(setsockopt(fd, SOL_SOCKET, snd?SO_SNDBUFFORCE:SO_RCVBUFFORCE, &size, sizeof(size))==0)
 			return;
-		mylog(log_debug,"SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (%s), UDP socket buffers are capped by net.core.rmem_max/wmem_max\n",get_sock_error());
-		udp_buf_force=0;
+		if(udp_buf_force.exchange(0,std::memory_order_relaxed))
+			mylog(log_debug,"SO_SNDBUFFORCE/SO_RCVBUFFORCE failed (%s), UDP socket buffers are capped by net.core.rmem_max/wmem_max\n",get_sock_error());
 	}
 	if(setsockopt(fd, SOL_SOCKET, snd?SO_SNDBUF:SO_RCVBUF, &size, sizeof(size))<0)
 	{
@@ -707,7 +710,7 @@ int parse_remote_target(const char *str,address_t &addr,char *remote_host,int re
 
 char * address_t::get_str()
 {
-	static char res[max_addr_len];
+	static thread_local char res[max_addr_len];//每个线程一份（M2，L6）
 	to_str(res);
 	return res;
 }

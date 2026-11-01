@@ -1471,7 +1471,8 @@ func TestSpliceFallbackEMFILE(t *testing.T) {
 	if debug < k-1 {
 		t.Errorf("pipe2 失败的 debug 行只有 %d 行：后 %d 次传输各跨过了定时器周期，应各再试一次", debug, k-1)
 	}
-	if limit := int(elapsed/(400*time.Millisecond)) + 2; tries > limit {
+	// M2：每个 worker 的池失败后各自到下一个周期才再试，上限按 worker 数放大
+	if limit := (int(elapsed/(400*time.Millisecond)) + 2) * m.threads(); tries > limit {
 		t.Errorf("%v 内试了 %d 次创建 pipe（上限约 %d 次）：失败后到下一个定时器周期之前不应再试", elapsed.Round(time.Millisecond), tries, limit)
 	}
 	if s.spliceFallback < uint64(10*tries) {
@@ -1580,7 +1581,7 @@ func startMapperAsUID(t testing.TB, uid uint32, port int, args ...string) *mappe
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(mapperBin, append([]string{"--disable-color"}, args...)...)
+	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid}}
 	cmd.Stdout, cmd.Stderr = f, f
 	if err := cmd.Start(); err != nil {
@@ -2120,6 +2121,7 @@ func TestSpliceFdQuarter(t *testing.T) {
 // 这个客户端的传输完整；还原后持有的方向排空，数据完整、EOF 紧随
 func TestSpliceTrimOnEMFILE(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "S10：tcp_pipe_trim() 只清碰到 EMFILE 的那个 worker 的空闲与 scratch pipe，别的 worker 的留着")
 	needPipeQuotaExempt(t)
 	for _, where := range []string{"accept", "socket", "udp"} {
 		t.Run(where, func(t *testing.T) {
@@ -2269,16 +2271,23 @@ type spliceCall struct {
 // 字节数（my_info.data_len），所以读到多少看紧跟着的写出；没有写出的读返回了 ≤ 0。同一方向在一轮里只有一个回调：持有 pipe 时源端停读，
 // 写分支排空后恢复读，要到下一轮 epoll 等待才报可读，所以以写出开头的一轮是写分支。
 // 同一轮里紧挨着的两次相同调用是内核重启的同一次调用（splice_to_socket 开头见到待处理的信号——statsAfterSignal 的 SIGUSR1——返回
-// -ERESTARTSYS，什么都没写，SA_RESTART 重新进入系统调用、再经过一次 seccomp），只记一次：读回调里两次读之间必有写出，两次写出之间必有读
+// -ERESTARTSYS，什么都没写，SA_RESTART 重新进入系统调用、再经过一次 seccomp），只记一次：读回调里两次读之间必有写出，两次写出之间必有读。
+// D62：轮次按线程各数各的（iters 以 TID 为键），连接对的回调都在接受它的 worker 线程里，所以只用这个线程（tid，第一次见到这个方向的
+// splice 时记下）的轮次；主线程（400 ms 定时器、SIGUSR1）与别的 worker 的 epoll 等待不再把一次回调切成两轮。同一方向的 splice 出自
+// 另一个线程即为错误（cross）
 type spliceTurns struct {
 	mu       sync.Mutex
-	iter     int64
-	reads    int64 // 读进 pipe 的 splice 总次数
-	restarts int64 // 去掉的重启
+	iters    map[int]int64 // 每个线程（TID）的 epoll 等待次数
+	tid      int           // 处理这个方向的 worker 线程
+	cross    int64         // 出自别的线程的 splice
+	reads    int64         // 读进 pipe 的 splice 总次数
+	restarts int64         // 去掉的重启
 	seq      map[int64][]spliceCall
 }
 
-func newSpliceTurns() *spliceTurns { return &spliceTurns{seq: map[int64][]spliceCall{}} }
+func newSpliceTurns() *spliceTurns {
+	return &spliceTurns{iters: map[int]int64{}, seq: map[int64][]spliceCall{}}
+}
 
 // record 在 notifier 的 decide 里调用：src、dst 为 tinymapper 源一侧、目的一侧 socket 的 fd
 func (s *spliceTurns) record(call notifyCall, src, dst int) {
@@ -2286,24 +2295,33 @@ func (s *spliceTurns) record(call notifyCall, src, dst int) {
 	defer s.mu.Unlock()
 	switch {
 	case isEpollWait(call.nr):
-		s.iter++
+		s.iters[call.pid]++
 	case call.nr == syscall.SYS_SPLICE && (call.fd(0) == src || call.fd(2) == dst):
+		if s.tid == 0 {
+			s.tid = call.pid
+		}
+		if call.pid != s.tid {
+			s.cross++
+			return
+		}
+		iter := s.iters[s.tid]
 		c := spliceCall{call.fd(0) == src, int(call.args[4])}
-		if seq := s.seq[s.iter]; len(seq) > 0 && seq[len(seq)-1] == c {
+		if seq := s.seq[iter]; len(seq) > 0 && seq[len(seq)-1] == c {
 			s.restarts++
 			return
 		}
 		if c.in {
 			s.reads++
 		}
-		s.seq[s.iter] = append(s.seq[s.iter], c)
+		s.seq[iter] = append(s.seq[iter], c)
 	}
 }
 
+// now 返回处理这个方向的 worker 线程当前的轮次与读进 pipe 的 splice 总次数
 func (s *spliceTurns) now() (iter, reads int64) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	return s.iter, s.reads
+	return s.iters[s.tid], s.reads
 }
 
 // readTurn 是一次读回调：ins 为各次读进 pipe 的请求长度，outs 为各次读到（随即写出）的字节，moved 为其和
@@ -2318,6 +2336,9 @@ type readTurn struct {
 func (s *spliceTurns) check(after int64, size int) (turns []readTurn, errs []string) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	if s.cross != 0 {
+		errs = append(errs, fmt.Sprintf("同一方向有 %d 次 splice 出自线程 %d 以外的线程：一个连接对的回调应当都在接受它的 worker 线程里", s.cross, s.tid))
+	}
 	budget := turnBudget(size)
 	for _, it := range slices.Sorted(maps.Keys(s.seq)) {
 		seq := s.seq[it]
@@ -2661,7 +2682,8 @@ func TestSpliceRounds(t *testing.T) {
 			turns.mu.Unlock()
 			t.Logf("恢复后第一次读回调：请求 %v，读到 %v（期望 %v、%v）；去掉了 %d 次重启的 splice", first.ins, first.outs, wantIns, wantOuts, restarts)
 			if !slices.Equal(first.ins, wantIns) || !slices.Equal(first.outs, wantOuts) {
-				t.Errorf("恢复后第一次读回调：各次读请求 %v、读到 %v，期望 %v、%v", first.ins, first.outs, wantIns, wantOuts)
+				t.Errorf("恢复后第一次读回调：各次读请求 %v、读到 %v，期望 %v、%v；恢复时第 %d 轮，之后的读回调 %+v", first.ins, first.outs, wantIns, wantOuts,
+					resumeIter, after[:min(len(after), 4)])
 			}
 		})
 	}
@@ -2755,16 +2777,18 @@ func TestSpliceUnshrinkSndbuf(t *testing.T) {
 				return fd
 			}
 			src, target := fdOf(p.tmCli), fdOf(p.tmUp)
-			var fakeOn, lastIn atomic.Bool
-			var faked, mssQueries atomic.Int64
+			var fakeOn atomic.Bool
+			// 读分支：lastIn 是最近一次读客户端一侧的 splice 所在线程的 TID，这个线程的下一次 epoll 等待把它清零。D62：只认同一线程的
+			// epoll 等待，主线程的定时器周期落在读分支的 splice 与它的 getsockopt 之间时不能把读分支当成写分支
+			var faked, mssQueries, lastIn atomic.Int64
 			var fakeSites atomic.Pointer[string]
 			fakeSites.Store(&c.fake)
 			nf.setDecide(func(call notifyCall) syscall.Errno {
 				switch {
 				case isEpollWait(call.nr):
-					lastIn.Store(false)
+					lastIn.CompareAndSwap(int64(call.pid), 0)
 				case call.nr == syscall.SYS_SPLICE && call.fd(0) == src:
-					lastIn.Store(true)
+					lastIn.Store(int64(call.pid))
 				case call.nr == syscall.SYS_GETSOCKOPT && call.fd(0) == target && call.args[1] == syscall.IPPROTO_TCP &&
 					call.args[2] == syscall.TCP_MAXSEG:
 					mssQueries.Add(1)
@@ -2776,7 +2800,7 @@ func TestSpliceUnshrinkSndbuf(t *testing.T) {
 					call.args[2] != syscall.SO_SNDBUF || !fakeOn.Load() {
 					return 0, false
 				}
-				if site := map[bool]string{true: "a", false: "b"}[lastIn.Load()]; !strings.Contains(*fakeSites.Load(), site) {
+				if site := map[bool]string{true: "a", false: "b"}[lastIn.Load() == int64(call.pid)]; !strings.Contains(*fakeSites.Load(), site) {
 					return 0, false
 				}
 				var b [4]byte
@@ -3392,7 +3416,8 @@ func TestSpliceGrowFail(t *testing.T) {
 		if len(all) == 0 || slices.ContainsFunc(all, func(a growAttempt) bool { return a.errno != errno || a.size != defaultPipeSize }) {
 			t.Errorf("%s：扩容 %v、regrow %v，期望合计至少一次、都请求 %d 并返回 %v", name, tries, regrows, defaultPipeSize, errno)
 		}
-		if limit := int(elapsed/(400*time.Millisecond)) + 2; len(tries) > limit || len(tries) >= created {
+		// M2：每个 worker 的池各自挡到下一个周期，上限按 worker 数放大
+		if limit := (int(elapsed/(400*time.Millisecond)) + 2) * m.threads(); len(tries) > limit || len(tries) >= created {
 			t.Errorf("%s：%v 内新建 %d 个 pipe、试了 %d 次扩容（上限 %d 次且少于新建数）：失败后到下一个定时器周期之前不应再试",
 				name, elapsed.Round(time.Millisecond), created, len(tries), limit)
 		}
@@ -3629,6 +3654,7 @@ func TestSpliceGrowQuota(t *testing.T) {
 // alloc 比峰值少（多出的已 close），pipe fd 恰为 2×alloc
 func TestSplicePoolCap(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "空闲 pipe 上限每个 worker 一份、按 N 均分（D64），留下多少取决于连接怎样分到各 worker；多 worker 的上限见 TestWorkerPipePoolCap")
 	needPipeQuotaExempt(t)
 	need4KPages(t)
 	for _, c := range []struct {
@@ -3748,6 +3774,7 @@ func finishHeld(c net.Conn, size int64, seed uint64) error {
 //     （新建的 pipe 照常扩上去）
 func TestSpliceRegrow(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "regrow 与扩容的挡板、scratch pipe 都是每个 worker 的池各一份，每个定时器周期各 worker 各试一次")
 	needPipeQuotaExempt(t)
 	need4KPages(t)
 	be := serveTCP(t, loopback4(t), streamHandler)
@@ -3909,6 +3936,7 @@ func TestSpliceRegrow(t *testing.T) {
 // close），pipe fd 恰为 2×alloc
 func TestSplicePoolQuota(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "空闲 pipe 上限与 quota_hit 是每个 worker 的池各一份（D64、R1），pool 行是各 worker 之和")
 	needPipeQuotaExempt(t)
 	need4KPages(t)
 	for _, c := range []struct{ mode, log string }{

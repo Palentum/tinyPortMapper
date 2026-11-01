@@ -57,7 +57,7 @@ func startMapperStableRSS(t testing.TB, wait []listenPoint, args ...string) *map
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(mapperBin, append([]string{"--disable-color"}, args...)...)
+	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	cmd.Env = append(os.Environ(), "ASAN_OPTIONS=quarantine_size_mb=0:thread_local_quarantine_size_kb=0:detect_stack_use_after_return=0")
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)

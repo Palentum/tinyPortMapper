@@ -77,18 +77,49 @@ func poolStatLine(p poolStat) string {
 		p.alloc, p.held, p.free, p.scratch, p.tcpSlabs, p.tcpFree, p.udpSlabs, p.udpFree, p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch, p.resizeFail)
 }
 
+// workerStat 是 N>1 时每个 worker 一行的统计（D63，S6）：该 worker 各规则的当前 TCP 连接数、已建 TCP 连接数、当前 UDP 会话数、
+// 已建 UDP 会话数之和
+type workerStat struct {
+	tcpConns, udpSessions int
+	tcpTotal, udpTotal    uint64
+}
+
+// workerStatLine 按 S6 的格式重新写出一行 worker 统计（从 "stats worker" 起），解析后与原行逐字节比较
+func workerStatLine(w int, s workerStat) string {
+	return fmt.Sprintf("stats worker %d: tcp_conns=%d tcp_total=%d udp_sessions=%d udp_total=%d", w, s.tcpConns, s.tcpTotal, s.udpSessions, s.udpTotal)
+}
+
 type statsDump struct {
 	tcp  map[int]tcpStat
 	udp  map[int]udpStat
 	pool poolStat
+	// M2（D63）：N>1 时每个 worker 一行，下标为 worker 号；threads=1 时没有这些行（输出与 M1 逐字节相同）
+	workers []workerStat
 }
 
-// parseStatsBlock 解析一组统计行（连续的 stats rule... 行加末尾一行 stats pool:）
+// parseStatsBlock 解析一组统计行（N>1 时先是 stats worker 0..N-1 各一行，然后是连续的 stats rule... 行，末尾一行 stats pool:）
 func parseStatsBlock(block []string) (statsDump, error) {
 	d := statsDump{tcp: map[int]tcpStat{}, udp: map[int]udpStat{}}
-	poolSeen := false
+	poolSeen, ruleSeen := false, false
 	for _, line := range block {
+		ruleSeen = ruleSeen || strings.Contains(line, "stats rule ")
 		switch {
+		case strings.Contains(line, "stats worker "):
+			s := line[strings.Index(line, "stats worker "):]
+			var w int
+			var ws workerStat
+			if _, err := fmt.Sscanf(s, "stats worker %d: tcp_conns=%d tcp_total=%d udp_sessions=%d udp_total=%d",
+				&w, &ws.tcpConns, &ws.tcpTotal, &ws.udpSessions, &ws.udpTotal); err != nil {
+				return d, fmt.Errorf("解析 worker 统计行失败：%q：%w", line, err)
+			}
+			if want := workerStatLine(w, ws); s != want {
+				return d, fmt.Errorf("worker 统计行格式不符：%q，期望 %q", s, want)
+			}
+			// S6：worker 行都在规则行之前，worker 号从 0 起依次递增
+			if ruleSeen || w != len(d.workers) {
+				return d, fmt.Errorf("worker 统计行 %q 的位置不对（前面已有 %d 行 worker 行，规则行已出现：%v）", line, len(d.workers), ruleSeen)
+			}
+			d.workers = append(d.workers, ws)
 		case strings.Contains(line, "stats rule ") && strings.Contains(line, " tcp: "):
 			s := line[strings.Index(line, "stats rule "):]
 			var idx int
@@ -145,10 +176,12 @@ const objPoolSlabObjs = 64 // main.cpp 的 obj_pool_slab_objs
 
 // checkPoolInvariants 从解析出的数字复核池不变式（发布构建里也要查）：块池与 pipe 池各自 alloc==held+free+scratch，
 // 两个对象池的在用对象数等于各规则连接数/会话数之和；另外 pipe 池空闲不超过上限、scratch 至多一个，每个方向至多持有块与 pipe 之一，
-// splice 字节是同方向字节的一部分（D49）
+// splice 字节是同方向字节的一部分（D49）。M2（D63）：pool 行是 N 个 worker 的和，scratch 至多 N 个、空闲 pipe 至多 N×64（每个 worker
+// 的上限，含 quota_hit 期间的 64）；有 worker 行时它们的和等于各规则行的和
 func checkPoolInvariants(t testing.TB, d statsDump) {
 	t.Helper()
 	p := d.pool
+	nw := max(1, len(d.workers))
 	if p.alloc != p.held+p.free+p.scratch {
 		t.Fatalf("池不变式 alloc==held+free+scratch 不成立：alloc=%d held=%d free=%d scratch=%d", p.alloc, p.held, p.free, p.scratch)
 	}
@@ -156,8 +189,9 @@ func checkPoolInvariants(t testing.TB, d statsDump) {
 		t.Fatalf("pipe 池不变式 alloc==held+free+scratch 不成立：pipes alloc=%d held=%d free=%d scratch=%d",
 			p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch)
 	}
-	if p.pipeFree > pipePoolMaxFree || p.pipeScratch > 1 || p.scratch > 1 {
-		t.Fatalf("pipe 池空闲 %d（上限 %d）、scratch pipe %d、scratch 块 %d：超出上限", p.pipeFree, pipePoolMaxFree, p.pipeScratch, p.scratch)
+	if p.pipeFree > nw*pipePoolMaxFree || p.pipeScratch > nw || p.scratch > nw {
+		t.Fatalf("pipe 池空闲 %d（上限 %d）、scratch pipe %d、scratch 块 %d（%d 个 worker 各至多 1 个）：超出上限",
+			p.pipeFree, nw*pipePoolMaxFree, p.pipeScratch, p.scratch, nw)
 	}
 	tcpConns := 0
 	for idx, s := range d.tcp {
@@ -181,6 +215,28 @@ func checkPoolInvariants(t testing.TB, d statsDump) {
 	if p.udpSlabs*objPoolSlabObjs-p.udpFree != udpSessions {
 		t.Fatalf("UDP 对象池不变式不成立：slabs*64-free=%d，各规则 sessions 之和=%d（slabs=%d free=%d）",
 			p.udpSlabs*objPoolSlabObjs-p.udpFree, udpSessions, p.udpSlabs, p.udpFree)
+	}
+	if len(d.workers) == 0 {
+		return
+	}
+	var sum workerStat
+	for _, w := range d.workers {
+		sum.tcpConns += w.tcpConns
+		sum.tcpTotal += w.tcpTotal
+		sum.udpSessions += w.udpSessions
+		sum.udpTotal += w.udpTotal
+	}
+	var rules workerStat
+	for _, s := range d.tcp {
+		rules.tcpConns += s.conns
+		rules.tcpTotal += s.total
+	}
+	for _, s := range d.udp {
+		rules.udpSessions += s.sessions
+		rules.udpTotal += s.total
+	}
+	if sum != rules {
+		t.Fatalf("worker 行之和 %+v 与规则行之和 %+v 不等", sum, rules)
 	}
 }
 
@@ -213,7 +269,7 @@ func (m *mapper) statsAfterSignal(t testing.TB) statsDump {
 			return fmt.Errorf("还没有新的统计输出（pool 行 %d，发信号前 %d）", count, before)
 		}
 		start := poolIdx
-		for start-1 >= 0 && strings.Contains(lines[start-1], "stats rule ") {
+		for start-1 >= 0 && (strings.Contains(lines[start-1], "stats rule ") || strings.Contains(lines[start-1], "stats worker ")) {
 			start--
 		}
 		d, err := parseStatsBlock(lines[start : poolIdx+1])
@@ -223,6 +279,10 @@ func (m *mapper) statsAfterSignal(t testing.TB) statsDump {
 		dump = d
 		return nil
 	})
+	// D63：worker 行只在 N>1 时有，恰为 N 行
+	if n := m.threads(); n > 1 && len(dump.workers) != n || n == 1 && len(dump.workers) != 0 {
+		t.Fatalf("--threads %d 的统计里有 %d 行 worker 行，期望 %d 行", n, len(dump.workers), map[bool]int{true: n, false: 0}[n > 1])
+	}
 	checkPoolInvariants(t, dump)
 	// D48：--disable-splice 时不创建 pipe，splice 计数全 0
 	if slices.Contains(m.cmd.Args, "--disable-splice") {
@@ -463,8 +523,8 @@ func heldBackpressure(t *testing.T, pipes bool, extra ...string) {
 		return nil
 	})
 	t.Logf("峰值 pool %+v；排空后 pool %+v", peak.pool, d.pool)
-	if d.pool.free > tcpBufPoolMaxFree {
-		t.Errorf("空闲块 %d 超过上限 %d", d.pool.free, tcpBufPoolMaxFree)
+	if limit := tcpBufPoolMaxFree * mp.threads(); d.pool.free > limit { // D64：空闲块每 worker 64 个，pool 行是各 worker 之和
+		t.Errorf("空闲块 %d 超过上限 %d（%d 个 worker 各 %d）", d.pool.free, limit, mp.threads(), tcpBufPoolMaxFree)
 	}
 	if d.tcp[1].total != m {
 		t.Errorf("tcp total=%d，期望 %d", d.tcp[1].total, m)
@@ -584,13 +644,10 @@ func TestStatsUDPDrops(t *testing.T) {
 		wait := listenPoints("u", portOf(listen))
 		args := []string{"-l", listen, "-r", be.addr, "-u"}
 		probe := startMapper(t, wait, args...)
-		fd := listenFD(probe.pid(), "udp", portOf(listen))
+		lo, hi := listenFDRange(t, probe.pid(), "udp", portOf(listen)) // M2：每个 worker 一个监听 socket，回包走会话所在 worker 的那个
 		probe.stop(t, false)
-		if fd < 0 {
-			t.Fatal("探测时没有找到 UDP 监听 socket")
-		}
 		// 只令监听 fd 的 sendto 失败：会话 socket 的上行照常，回包经监听 socket sendto 下行失败
-		m := startMapperSendtoFail(t, fd, fd+1, wait, args...)
+		m := startMapperSendtoFail(t, lo, hi, wait, args...)
 		c := udpDial(t, "", listen)
 		for range K {
 			if _, err := c.Write([]byte("ping")); err != nil {
@@ -629,6 +686,7 @@ func TestStatsUDPDrops(t *testing.T) {
 	}{{"downbatch", 10}, {"downbatchfull", 30}} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
+			singleWorkerOnly(t, "一次 flush 的回程批是一个 worker 的：3 个会话分在几个 worker 上时各 worker 各发一批、各记一行丢包")
 			const n = 3
 			be := quietUDP(t, loopback4(t))
 			listen := loopback4(t)
@@ -697,6 +755,7 @@ func TestStatsUDPDrops(t *testing.T) {
 	// 规则 2 的会话、后排规则 1 的：规则 1 的组排在批首、先发，它的 EAGAIN 不能连累后面规则 2 的组
 	t.Run("downmultirule", func(t *testing.T) {
 		t.Parallel()
+		singleWorkerOnly(t, "两条规则的回包在同一次 flush 里、只让规则 1 的监听 fd 失败；多个 worker 时每条规则有 N 个监听 fd，回程批按 worker 分开")
 		const perRule, k = 2, 8
 		bes := []*udpRecorder{quietUDP(t, loopback4(t)), quietUDP(t, loopback4(t))}
 		listens := []string{loopback4(t), loopback4(t)}
@@ -925,9 +984,9 @@ func TestStatsUDPSessionRelease(t *testing.T) {
 	// 释放后对象必须归还：slabs*64-free==sessions，由 statsAfterSignal 里的 checkPoolInvariants 保证（o1udpleak 在此被捕获）
 }
 
-// 域名 remote 会启动 DNS 线程，进程有两个线程。glibc 构建里 libev 用 signalfd，只在调用 ev_signal_start 的线程里屏蔽 SIGUSR1；
+// 域名 remote 会启动 DNS 线程。glibc 构建里 libev 用 signalfd，只在调用 ev_signal_start 的线程里屏蔽 SIGUSR1；
 // DNS 线程在信号 watcher 启动之后创建、继承屏蔽字，发给进程的 SIGUSR1 才不会落到它头上走默认动作（终止进程）。
-// 连发几次，每次都要有一组统计，进程不退出，转发照常
+// 连发几次，每次都要有一组统计，进程不退出，转发照常。D62 起进程有主线程、N 个 worker 线程与 DNS 线程，共 N+2 个
 func TestStatsDomainRemote(t *testing.T) {
 	t.Parallel()
 	bport := freePort(t)
@@ -942,8 +1001,8 @@ func TestStatsDomainRemote(t *testing.T) {
 		if err != nil {
 			return err
 		}
-		if len(tasks) < 2 {
-			return fmt.Errorf("tinymapper 只有 %d 个线程：域名 remote 应启动 DNS 线程，本用例没有测到多线程", len(tasks))
+		if want := m.threads() + 2; len(tasks) != want {
+			return fmt.Errorf("tinymapper 有 %d 个线程，期望 %d（主线程、%d 个 worker、DNS 线程）：域名 remote 应启动 DNS 线程", len(tasks), want, m.threads())
 		}
 		return nil
 	})
@@ -1067,7 +1126,7 @@ func startMapperSendFail(t testing.TB, lo, hi int, errno syscall.Errno, wait []l
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d %d", sendtoFailEnv, lo, hi, int(errno)))
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)

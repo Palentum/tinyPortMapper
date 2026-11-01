@@ -14,8 +14,10 @@
 #            tinymapper[-musl]@<后缀> 使用 build/tinymapper-{glibc,musl}-<后缀>，缺失时以 REF=<后缀> 自动编译；
 #            加 +gro 后缀（tinymapper+gro、tinymapper-musl@<后缀>+gro，可与 +nocap 组合）为同一二进制加 --udp-gro 启动（U5），
 #            +nosplice 为加 --disable-splice 启动（B2）；+nonroot（任何转发器，如 realm-1c+nonroot）以专用 uid FWD_UID（4242）启动，
-#            fs.pipe-user-pages-soft 按它计（见 lib.sh 的 start_fwd）
+#            fs.pipe-user-pages-soft 按它计（见 lib.sh 的 start_fwd）；+t<N>（tinymapper）加 --threads N 启动（P4 多 worker），
+#            N ≥ 2 时同 realm-2c 绑 FWD_CPUS2（0,1），CPU 统计按这组 CPU（如 tinymapper@<后缀>+t2、tinymapper-musl+t2+nonroot）
 #   TESTS    测试项，默认全部 8 项；REPS 轮数（3）；DUR 每项秒数（10）
+#            tcp_rr_<N> / tcp_crr_<N> 的 N 是并发连接数（默认列表里是 64、1000 / 32，其他 N 同样可用，如 tcp_rr_128、tcp_crr_128）
 #            另有不在默认列表里的 UDP 负载（TESTS / SC_TESTS 里显式指定）：
 #              udp_pps_64_p<N>  N 条流（iperf3 -P N），每条流是转发器里的一个会话
 #              <UDP 负载>_r     反向（iperf3 -R）：后端发、客户端收，数据走转发器回程；udp_pps_64_r、udp_pps_64_p<N>_r、udp_bw_1400_r

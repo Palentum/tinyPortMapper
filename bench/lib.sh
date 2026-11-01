@@ -11,7 +11,7 @@ CLI_HOST=${CLI_HOST:-}; FWD_HOST=${FWD_HOST:-}; SRV_HOST=${SRV_HOST:-}
 FWD_IP=${FWD_IP:-127.0.0.1}      # 客户端访问转发器的地址
 SRV_IP=${SRV_IP:-127.0.0.1}      # 转发器（direct 时为客户端）访问后端的地址
 CLI_CPUS=${CLI_CPUS:-2,3}; SRV_CPUS=${SRV_CPUS:-4,5}
-FWD_CPUS=${FWD_CPUS:-0}; FWD_CPUS2=${FWD_CPUS2:-0,1}   # 单核转发器 / realm-2c
+FWD_CPUS=${FWD_CPUS:-0}; FWD_CPUS2=${FWD_CPUS2:-0,1}   # 单核转发器 / realm-2c 与 tinymapper+t<N>（N ≥ 2）
 BIN=${BIN:-/build}               # fwd 上 tinymapper-{glibc,musl}[-后缀] 所在目录
 TM_LOG_LEVEL=${TM_LOG_LEVEL:-3}  # tinymapper 的 --log-level；4 为默认级别 info，CRR 每连接写 3 行日志
 FWDBENCH=${FWDBENCH:-fwdbench}; IPERF3=${IPERF3:-iperf3}; REALM=${REALM:-realm}; RINETD=${RINETD:-rinetd}
@@ -142,7 +142,7 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>][+t<N>] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；+ 开头的标记顺序任意，可组合：
 # +gro：同一二进制加 --udp-gro 启动（U5），同一批里对照开/关；
 # +nosplice：同一二进制加 --disable-splice 启动（B2），同一批里对照 splice 开/关；
@@ -152,6 +152,8 @@ iperf_udp() {
 # fs.pipe-user-pages-soft 按这个 uid 计（容器里的 root 与 VM 里所有 root 进程同一 uid，--privileged 时还不受该限额约束）；
 # 只用于 loopback 容器（脚本以 root 运行）
 # +pipe<KiB>（tinymapper 与 realm 都可加）：pipe 容量（B3），tinymapper 加 --pipe-size <KiB>，realm 加 -p <KiB/4>（4 KiB 页数）
+# +t<N>（tinymapper）：加 --threads N 启动（P4 多 worker）；N ≥ 2 时绑 FWD_CPUS2（同 realm-2c），FWD_SET 随之，cpus.fwd 是这组 CPU 之和；
+# 不带时不传 --threads（二进制的默认值），绑 FWD_CPUS
 tm_file() {
   local n=${1%%+*} v s=""
   v=${n%%@*}
@@ -162,20 +164,23 @@ tm_file() {
 
 # start_fwd <转发器> <后端端口>：启动转发器，设置 FWD_PID、FWD_NAME、所在 CPU FWD_SET 与客户端目标 TARGET_IP:TARGET_PORT
 start_fwd() {
-  local fwd=$1 bp=$2 l r c u="" pipe=""
+  local fwd=$1 bp=$2 l r c u="" pipe="" thr="" cpus
   FWD_PID=""; FWD_NAME=$fwd; FWD_SET=$FWD_CPUS; TARGET_IP=$FWD_IP; TARGET_PORT=$FPORT
   l=$(hp "$FWD_IP" $FPORT); r=$(hp "$SRV_IP" "$bp")
   case "$fwd+" in *+nonroot+*) u="setpriv --reuid=$FWD_UID --regid=$FWD_UID --clear-groups " ;; esac
   case "$fwd+" in *+pipe[0-9]*) pipe=${fwd##*+pipe}; pipe=${pipe%%+*} ;; esac
+  case "$fwd+" in *+t[0-9]*) thr=${fwd##*+t}; thr=${thr%%+*} ;; esac
   case ${fwd%%+*} in
     direct) TARGET_IP=$SRV_IP; TARGET_PORT=$bp; return 0 ;;
     tinymapper*)
-      c="taskset -c $FWD_CPUS $u"
+      cpus=$FWD_CPUS; [ -z "$thr" ] || [ "$thr" -lt 2 ] || cpus=$FWD_CPUS2
+      FWD_SET=$cpus; c="taskset -c $cpus $u"
       [ -n "$u" ] || case "${TM_NOCAP:-}:$fwd+" in 1:*|*+nocap+*) c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin" ;; esac
       c="$c $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL"
       case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac
       case "$fwd+" in *+nosplice+*) c="$c --disable-splice" ;; esac
-      [ -z "$pipe" ] || c="$c --pipe-size $pipe" ;;
+      [ -z "$pipe" ] || c="$c --pipe-size $pipe"
+      [ -z "$thr" ] || c="$c --threads $thr" ;;
     rinetd)
       on fwd "mkdir -p $WORK; printf '%s %s %s %s\n%s %s/udp %s %s/udp\n' $FWD_IP $FPORT $SRV_IP $bp $FWD_IP $FPORT $SRV_IP $bp >$WORK/rinetd.conf"
       c="taskset -c $FWD_CPUS $u$RINETD -f -c $WORK/rinetd.conf" ;;
@@ -235,20 +240,25 @@ cpu_json() {
 
 # tm_stats：被测 tinymapper 支持 SIGUSR1 统计（O1 起）时让它输出一次，打印其中（单规则）`stats rule N tcp:`、`stats rule N udp:`、
 # `stats pool:` 各一行，行首为 tcp / udp / pool，后面是原样的字段（去掉颜色码），如 `udp sessions=1 total=1 up_pkts=…`、
-# `pool bufs alloc=64 held=0 … pipes alloc=…`；其他转发器、没有统计的旧二进制（收到 SIGUSR1 会退出）与 --log-level 0 时不输出。
-# 等到 `stats pool:` 行写出（sigusr1_cb 最后 fflush）
+# `pool bufs alloc=64 held=0 … pipes alloc=…`；多 worker（P4，D63）时规则行与 pool 行是各 worker 之和，这一次输出的
+# `stats worker W: tcp_conns=… udp_total=…` 每 worker 一行，行首为 wW（w0、w1…）；其他转发器、没有统计的旧二进制（收到 SIGUSR1
+# 会退出）与 --log-level 0 时不输出。等到 `stats pool:` 行写出（sigusr1_cb 最后 fflush）
 tm_stats() {
   case $FWD_NAME in tinymapper*) ;; *) return 0 ;; esac
   [ -n "$FWD_PID" ] && [ "$TM_LOG_LEVEL" != 0 ] || return 0
   on fwd "f=$WORK/fwd.log; LC_ALL=C grep -aq 'stats rule' $BIN/$(tm_file "$FWD_NAME") || exit 0
-    n=\$(grep -ac 'stats pool:' \$f); kill -USR1 $FWD_PID 2>/dev/null || exit 0
+    n=\$(grep -ac 'stats pool:' \$f); l=\$(wc -l < \$f); kill -USR1 $FWD_PID 2>/dev/null || exit 0
     for i in \$(seq 100); do [ \$(grep -ac 'stats pool:' \$f) -gt \$n ] && break; sleep 0.02; done
+    tail -n +\$((l + 1)) \$f | grep -a 'stats worker [0-9]*:' | sed 's/.*stats worker \([0-9]*\): /w\1 /; s/\x1b\[[0-9;]*m//g'
     for k in 'rule [0-9]* tcp' 'rule [0-9]* udp' pool; do
       grep -a \"stats \$k:\" \$f | tail -1 | sed 's/.*stats \(rule [0-9]* \)*\([a-z]*\): /\2 /; s/\x1b\[[0-9;]*m//g'
     done"
 }
 
-# stats_json <tcp|udp|pool>：从 tm_stats 的输出里取该行转为 JSON 对象，没有时输出 null。pool 行里不带 = 的词（bufs、tcp_pairs、
+# tm_workers <tm_stats 的输出>：其中每 worker 行的行首（w0 w1 …），没有时为空
+tm_workers() { echo "$1" | awk '/^w[0-9]+ / {print $1}'; }
+
+# stats_json <tcp|udp|pool|wW>：从 tm_stats 的输出里取该行转为 JSON 对象，没有时输出 null。pool 行里不带 = 的词（bufs、tcp_pairs、
 # udp_pairs、pipes）作为其后字段的前缀：{"bufs_alloc":…, "pipes_held":…}
 stats_json() {
   awk -v k="$1" '$1 == k {for (i = 2; i <= NF; i++) if (split($i, kv, "=") == 2) printf "%s\"%s%s\":%s", (n++ ? "," : "{"), p, kv[1], kv[2]; else p = $i "_"}

@@ -239,6 +239,7 @@ func TestUDPSessionOneWay(t *testing.T) {
 // lru.size() 为 k，fd 数回到 n+k，进程不退出，k 个正常会话不受影响
 func TestUDPEpollAddFail(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "日志里的连接数与 lru.size() 是本 worker 的（S7），释放后的计数随连接落在哪个 worker 而不同")
 	const k, attempts = 3, 4
 	be := serveUDP(t, loopback4(t), "")
 	listen := loopback4(t)
@@ -316,14 +317,11 @@ func TestUDPEpollAddFailListener(t *testing.T) {
 	wait := listenPoints("tu", portOf(listen))
 	args := []string{"-l", listen, "-r", remote, "-t", "-u"}
 	probe := startMapper(t, wait, args...)
-	fd := listenFD(probe.pid(), "udp", portOf(listen))
+	fd, hi := listenFDRange(t, probe.pid(), "udp", portOf(listen)) // M2：每个 worker 一个监听 socket，都让它们 ADD 失败
 	probe.stop(t, false)
-	if fd < 0 {
-		t.Fatal("探测时没有找到 UDP 监听 socket")
-	}
-	m := startMapperEpollAddFail(t, fd, fd+1, wait, args...)
-	if got := listenFD(m.pid(), "udp", portOf(listen)); got != fd {
-		t.Fatalf("注入故障后 UDP 监听 socket 的 fd 为 %d，探测时为 %d", got, fd)
+	m := startMapperEpollAddFail(t, fd, hi, wait, args...)
+	if got, gotHi := listenFDRange(t, m.pid(), "udp", portOf(listen)); got != fd || gotHi != hi {
+		t.Fatalf("注入故障后 UDP 监听 socket 的 fd 为 [%d, %d)，探测时为 [%d, %d)", got, gotHi, fd, hi)
 	}
 	warn := fmt.Sprintf("[udp]accept watcher of listen fd %d got EV_ERROR", fd)
 	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
@@ -348,9 +346,14 @@ func TestUDPEpollAddFailListener(t *testing.T) {
 	ticks, warns := m.cpuTicks(t)-ticks0, m.logLines(warn)-warns0
 	m.fatalIfExited(t, "UDP 监听 fd 的 ADD 失败 2 s 后")
 	t.Logf("UDP 监听 fd %d 的 ADD 一直失败的 2 s：CPU %.2f s，%d 行 warn", fd, float64(ticks)/100, warns)
-	// warn 由 400 ms 的定时器写出，两次读数各偏移不到一个周期，2 s 内约 5 行
+	// warn 由 400 ms 的定时器写出，两次读数各偏移不到一个周期，2 s 内约 5 行（只数第一个监听 fd 的；M2 的其余监听 fd 各有自己的行）
 	if warns < 2 {
 		t.Errorf("2 s 内只有 %d 行 warn：clear_timer_cb 没有重新 start UDP 监听 watcher，ADD 不再重试", warns)
+	}
+	for k := fd + 1; k < hi; k++ {
+		if m.logLines(fmt.Sprintf("[udp]accept watcher of listen fd %d got EV_ERROR", k)) == 0 {
+			t.Errorf("监听 fd %d（另一个 worker 的）没有 EV_ERROR 的 warn", k)
+		}
 	}
 	if warns > 10 {
 		t.Errorf("2 s 内有 %d 行 warn：UDP 监听 watcher 的重试在空转", warns)
@@ -457,6 +460,7 @@ func TestUDPManySessions(t *testing.T) {
 //     （删除用后移，表不被打乱；noshift/shiftgt 变异会让部分 A 会话查不到→重建→计数超出，在此被杀）。
 func TestUDPSessionChurn(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 	inContainer(t)
 	const n = 600
 	const name = "tpm-u2churn.test"
@@ -717,6 +721,8 @@ func queueUDP(t testing.TB, m *mapper, listen string, sends []udpSend) {
 // 两种情况 rqueue 都严格增大
 func queueListen(t testing.TB, m *mapper, listen string, n int, size func(i int) int, send func(i int) error) {
 	t.Helper()
+	singleWorkerOnly(t, "暂停期间排进监听 socket 的包按队列里的位置分批；多个 worker 时各客户端的包按四元组散列到各自 worker 的监听 socket，"+
+		"sock_diag 按地址只查得到 reuseport 组里一个")
 	remote := "0.0.0.0:0"
 	if strings.HasPrefix(listen, "[") {
 		remote = "[::]:0"

@@ -24,6 +24,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"syscall"
 	"testing"
@@ -62,7 +63,8 @@ func isSetPipeSz(c notifyCall) bool { return c.nr == syscall.SYS_FCNTL && c.args
 func isGetPipeSz(c notifyCall) bool { return c.nr == syscall.SYS_FCNTL && c.args[1] == fGetpipeSz }
 
 // epollWaitNR：事件循环的 epoll 等待（arm64 上 libev 的 epoll_wait 经 libc 走 epoll_pwait），测试据此把调用按事件循环的轮次分组
-// （D53：一次回调里 splice 的轮数）
+// （D53：一次回调里 splice 的轮数）。D62 起 threads=1 也是主线程（TID 等于进程号：信号、400 ms 定时器）加 worker 线程，各有自己的 loop，
+// 主线程与别的 worker 的 epoll 等待和转发所在 worker 的交错：轮次只能按发起调用的线程（notifyCall.pid）的 epoll 等待划分
 var epollWaitNR = map[string][]uint32{
 	"arm64": {uint32(syscall.SYS_EPOLL_PWAIT), 441},      // 441：epoll_pwait2
 	"amd64": {232, uint32(syscall.SYS_EPOLL_PWAIT), 441}, // 232：epoll_wait
@@ -178,7 +180,7 @@ func execNotify() {
 	fail("exec %s：%v", os.Args[1], err)
 }
 
-// notifyCall 是一次被通知的系统调用；pid 是调用线程在测试进程的 pid 命名空间里的号
+// notifyCall 是一次被通知的系统调用；pid 是调用线程在测试进程的 pid 命名空间里的号（seccomp_notif.pid：线程的 TID，主线程才等于进程号）
 type notifyCall struct {
 	pid  int
 	nr   uint32
@@ -187,16 +189,22 @@ type notifyCall struct {
 
 func (c notifyCall) fd(i int) int { return int(int32(c.args[i])) }
 
-// notifier 回应 tinymapper 的被通知调用：先问 addFD，它返回测试进程的一个 fd 时把它装进 tinymapper、以新 fd 号作为这次调用的返回值
-// （调用不执行）；再问 emulate，它返回 ok 时这次调用不执行、直接以 val 返回（输出参数由 emulate 经 writeTargetMem 写好）；否则 decide
-// 返回 0 表示照常执行，返回 errno 则以它失败
+// notifier 回应 tinymapper 的被通知调用：先问 hold，它返回通道时这次调用先不回应，通道关闭后照常执行（notifier 照常处理别的线程的调用，
+// 用于让一个 worker 线程停在系统调用里，S8 的退出超时）；再问 addFD，它返回测试进程的一个 fd 时把它装进 tinymapper、以新 fd 号作为这次
+// 调用的返回值（调用不执行）；再问 emulate，它返回 ok 时这次调用不执行、直接以 val 返回（输出参数由 emulate 经 writeTargetMem 写好）；
+// 否则 decide 返回 0 表示照常执行，返回 errno 则以它失败
 type notifier struct {
 	fd      int
+	hold    atomic.Pointer[func(notifyCall) <-chan struct{}]
 	addFD   atomic.Pointer[func(notifyCall) int]
 	emulate atomic.Pointer[func(notifyCall) (int64, bool)]
 	decide  atomic.Pointer[func(notifyCall) syscall.Errno]
 	calls   atomic.Int64 // 收到的通知数
+	held    sync.WaitGroup
+	gone    chan struct{} // loop 退出时关闭：还压着的调用不再回应（tinymapper 已退出），fd 在它们都放手之后才关
 }
+
+func (n *notifier) setHold(f func(notifyCall) <-chan struct{}) { n.hold.Store(&f) }
 
 func (n *notifier) setDecide(f func(notifyCall) syscall.Errno) { n.decide.Store(&f) }
 
@@ -245,7 +253,11 @@ func openPath(c notifyCall) (path string, ok bool) {
 }
 
 func (n *notifier) loop() {
-	defer syscall.Close(n.fd)
+	defer func() {
+		close(n.gone)
+		n.held.Wait()
+		syscall.Close(n.fd)
+	}()
 	ep, err := syscall.EpollCreate1(syscall.EPOLL_CLOEXEC)
 	if err != nil {
 		return
@@ -275,6 +287,26 @@ func (n *notifier) loop() {
 		c := notifyCall{pid: int(ne.Uint32(req[8:])), nr: ne.Uint32(req[16:])}
 		for i := range c.args {
 			c.args[i] = ne.Uint64(req[32+8*i:])
+		}
+		if f := n.hold.Load(); f != nil {
+			if ch := (*f)(c); ch != nil {
+				var resp [24]byte
+				copy(resp[0:8], req[0:8])
+				ne.PutUint32(resp[20:], seccompNotifContinue)
+				n.held.Go(func() {
+					select {
+					case <-ch:
+					case <-n.gone:
+						return
+					}
+					for {
+						if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(n.fd), seccompNotifSend, uintptr(unsafe.Pointer(&resp[0]))); e != syscall.EINTR {
+							break
+						}
+					}
+				})
+				continue
+			}
 		}
 		if f := n.addFD.Load(); f != nil {
 			if src := (*f)(c); src >= 0 {
@@ -353,7 +385,7 @@ func startMapperNotifyWith(t testing.TB, setup func(*notifier), wait []listenPoi
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
 	cmd.Env = append(os.Environ(), notifyEnv+"=1")
 	cmd.ExtraFiles = []*os.File{child}
 	cmd.Stdout, cmd.Stderr = f, f
@@ -389,7 +421,7 @@ func startMapperNotifyWith(t testing.TB, setup func(*notifier), wait []listenPoi
 	if err != nil || len(fds) != 1 {
 		t.Fatalf("解析 SCM_RIGHTS 失败：%v（%v）", err, fds)
 	}
-	n := &notifier{fd: fds[0]}
+	n := &notifier{fd: fds[0], gone: make(chan struct{})}
 	if setup != nil {
 		setup(n)
 	}

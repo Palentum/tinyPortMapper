@@ -100,7 +100,7 @@ func startMapperTopPad0(t testing.TB, wait []listenPoint, args ...string) *mappe
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(mapperBin, append([]string{"--disable-color"}, args...)...)
+	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	cmd.Env = append(os.Environ(), "GLIBC_TUNABLES=glibc.malloc.top_pad=0")
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)
@@ -241,6 +241,7 @@ func TestAllocTCPObjPool(t *testing.T) {
 // 预热对齐边界很关键，否则复用空闲对象且无需扩容的会话不分配任何东西（U2 去掉了每会话的 map 节点），没有可失败的分配。
 func TestAllocUDPObjPool(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "预热到对象池 slab 的整数倍要求所有会话在同一个 worker 的池里")
 	heavy(t)
 	be := serveUDP(t, loopback4(t), "")
 	listen := loopback4(t)

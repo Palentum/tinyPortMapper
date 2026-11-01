@@ -6,6 +6,8 @@
 //	TPM_SLOW=1        运行耗时超过约 60 s 的用例（TCP/UDP 空闲超时、TCP 上游建连超时）
 //	TPM_IN_CONTAINER=1 允许修改 /etc/hosts 的用例运行，并要求测试进程有 CAP_NET_ADMIN（needNetAdmin）（只应由 tests/run.sh 在容器中设置）
 //	TPM_VARIANT       被测构建的 libc（glibc 或 musl），用于只在某一变体上预期失败的已知缺陷
+//	TPM_THREADS=N     M2：没有自带 --threads 的 tinymapper 启动都加上 --threads N（1–64 或 auto），在多 worker 下跑全套件；
+//	                  本身假设只有一个 worker 的用例经 singleWorkerOnly 跳过
 package tests
 
 import (
@@ -18,6 +20,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -47,6 +50,12 @@ func TestMain(m *testing.M) {
 		fmt.Fprintln(os.Stderr, "需要在 Linux 上运行并设置 TINYMAPPER_BIN；在开发机上请用 tests/run.sh")
 		os.Exit(2)
 	}
+	if s := os.Getenv("TPM_THREADS"); s != "" && s != "auto" {
+		if n, err := strconv.Atoi(s); err != nil || n < 1 || n > 64 {
+			fmt.Fprintf(os.Stderr, "TPM_THREADS=%q 无效：应为 1–64 或 auto\n", s)
+			os.Exit(2)
+		}
+	}
 	nextPort.Store(20000)
 	os.Exit(m.Run())
 }
@@ -69,6 +78,82 @@ func inContainer(t testing.TB) {
 func heavy(t testing.TB) {
 	heavySem <- struct{}{}
 	t.Cleanup(func() { <-heavySem })
+}
+
+// autoThreads 是 --threads auto 的 worker 数（S1）：sched_getaffinity 的 CPU 数，上限 8。测试进程与它启动的 tinymapper 在同一个容器里，
+// 亲和掩码相同
+var autoThreads = sync.OnceValue(func() int {
+	var mask [16]uint64 // 1024 个 CPU
+	n, _, e := syscall.RawSyscall(syscall.SYS_SCHED_GETAFFINITY, 0, unsafe.Sizeof(mask), uintptr(unsafe.Pointer(&mask[0])))
+	if e != 0 {
+		panic(fmt.Sprintf("sched_getaffinity：%v", e))
+	}
+	cpus := 0
+	for _, w := range mask[:n/8] {
+		for ; w != 0; w &= w - 1 {
+			cpus++
+		}
+	}
+	return min(max(cpus, 1), 8)
+})
+
+// envThreads 返回 TPM_THREADS 给的 worker 数（auto 按 autoThreads 换算），没设时为 0
+func envThreads() int {
+	switch s := os.Getenv("TPM_THREADS"); s {
+	case "":
+		return 0
+	case "auto":
+		return autoThreads()
+	default:
+		n, _ := strconv.Atoi(s) // TestMain 已核对
+		return n
+	}
+}
+
+// hasThreadsArg 判断参数里是否已有 --threads（含 --threads=N 的写法）
+func hasThreadsArg(args []string) bool {
+	return slices.ContainsFunc(args, func(a string) bool { return a == "--threads" || strings.HasPrefix(a, "--threads=") })
+}
+
+// mapperArgv 返回启动 tinymapper 的参数（不含程序名）：--disable-color，TPM_THREADS 设了且 args 里没有 --threads 时接着是 --threads N，
+// 然后是 args。插在用例参数之前而不是末尾：以缺值选项结尾的参数（如 "--pipe-size"）后面接上 --threads 会变成别的错误
+func mapperArgv(args ...string) []string {
+	argv := []string{"--disable-color"}
+	if s := os.Getenv("TPM_THREADS"); s != "" && !hasThreadsArg(args) {
+		argv = append(argv, "--threads", s)
+	}
+	return append(argv, args...)
+}
+
+// threads 返回这个 tinymapper 的 worker 数（按启动参数里的 --threads，默认 1）
+func (m *mapper) threads() int {
+	for i, a := range m.cmd.Args {
+		v, ok := strings.CutPrefix(a, "--threads=")
+		if !ok && a == "--threads" && i+1 < len(m.cmd.Args) {
+			v, ok = m.cmd.Args[i+1], true
+		}
+		if !ok {
+			continue
+		}
+		if v == "auto" {
+			return autoThreads()
+		}
+		n, err := strconv.Atoi(v)
+		if err != nil {
+			panic(fmt.Sprintf("无法解析 --threads %q", v))
+		}
+		return n
+	}
+	return 1
+}
+
+// singleWorkerOnly 用于本身假设只有一个 worker 的用例（同一轮事件循环里的确定性批次、accept 轮次、fd 复用，每个 loop 一份的池计数，
+// 每 worker 一份的轮询状态，按地址只查得到 reuseport 组里一个 socket 的 sock_diag 等）：TPM_THREADS 大于 1 时跳过，reason 写明假设
+func singleWorkerOnly(t testing.TB, reason string) {
+	t.Helper()
+	if n := envThreads(); n > 1 {
+		t.Skipf("TPM_THREADS=%d：本用例假设只有一个 worker（%s）", n, reason)
+	}
 }
 
 var ephemeralRange = sync.OnceValues(func() (int, int) {
@@ -162,7 +247,7 @@ func startMapperLimit(t testing.TB, nofile int, wait []listenPoint, args ...stri
 		t.Fatal(err)
 	}
 	defer f.Close()
-	argv := append([]string{"--disable-color"}, args...)
+	argv := mapperArgv(args...)
 	cmd := exec.Command(mapperBin, argv...)
 	if nofile > 0 {
 		script := fmt.Sprintf(`ulimit -n %d && exec "$0" "$@"`, nofile)
@@ -284,7 +369,7 @@ func startMapperEpollAddFail(t testing.TB, lo, hi int, wait []listenPoint, args 
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d", epollAddFailEnv, lo, hi))
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)
@@ -349,7 +434,7 @@ func startMapperNoNetAdmin(t testing.TB, wait []listenPoint, args ...string) *ma
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
 	cmd.Env = append(os.Environ(), noNetAdminEnv+"=1")
 	cmd.Stdout, cmd.Stderr = f, f
 	m := runMapper(t, cmd, logPath, wait)
@@ -542,13 +627,15 @@ next:
 	return n
 }
 
+// waitListen 等到 wait 中的每个监听都有 m.threads() 个 socket（M2：每个 worker 一个 SO_REUSEPORT 监听）。只等到第一个时 UDP 的 reuseport 组
+// 还没建齐，这时发出的包落在组里已有的 socket 上，之后同一客户端的包按完整的组散列，可能落到别的 worker、另建一个会话（S12）
 func (m *mapper) waitListen(t testing.TB, wait []listenPoint) {
 	t.Helper()
 	deadline := time.Now().Add(10 * time.Second)
 	for {
 		ready := true
 		for _, lp := range wait {
-			if !listening(m.pid(), lp.proto, lp.port) {
+			if len(listenFDs(m.pid(), lp.proto, lp.port)) < m.threads() {
 				ready = false
 				break
 			}
@@ -752,11 +839,34 @@ func sockDiagDump(family, proto int, states uint32, f func(sport, dport uint16, 
 // listening 判断进程 pid 是否已在 port 上监听 proto（IPv4 或 IPv6）。
 func listening(pid int, proto string, port int) bool { return listenFD(pid, proto, port) >= 0 }
 
-// listenFD 返回进程 pid 在 port 上监听 proto 的 socket 的 fd 号，没有则返回 -1：TCP 为 LISTEN 状态，UDP 为未连接的 socket
+// listenFD 返回进程 pid 在 port 上监听 proto 的 socket 的 fd 号（M2 起每个 worker 一个，取最小的），没有则返回 -1
+func listenFD(pid int, proto string, port int) int {
+	if fds := listenFDs(pid, proto, port); len(fds) > 0 {
+		return fds[0]
+	}
+	return -1
+}
+
+// listenFDRange 返回进程 pid 在 port 上监听 proto 的全部 socket 的 fd 区间 [lo, hi)（M2：每个 worker 一个，主线程依次建，fd 相邻），
+// 用于按 fd 区间注入故障的用例让同一条规则的每个监听 socket 都失败
+func listenFDRange(t testing.TB, pid int, proto string, port int) (lo, hi int) {
+	t.Helper()
+	fds := listenFDs(pid, proto, port)
+	if len(fds) == 0 {
+		t.Fatalf("没有找到端口 %d 上的 %s 监听 socket", port, proto)
+	}
+	lo, hi = fds[0], fds[len(fds)-1]+1
+	if hi-lo != len(fds) {
+		t.Fatalf("端口 %d 上的 %s 监听 socket 的 fd %v 不相邻，按区间注入会波及别的 fd", port, proto, fds)
+	}
+	return lo, hi
+}
+
+// listenFDs 返回进程 pid 在 port 上监听 proto 的全部 socket 的 fd 号（升序）：TCP 为 LISTEN 状态，UDP 为未连接的 socket
 // （TCP_CLOSE，即 /proc/net/udp 的 st=07），IPv4、IPv6 都算。原来每次整表读 /proc/net/{tcp,tcp6}：与 TestTCPMaxConn 并行时
 // 两张表各有约 8 万行，读一遍要数秒，waitListen 的 10 s 里只试得了几次，就绪超时（两份套件并行时 27 次全量里 10 次）。
 // 改用 sockDiagDump 只列监听 socket，耗时与系统里已建立的连接数无关
-func listenFD(pid int, proto string, port int) int {
+func listenFDs(pid int, proto string, port int) []int {
 	ipproto, states := syscall.IPPROTO_TCP, uint32(1)<<10 // TCP_LISTEN
 	if proto == "udp" {
 		ipproto, states = syscall.IPPROTO_UDP, uint32(1)<<7 // TCP_CLOSE
@@ -770,18 +880,20 @@ func listenFD(pid int, proto string, port int) int {
 		})
 	}
 	if len(inodes) == 0 {
-		return -1
+		return nil
 	}
+	var fds []int
 	dir := fmt.Sprintf("/proc/%d/fd", pid)
 	ents, _ := os.ReadDir(dir)
 	for _, e := range ents {
 		link, _ := os.Readlink(filepath.Join(dir, e.Name()))
 		if inode, ok := strings.CutPrefix(link, "socket:["); ok && inodes[strings.TrimSuffix(inode, "]")] {
 			fd, _ := strconv.Atoi(e.Name())
-			return fd
+			fds = append(fds, fd)
 		}
 	}
-	return -1
+	slices.Sort(fds)
+	return fds
 }
 
 // portHolders 列出 /proc/net/{tcp,tcp6,udp,udp6} 中本地端口为 port 的 socket 及持有它的进程，用于诊断 EADDRINUSE：
@@ -882,19 +994,27 @@ func (m *mapper) syscw(t testing.TB) int {
 	return 0
 }
 
-// pause 向 tinymapper 发送 SIGSTOP 并等到它停下（kill 返回时目标进程未必已停下），测试结束时自动 SIGCONT
+// pause 向 tinymapper 发送 SIGSTOP 并等到它的每个线程都停下（kill 返回时目标进程未必已停下），测试结束时自动 SIGCONT。
+// D62 起转发在 worker 线程里：/proc/<pid>/stat 只是主线程的状态，主线程停下时 worker 可能还在跑（正在处理回调、或停在 seccomp 通知里
+// 等回应），暂停期间排队的数据会被它先读走一部分，所以逐个看 /proc/<pid>/task/<tid>/stat
 func (m *mapper) pause(t testing.TB) {
 	t.Helper()
 	m.cmd.Process.Signal(syscall.SIGSTOP)
 	t.Cleanup(func() { m.cmd.Process.Signal(syscall.SIGCONT) })
 	eventually(t, ioTimeout, 10*time.Millisecond, func() error {
-		data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", m.pid()))
+		tasks, err := os.ReadDir(fmt.Sprintf("/proc/%d/task", m.pid()))
 		if err != nil {
 			return err
 		}
-		s := string(data)
-		if st := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[0]; st != "T" {
-			return fmt.Errorf("tinymapper 状态为 %s，SIGSTOP 尚未生效", st)
+		for _, task := range tasks {
+			data, err := os.ReadFile(fmt.Sprintf("/proc/%d/task/%s/stat", m.pid(), task.Name()))
+			if err != nil {
+				return err
+			}
+			s := string(data)
+			if st := strings.Fields(s[strings.LastIndexByte(s, ')')+1:])[0]; st != "T" {
+				return fmt.Errorf("tinymapper 线程 %s 状态为 %s，SIGSTOP 尚未生效", task.Name(), st)
+			}
 		}
 		return nil
 	})
@@ -903,7 +1023,7 @@ func (m *mapper) pause(t testing.TB) {
 // runExpectFail 运行 tinymapper 并期望它以非零状态退出，返回其输出
 func runExpectFail(t testing.TB, timeout time.Duration, args ...string) string {
 	t.Helper()
-	cmd := exec.Command(mapperBin, append([]string{"--disable-color"}, args...)...)
+	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	var out strings.Builder
 	cmd.Stdout, cmd.Stderr = &out, &out
 	if err := cmd.Start(); err != nil {

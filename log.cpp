@@ -13,13 +13,13 @@ void log0(const char * file,const char * function,int line,int level,const char*
 	if(level>log_trace||level<0) return ;
 
 
-	//时间戳和各级别的"颜色[时间][级别]"前缀按秒缓存（不加锁：只有主线程写日志，DNS 线程不写）。
+	//时间戳和各级别的"颜色[时间][级别]"前缀按秒缓存，每个线程一份（M2，L6：主线程与各 worker 线程都写日志，DNS 线程不写）。
 	//用 localtime_r：glibc 的 localtime 每次调用都重新检查 /etc/localtime，每行多一次 stat。
 	//enable_log_color 只在 process_arg 开头的预扫描里设置，之后不再改（在它之前只有 main() 里 ev_default_loop 失败会写一行，随即退出），不作为缓存的键
-	static time_t time_buf_sec=-1;
-	static char time_buf[100];
-	static char prefix_buf[log_end][sizeof(log_color[0])+sizeof(time_buf)+sizeof(log_text[0])+4];//放得下最长的前缀，snprintf 不会截断
-	static int prefix_len[log_end];//0：这一秒还没生成
+	static thread_local time_t time_buf_sec=-1;
+	static thread_local char time_buf[100];
+	static thread_local char prefix_buf[log_end][sizeof(log_color[0])+sizeof(time_buf)+sizeof(log_text[0])+4];//放得下最长的前缀，snprintf 不会截断
+	static thread_local int prefix_len[log_end];//0：这一秒还没生成
 	time_t timer=time(NULL);
 	if(timer!=time_buf_sec)
 	{
@@ -54,12 +54,14 @@ void log0(const char * file,const char * function,int line,int level,const char*
 	}
 	else
 	{
-		//放不下（如很长的配置文件路径）：分几次写，不截断
+		//放不下（如很长的配置文件路径）：分几次写，不截断；锁住 stdout，别的线程的行不会插进来
+		flockfile(stdout);
 		fwrite(line_buf,1,len,stdout);
 		va_start(vlist, str);
 		vfprintf(stdout, str, vlist);
 		va_end(vlist);
 		fputs(reset,stdout);
+		funlockfile(stdout);
 	}
 
 	//printf("\n");

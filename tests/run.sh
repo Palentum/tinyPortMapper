@@ -9,6 +9,8 @@
 #   REF=<git ref>          测试该提交的构建（build/tinymapper-<variant>-<ref>），与 docker/build.sh 一致
 #   TPM_NO_BUILD=1         跳过 docker/build.sh，直接使用 build/ 中已有的二进制
 #   TPM_SLOW=1             同时运行慢速用例（TCP/UDP 空闲超时，约 7 分钟）
+#   TPM_DOCKER_NAME=<名字> 容器名取 <名字>-<变体>（并行的成员据此只停自己的容器）
+#   TPM_THREADS=N          M2：没有自带 --threads 的 tinymapper 启动都加上 --threads N（1–64 或 auto），在多 worker 下跑全套件
 #
 # 流程：docker/build.sh 编译 tinymapper → 宿主机交叉编译测试二进制 → 每个变体一个
 # `docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
@@ -65,16 +67,16 @@ for v in $VARIANTS; do
 	# 由 Docker VM 里所有 root 进程共用（测试进程的回显后端 io.Copy 走 Go 的 splice，每个 pipe 1 MiB，TestTCPMaxConn 期间约 1.9 万个；
 	# 并行的另一份套件也算），用完后断言 splice 的用例拿不到 pipe
 	# （needPipeQuotaExempt）；限额本身由 TestSpliceFallbackPipeQuota 以专用的非 root uid 测
-	if docker run --rm --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun \
+	if docker run --rm ${TPM_DOCKER_NAME:+--name "$TPM_DOCKER_NAME-$v"} --network none --ulimit nofile=524288:524288 --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun \
 		-v "$ROOT/build:/build:ro" -w /tmp \
-		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW \
+		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_SLOW -e TPM_THREADS \
 		"$img" "/build/$TESTBIN" -test.timeout=30m "$@"; then
 		result=PASS
 	else
 		result=FAIL
 		status=1
 	fi
-	summary+=("${v}: ${result}（$(($(date +%s) - start)) s，build/${bin}）")
+	summary+=("${v}${TPM_THREADS:+（TPM_THREADS=${TPM_THREADS}）}: ${result}（$(($(date +%s) - start)) s，build/${bin}）")
 done
 printf '%s\n' "${summary[@]}"
 exit $status

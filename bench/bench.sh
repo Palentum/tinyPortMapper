@@ -5,7 +5,8 @@
 # 每行另记 cpus（客户端运行期间转发器所在 CPU 与客户端、后端 CPU 的占用，含 softirq，见 lib.sh 的 cpu_json），
 # 被测的是 tinymapper 时记运行结束后 SIGUSR1 统计（lib.sh 的 tm_stats）：TCP 负载记 tm_tcp（tcp 行：conns、total、up_bytes、down_bytes，
 # B2 起含 up_splice/down_splice/splice_fallback），UDP 负载记 tm_udp（udp 行，--udp-gro 时含 up_gro/down_gro），两者都另记 tm_pool
-# （pool 行，bufs_*、tcp_pairs_*、udp_pairs_*，B2 起含 pipes_*）；tcp_bulk_* 另记测量窗口中点的 tm_tcp_mid/tm_pool_mid，
+# （pool 行，bufs_*、tcp_pairs_*、udp_pairs_*，B2 起含 pipes_*），多 worker（P4）时规则行与 pool 行是各 worker 之和，另记每 worker 的
+# tm_w0、tm_w1…（`stats worker W:` 行：tcp_conns、tcp_total、udp_sessions、udp_total）；tcp_bulk_* 另记测量窗口中点的 tm_tcp_mid/tm_pool_mid，
 # _stall 时还有 sink 停顿中途的 tm_tcp_stall/tm_pool_stall（这时所有方向都积压在转发器里），
 # fwd_win_s 是 CPU 统计窗口的秒数（fwd_cpu_pct × fwd_win_s ÷ 转发的数据报数 = 每个数据报的 CPU 时间，不受接收端丢包影响）
 # 主机模式：bench/host.sh 在开发机上调用，三个角色经 RSH 在各自主机执行（见 lib.sh）
@@ -31,7 +32,7 @@ run_test() {
     udp_bw_*|udp_pps_*)
       j=$(on cli "$CLI $IPERF3 -c $TARGET_IP -p $TARGET_PORT $(iperf_udp "$t") -t $DUR -O 1 -J")
       echo "$j" | jq -c '{gbps: (.end.sum_received.bits_per_second/1e9), kpps: ((.end.sum_received.packets - .end.sum_received.lost_packets)/.end.sum_received.seconds/1e3), sent_kpps: (.end.sum_sent.packets/.end.sum_sent.seconds/1e3), lost_pct: .end.sum_received.lost_percent, err: .error}' ;;
-    tcp_rr_64|tcp_rr_1000)
+    tcp_rr_*)
       on cli "$CLI $FWDBENCH rr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;
     tcp_crr_*)
       on cli "$CLI $FWDBENCH crr -c $(hp "$TARGET_IP" "$TARGET_PORT") -n ${t##*_} -s 64 -d ${DUR}s -w 1s" ;;
@@ -75,7 +76,7 @@ bulk_test() {
 }
 
 one() {
-  local rep=$1 t=$2 fwd=$3 res a b c0 u0 r0 c1 u1 r1 thr hpid cpu win sa sb cpus ex='{}'
+  local rep=$1 t=$2 fwd=$3 res a b c0 u0 r0 c1 u1 r1 thr hpid cpu win sa sb cpus st ex='{}'
   if ! start_fwd "$fwd" "$(backend_for "$t")"; then
     jq -nc --arg fwd "$fwd" --arg t "$t" --argjson rep "$rep" '{rep: $rep, test: $t, fwd: $fwd, err: "start failed"}' | tee -a "$OUT"
     stop_fwd; return
@@ -101,8 +102,8 @@ one() {
     read -r c0 u0 _ _ <<< "$a"; read -r c1 u1 r1 thr <<< "$b"
     cpus=$(cpu_json "$sa" "$sb")
     case $t in
-      tcp_*) ex=$(echo "$ex" | jq -c --argjson f "$(tm_json "$(tm_stats)" "" tcp pool)" '. + $f') ;;
-      udp_*) ex=$(tm_json "$(tm_stats)" "" udp pool) ;;
+      tcp_*) st=$(tm_stats); ex=$(echo "$ex" | jq -c --argjson f "$(tm_json "$st" "" tcp pool $(tm_workers "$st"))" '. + $f') ;;
+      udp_*) st=$(tm_stats); ex=$(tm_json "$st" "" udp pool $(tm_workers "$st")) ;;
     esac
   fi
   cpu=$(awk -v a="${c0:-0}" -v b="${c1:-0}" -v s="${u0:-0}" -v e="${u1:-0}" 'BEGIN{printf "%.1f", (e > s ? (b-a)/(e-s) : 0)}')

@@ -6,8 +6,10 @@ import (
 	"net"
 	"os"
 	"slices"
+	"strconv"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -145,10 +147,16 @@ func TestDomainRefresh(t *testing.T) {
 	if got := udpReplyFrom(t, udp, "after"); got != "3" {
 		t.Fatalf("地址变化后旧 UDP 客户端仍发往后端 %q", got)
 	}
-	// T10：clear_remote_index 释放旧会话时要关掉它的 socket，此时 tinymapper 只持有 UDP 监听 socket 和新会话的 socket
-	if got := udpSockets(m.pid()); got != 2 {
-		t.Errorf("地址变化后 tinymapper 持有 %d 个 UDP socket，期望 2（监听 socket 与新会话）：被释放的旧会话没有关闭 socket", got)
-	}
+	// T10：clear_remote_index 释放旧会话时要关掉它的 socket，此时 tinymapper 只持有 UDP 监听 socket（M2：每个 worker 一个）和新会话的 socket。
+	// 并行用例（TestWorkerUDPMaxConn）同时建拆上万个 UDP socket 时一次遍历可能漏掉一个（实测少数一个），所以重试：漏掉的只会让数变少，
+	// 没关的旧会话 socket 一直多一个
+	want := m.threads() + 1
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if got := udpSockets(m.pid()); got != want {
+			return fmt.Errorf("地址变化后 tinymapper 持有 %d 个 UDP socket，期望 %d（%d 个监听 socket 与新会话）：被释放的旧会话没有关闭 socket", got, want, m.threads())
+		}
+		return nil
+	})
 	// 被释放的连接对与会话的 fd 号随后被新 socket 复用：再建两条 TCP 连接各往返一次，旧会话的 watcher 若没有 stop，
 	// 新 socket 上的事件也会回调到已释放的会话（ASan 报 heap-use-after-free，release 构建里数据被它取走）
 	for i := 0; i < 2; i++ {
@@ -167,20 +175,17 @@ func TestDomainRefresh(t *testing.T) {
 	}
 }
 
-// udpSockets 返回进程 pid 持有的 UDP socket 个数（/proc/net/udp、udp6 中 inode 属于该进程的行）
+// udpSockets 返回进程 pid 持有的 UDP socket 个数（sock_diag 列出的 IPv4、IPv6 UDP socket 中 inode 属于该进程的；原来读 /proc/net/udp，
+// 与上万个 UDP socket 的用例并行时又慢又会漏行）
 func udpSockets(pid int) int {
 	inodes := socketInodes(pid)
 	n := 0
-	for _, name := range []string{"udp", "udp6"} {
-		data, err := os.ReadFile("/proc/net/" + name)
-		if err != nil {
-			continue
-		}
-		for _, line := range strings.Split(string(data), "\n")[1:] {
-			if f := strings.Fields(line); len(f) >= 10 && inodes[f[9]] {
+	for _, family := range []int{syscall.AF_INET, syscall.AF_INET6} {
+		sockDiagDump(family, syscall.IPPROTO_UDP, ^uint32(0), func(_, _ uint16, inode uint32) {
+			if inodes[strconv.FormatUint(uint64(inode), 10)] {
 				n++
 			}
-		}
+		})
 	}
 	return n
 }
@@ -263,6 +268,7 @@ func balanceArgs(listen string, remotes []string, balance string, proto string) 
 // 平滑加权轮询的选择序列与 nginx 算法完全一致（因此比例精确）
 func TestBalanceRoundRobin(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 	for _, weights := range [][]int{{2, 1, 1}, {3, 1, 2}, {1, 1}} {
 		t.Run(fmt.Sprint(weights), func(t *testing.T) {
 			t.Parallel()
@@ -286,6 +292,7 @@ func TestBalanceRoundRobin(t *testing.T) {
 // TCP 与 UDP 共享同一规则的轮询状态：交替建立 TCP 连接和 UDP 会话时按同一序列推进
 func TestBalanceRoundRobinSharedTCPUDP(t *testing.T) {
 	t.Parallel()
+	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 	weights := []int{2, 1, 1}
 	listen := loopback4(t)
 	remotes := balancedBackends(t, len(weights))

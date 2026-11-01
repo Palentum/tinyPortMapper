@@ -189,7 +189,7 @@ func startMapperTTY(t testing.TB, wait []listenPoint, args ...string) *mapper {
 		f.Close()
 	})
 	t.Cleanup(func() { pts.Close() })
-	cmd := exec.Command(mapperBin, append([]string{"--disable-color"}, args...)...)
+	cmd := exec.Command(mapperBin, mapperArgv(args...)...)
 	cmd.Stdout, cmd.Stderr = pts, pts
 	return runMapper(t, cmd, logPath, wait)
 }

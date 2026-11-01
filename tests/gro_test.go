@@ -745,6 +745,7 @@ func TestUDPGROFallbackPerClient(t *testing.T) {
 	} {
 		t.Run(c.name, func(t *testing.T) {
 			t.Parallel()
+			singleWorkerOnly(t, "用例依赖同一轮事件循环里各会话回调的先后（trace 行），各客户端的会话在不同 worker 时没有这个次序")
 			d := newTun(t, c.mtu)
 			be := newGRORecorder(t, loopback4(t), false)
 			lport, lport2 := freePort(t), freePort(t)
@@ -898,12 +899,9 @@ func TestUDPGROEAGAIN(t *testing.T) {
 		wait := listenPoints("u", portOf(listen))
 		args := []string{"-l", listen, "-r", be.addr, "-u", "--udp-gro"}
 		probe := startMapper(t, wait, args...)
-		fd := listenFD(probe.pid(), "udp", portOf(listen))
+		lo, hi := listenFDRange(t, probe.pid(), "udp", portOf(listen)) // M2：每个 worker 一个监听 socket
 		probe.stop(t, false)
-		if fd < 0 {
-			t.Fatal("探测时没有找到 UDP 监听 socket")
-		}
-		m := startMapperSendtoFail(t, fd, fd+1, wait, args...)
+		m := startMapperSendtoFail(t, lo, hi, wait, args...)
 		var sessions []string
 		for i := range 2 {
 			c := udpDial(t, "", listen)
@@ -920,19 +918,27 @@ func TestUDPGROEAGAIN(t *testing.T) {
 		m.resume(t)
 		total, _, merged := gsoTotals(pkts...)
 		var s udpStat
+		var d statsDump
 		eventually(t, ioTimeout, 50*time.Millisecond, func() error {
-			if s = m.statsAfterSignal(t).udp[1]; s.downDrop < total {
-				return fmt.Errorf("down_drop=%d，期望 %d", s.downDrop, total)
+			if d = m.statsAfterSignal(t); d.udp[1].downDrop < total {
+				return fmt.Errorf("down_drop=%d，期望 %d", d.udp[1].downDrop, total)
 			}
 			return nil
 		})
+		s = d.udp[1]
+		// M2：回程批每个 worker 一份，两个会话在几个 worker 上就有几组、几行
+		groups := 1
+		if len(d.workers) > 0 {
+			groups = busyWorkers(d, "udp")
+		}
 		if s.downDrop != total || s.downPkts != 0 || s.downBytes != 0 || s.downGRO != merged || s.downGSOFallback != 0 {
 			t.Errorf("统计 down_drop=%d down_pkts=%d down_bytes=%d down_gro=%d down_gso_fallback=%d，期望 %d/0/0/%d/0",
 				s.downDrop, s.downPkts, s.downBytes, s.downGRO, s.downGSOFallback, total, merged)
 		}
 		eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
-			if drops, lines, _ := loggedDownDrops(m); uint64(drops) != total || lines != 1 {
-				return fmt.Errorf("日志里 %d 行回程发送失败的 warn 共报告丢 %d 个包，期望 1 行（这条规则的一组）、%d 个（按数据报计）", lines, drops, total)
+			if drops, lines, _ := loggedDownDrops(m); uint64(drops) != total || lines != groups {
+				return fmt.Errorf("日志里 %d 行回程发送失败的 warn 共报告丢 %d 个包，期望 %d 行（这条规则在每个有会话的 worker 上一组）、%d 个（按数据报计）",
+					lines, drops, groups, total)
 			}
 			return nil
 		})
@@ -973,12 +979,9 @@ func TestUDPGROSendError(t *testing.T) {
 				m.resume(t)
 			} else {
 				probe := startMapper(t, wait, args...)
-				fd := listenFD(probe.pid(), "udp", portOf(listen))
+				lo, hi := listenFDRange(t, probe.pid(), "udp", portOf(listen)) // M2：每个 worker 一个监听 socket
 				probe.stop(t, false)
-				if fd < 0 {
-					t.Fatal("探测时没有找到 UDP 监听 socket")
-				}
-				m = startMapperSendFail(t, fd, fd+1, c.errno, wait, args...)
+				m = startMapperSendFail(t, lo, hi, c.errno, wait, args...)
 				var replies []gsoReply
 				for i, cn := range conns {
 					session := helloGRO(t, be, fmt.Appendf(nil, "hello-%d", i), func(b []byte) error { _, err := cn.Write(b); return err })
@@ -1321,7 +1324,7 @@ func startMapperGROFail(t testing.TB, lo, hi int, wait []listenPoint, args ...st
 		t.Fatal(err)
 	}
 	defer f.Close()
-	cmd := exec.Command(self, append([]string{mapperBin, "--disable-color"}, args...)...)
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
 	cmd.Env = append(os.Environ(), fmt.Sprintf("%s=%d %d", groFailEnv, lo, hi))
 	cmd.Stdout, cmd.Stderr = f, f
 	return runMapper(t, cmd, logPath, wait)
@@ -1357,12 +1360,8 @@ func TestUDPGROSetsockoptFail(t *testing.T) {
 			switch c {
 			case "second-listen":
 				probe := startMapper(t, wait, args...)
-				lo = listenFD(probe.pid(), "udp", portOf(listens[1]))
+				lo, hi = listenFDRange(t, probe.pid(), "udp", portOf(listens[1])) // M2：规则 2 在每个 worker 上的监听 socket 都开不了
 				probe.stop(t, false)
-				if lo < 0 {
-					t.Fatal("探测时没有找到规则 2 的 UDP 监听 socket")
-				}
-				hi = lo + 1
 			case "session":
 				lo = startupFDs(t, wait, args...)
 			}

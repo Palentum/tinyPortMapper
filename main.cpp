@@ -9,10 +9,17 @@
 #include <sys/mman.h>
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
+#include <sys/prctl.h>
+#include <pthread.h>
+#include <semaphore.h>
+#include <signal.h>
+#include <sched.h>
 #include <thread>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
+#include <atomic>
+#include <algorithm>
 
 using  namespace std;
 
@@ -24,7 +31,8 @@ typedef int i32_t;
 
 int disable_conn_clear=0;
 int disable_tcp_nodelay=0;
-int disable_splice=0;//--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe
+//--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe。splice 本身不可用时由碰到的 worker 运行期置 1（审查 L1），各 worker 都读：relaxed 原子（M2）
+std::atomic<int> disable_splice(0);
 int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
 //--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
 //（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时各 worker 的 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
@@ -40,6 +48,12 @@ static const int max_accept_per_round=8;
 //内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
 static const int listen_backlog=65535;
 static const my_time_t lru_move_interval=1000;
+//worker 线程数（M2，S1，--threads N|auto）：每个 worker 一个线程、一个 loop，每条规则在每个 worker 各有一个监听（N>1 时组成 SO_REUSEPORT 组，D67）。
+//默认 1（D5：P4 门槛通过前）；为 1 时也是主线程 + 1 个 worker 线程（D62）
+static int worker_count=1;
+static const int worker_count_max=64;
+static const int worker_count_auto_max=8;//auto：可用 CPU 数，最多这么多（D5）
+static const size_t worker_stack_size=256*1024;//musl 1.1.16（OpenWRT SDK）默认线程栈 80 KiB；回调里最大的栈上数组是 log0 的 1 KiB 行缓冲
 //上游第一次 send 不超过这么多字节时才不设 TCP_NODELAY（T15）。536 是 TCP_MSS_DEFAULT：对端初始窗口比它大时，这么多数据整段落在窗口内；
 //比它小时内核把 MSS 截到窗口（tcp_bound_to_half_wnd），也不会在窗口边沿切出小段。更大的第一次写入可能被没对齐 MSS 的窗口边沿
 //切出一个小段（如后端接收缓冲 8 KiB 时初始窗口 7240、路径 MSS 1388），尾段就要等这个小段的 ACK
@@ -266,7 +280,7 @@ static int splice_turn_max=256*1024;
 static const int splice_more_min=65536;//64K pipe（扩容失败）满一次、网卡来源 64 槽满一次都够这个数
 static int tcp_pipe_min_size=65536;//新 pipe 不到 16 槽（fs.pipe-user-pages-soft 已满时只有 2 页）就不用：每次 splice 只能搬 2 个片段。按槽数判断（D58），启动时按页大小设
 static const int tcp_pipe_pool_max_free=64;//同 D19；pipe 比 16 页大时按页数折算，见 tcp_pipe_pool_t::max_free
-static int tcp_pipe_max_free=tcp_pipe_pool_max_free;//tcp_pipe_pool_t::max_free 的值：启动时 tcp_pipe_probe() 按 pipe 大小算出，之后只读，worker 的 pipe 池构造时取它（M1）
+static int tcp_pipe_max_free=tcp_pipe_pool_max_free;//tcp_pipe_pool_t::max_free 的值：启动时 tcp_pipe_probe() 按 pipe 大小与 worker 数算出，之后只读，worker 的 pipe 池构造时取它（M1、D64）
 
 //pipe 里还有多少字节，只给 DEBUG_ASSERT 用：还池与复用的 pipe 必须是空的，计账错了就会把一个连接的数据写给另一个连接
 static inline int tcp_pipe_len(const tcp_pipe_t &p)
@@ -276,6 +290,8 @@ static inline int tcp_pipe_len(const tcp_pipe_t &p)
 	return n;
 }
 
+//pipe 创建失败、扩容失败各只有整个进程的第一次记 info，之后 debug（B3 审查 L1）；各 worker 共用（M2），由把它从 0 换成 1 的线程记 info
+static std::atomic<int> pipe_fail_logged(0),pipe_grow_logged(0);
 //pipe 池（B2，D47）：splice 都读进 tcp_pipe_scratch，整段写出就留着给下一次；没写完时连同数据交给该方向（tcp_info_t::pipe），
 //排空后还回来。空闲的最多留 max_free 个，多出的 close；有残留数据的 pipe 不复用，释放连接对时直接 close
 struct tcp_pipe_pool_t
@@ -284,13 +300,11 @@ struct tcp_pipe_pool_t
 	int free_cnt;
 	int alloc;//已创建还没关闭的 pipe 数（O1）：每个要么是 scratch，要么属于某个方向，要么在空闲表里
 	int blocked;//创建失败过：到下一个定时器周期（clear_timer_cb 清零）之前不再创建，免得每次读都试
-	int failures;//创建失败次数，只有第一次记 info
 	int grow_blocked;//扩容失败过（D58）：到下一个定时器周期之前新建的 pipe 不再试扩
-	int grow_failures;//扩容失败次数，只有第一次记 info
 	u64_t resize_fail;//没能扩到 tcp_pipe_size 的新 pipe 个数（含 grow_blocked 期间没试的），stats pool 行输出
-	//空闲的最多留几个：合计不超过 64 个 16 页 pipe 的 1024 页（B3 审查 M1）。fs.pipe-user-pages-soft 按 uid、按容量计页，
-	//池里的空 pipe 也算，留多了同 uid 的其他进程（以 root 运行时含没有 CAP_SYS_RESOURCE 的容器 root）只能拿到 2 页的 pipe。
-	//256 KiB 时 16 个，1 MiB 时 4 个；构造时取 tcp_pipe_probe() 算出的 tcp_pipe_max_free
+	//空闲的最多留几个：整个进程合计不超过 64 个 16 页 pipe 的 1024 页（B3 审查 M1），按 worker 数均分、每个 worker 至少 1 个（D64）。
+	//fs.pipe-user-pages-soft 按 uid、按容量计页，池里的空 pipe 也算，留多了同 uid 的其他进程（以 root 运行时含没有 CAP_SYS_RESOURCE
+	//的容器 root）只能拿到 2 页的 pipe。1 个 worker 时 256 KiB 16 个、1 MiB 4 个；构造时取 tcp_pipe_probe() 算出的 tcp_pipe_max_free
 	int max_free;
 	//新 pipe 因配额只有 2 页（不到 16 槽）之后，到下一个定时器周期之前不再建 pipe：这期间还回来的 pipe 马上会被别的方向借走，
 	//留到 64 个，否则超过 max_free 的被关掉、那些方向只能走拷贝（复审 R1：非 root 2000 条停读、--pipe-size 1024 时 63.4 → 73.2 Gbit/s）。
@@ -301,9 +315,7 @@ struct tcp_pipe_pool_t
 		free_cnt=0;
 		alloc=0;
 		blocked=0;
-		failures=0;
 		grow_blocked=0;
-		grow_failures=0;
 		resize_fail=0;
 		max_free=tcp_pipe_max_free;
 		quota_hit=0;
@@ -311,7 +323,7 @@ struct tcp_pipe_pool_t
 	int fail_level()//创建失败：到下一个定时器周期之前不再创建；只有第一次记 info
 	{
 		blocked=1;
-		return failures++==0?log_info:log_debug;
+		return pipe_fail_logged.exchange(1,memory_order_relaxed)?log_debug:log_info;
 	}
 	int get(tcp_pipe_t &p)
 	{
@@ -362,7 +374,7 @@ struct tcp_pipe_pool_t
 				if(!grow_blocked)
 				{
 					grow_blocked=1;
-					int level=grow_failures++==0?log_info:log_debug;//mylog 会把级别参数求值两次
+					int level=pipe_grow_logged.exchange(1,memory_order_relaxed)?log_debug:log_info;//mylog 会把级别参数求值两次
 					mylog(level,"[tcp]enlarging a new pipe to %d bytes failed (%s), new pipes keep %d bytes until the next timer tick (fs.pipe-user-pages-soft reached?)\n",tcp_pipe_size,get_sock_error(),size);
 				}
 			}
@@ -433,7 +445,7 @@ static void tcp_pipe_probe()
 		close(fds[1]);
 	}
 	splice_turn_max=tcp_pipe_size<=256*1024?256*1024:tcp_pipe_size/(256*1024)*tcp_pipe_size;
-	tcp_pipe_max_free=tcp_pipe_pool_max_free*16/max(16,tcp_pipe_size/page);
+	tcp_pipe_max_free=max(1,tcp_pipe_pool_max_free*16/max(16,tcp_pipe_size/page)/worker_count);//D64：合计页数按 worker 均分
 }
 //splice 写不完时对目的端调用（D54）：主机越过 tcp_mem 压力线时内核把目的 socket 的 sndbuf 缩到当时队列的一半（sk_stream_moderate_sndbuf），
 //压力期间不再放大。回环这类 MSS 接近 64 KiB 的目的端缩完装不下 2 段，只有 1 段在途，接收方对单个满长段延迟 ACK（约 40 ms），
@@ -745,6 +757,7 @@ struct worker_t;
 struct conn_manager_udp_t
 {
 	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把会话还回它的池
+	std::atomic<int> *conns;//本规则在所有 worker 合计的会话数（M4，S7）：max_conn_num 按它判断，建会话时加、erase 时减
 	udp_table_t sessions;
 	udp_pair_t *last_hit;//上一次查到的会话：同一客户端连续来包时不算哈希、不查表；释放这个会话时清零
 
@@ -756,11 +769,12 @@ struct conn_manager_udp_t
 	u64_t pkts[2],bytes[2],drop[2];
 	//U5（D42、D45）：gro 以 GRO 合并包形式收到的数据报数，gso_fallback 某个会话在这个方向的 GSO 发送失败（EIO/EINVAL/EMSGSIZE）、改为逐包发送的次数
 	u64_t gro[2],gso_fallback[2];
-	unsigned char gso_logged[2];//U5：这个方向的 GSO 回退已写过一行 info，之后的写 debug（审查 L3）
+	std::atomic<int> *gso_logged;//U5：本规则这个方向的 GSO 回退已写过一行 info，之后的写 debug（审查 L3）；所有 worker 共用（rule_shared_t，M2），下标同 gro
 
 	conn_manager_udp_t()
 	{
 		worker=0;
+		conns=0;
 		last_hit=0;
 		last_clear_time=0;
 		//clear_it=udp_pair_list.begin();
@@ -770,7 +784,7 @@ struct conn_manager_udp_t
 		memset(drop,0,sizeof(drop));
 		memset(gro,0,sizeof(gro));
 		memset(gso_fallback,0,sizeof(gso_fallback));
-		memset(gso_logged,0,sizeof(gso_logged));
+		gso_logged=0;
 	}
 	//没找到时返回 0，hash 为 addr 的哈希，供随后的 insert 用；命中 last_hit 时不算哈希
 	udp_pair_t *find(const address_t &addr,u32_t &hash)
@@ -841,6 +855,7 @@ struct conn_manager_udp_t
 struct conn_manager_tcp_t
 {
 	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把缓冲、pipe 与连接对还回它的池
+	std::atomic<int> *conns;//本规则在所有 worker 合计的连接对数（M4，S7）：max_conn_num 按它判断，建连时加、erase/erase_closed 时减
 	long long last_clear_time;
 	lru_collector_t lru;
 	//O1 累计计数，SIGUSR1 时输出：total 建立的连接对数；bytes 发送成功的字节数，[0] 客户端→上游（从 local 读、发往 remote），[1] 上游→客户端；
@@ -852,6 +867,7 @@ struct conn_manager_tcp_t
 	conn_manager_tcp_t()
 	{
 		worker=0;
+		conns=0;
 		last_clear_time=0;
 		total=0;
 		memset(bytes,0,sizeof(bytes));
@@ -917,6 +933,7 @@ struct conn_manager_tcp_t
 	}
 };
 
+//worker 的规则副本里的一个 remote（DNS 的刷新时间与查询状态在主线程的 dns_targets 里，M3）
 struct remote_target_t
 {
 	address_t addr;
@@ -924,16 +941,12 @@ struct remote_target_t
 	char remote_str[max_remote_len];
 	char host[max_domain_len];
 	u32_t port;
-	my_time_t last_dns_refresh_time;
-	int dns_query_pending;
 	remote_target_t()
 	{
 		is_domain=0;
 		remote_str[0]=0;
 		host[0]=0;
 		port=0;
-		last_dns_refresh_time=0;
-		dns_query_pending=0;
 	}
 };
 
@@ -979,12 +992,49 @@ struct forward_rule_t:not_copy_able_t
 	}
 };
 
-//每个 worker 的全部可变状态（M1，D59、D60）：自己的 loop 与时间缓存、规则运行时（监听 fd 与 watcher、管理器与计数、rr_nodes、
-//remote 地址副本，DNS 状态在 M3 之前也留在这里）、连接对象池、缓冲池与 scratch、pipe 池与 scratch pipe、UDP 批缓冲。
+//每条规则在所有 worker 之间共用的状态，主线程按规则分配，各 worker 的管理器存指针，relaxed：tcp/udp 是合计的连接数（M4，S7），
+//只在建连/建会话与释放时访问；gso_logged 是每个方向的 GSO 回退是否已记过 info（U5 审查 L3，按规则而不是按 worker）
+struct rule_shared_t
+{
+	std::atomic<int> tcp,udp;
+	std::atomic<int> gso_logged[2];
+	rule_shared_t():tcp(0),udp(0)
+	{
+		gso_logged[0].store(0);
+		gso_logged[1].store(0);
+	}
+};
+static rule_shared_t *rule_shared;//下标为规则序号 - 1，进程生命周期内不释放
+
+//主线程发给 worker 的控制消息（M3，S4）：经 worker_post() 进 worker 的队列，worker 在自己 loop 上的 ctrl_watcher 回调里处理
+enum worker_msg_type_t
+{
+	worker_msg_dns=1,//rule_index 的 remote remote_index 的地址换成 addr（S5）
+	worker_msg_stats,//取统计快照回传主线程（D63）
+	worker_msg_exit//退出 loop（M6）
+};
+struct worker_msg_t
+{
+	int type;
+	int rule_index;
+	int remote_index;
+	address_t addr;
+	worker_msg_t(int t)
+	{
+		type=t;
+		rule_index=0;
+		remote_index=0;
+	}
+};
+
+//每个 worker 的全部可变状态（M1，D59、D60；M2 起每个 worker 一个线程，D62）：自己的 loop 与时间缓存、规则运行时（监听 fd 与 watcher、
+//管理器与计数、rr_nodes、remote 地址副本）、连接对象池、缓冲池与 scratch、pipe 池与 scratch pipe、UDP 批缓冲、定时器与控制消息队列。
 //热路径经 forward_rule_t::worker（连接对与会话经 owner）取到它，不用 thread_local（mips24kc 上 TLS 指针是 rdhwr，可能由内核模拟，
-//T11 审查 F10），也不用 ev_userdata（ev.c 里的非内联函数）。threads=1 时只有一个 worker，用 ev_default_loop、在主线程运行（D59）
+//T11 审查 F10），也不用 ev_userdata（ev.c 里的非内联函数）。除 ctrl_mutex 保护的 ctrl_queue 外只有本 worker 的线程访问；
+//主线程只在启动 worker 线程之前建它、之后只经 worker_post() 发消息
 struct worker_t:not_copy_able_t
 {
+	int id;//从 0 起，统计行与线程名用
 	struct ev_loop *loop;
 	loop_clock_t clock;
 	char *tcp_scratch;//recv 都读进这一块，读到的数据整块发完就留着给下一次 recv；没发完时整块交给该方向，下一次 recv 前再从池里取一块
@@ -995,15 +1045,27 @@ struct worker_t:not_copy_able_t
 	obj_pool_t<udp_pair_t> udp_pair_pool;
 	list<forward_rule_t> rules;//各规则在本 worker 的运行时，按规则序号排列
 	ev_prepare udp_flush_watcher;//每轮阻塞之前发出回程批（U4），有规则开 UDP 时才 start
+	ev_timer tick_timer;//每 timer_interval 跑一次 worker_tick()（L7）
+	ev_async ctrl_watcher;//主线程发来消息时唤醒（S4）
+	//直接用 pthread 的锁（审查 I-5）：libstdc++ 的 std::mutex 在 _GLIBCXX_GTHREAD_USE_WEAK 为 1 的工具链上靠弱符号判断是否多线程，
+	//静态链接的 musl 里判断为否时加解锁全是空操作（OpenWRT SDK 的 GCC 5.4 没法在这里核对）
+	pthread_mutex_t ctrl_mutex;
+	std::deque<worker_msg_t> ctrl_queue;
+	pthread_t thread;
 	udp_batch_t udp_batch;
-	worker_t(struct ev_loop *l)
+	worker_t(int i,struct ev_loop *l)
 	{
+		id=i;
 		loop=l;
 		clock.loop=l;
 		tcp_scratch=0;
 		tcp_pipe_scratch.r=tcp_pipe_scratch.w=-1;
-		//清零等同 ev_init（同 T11 的 watcher），不用 ev_prepare_init 宏：不新增 strict-aliasing 告警；回调由 event_loop() 设
+		//清零等同 ev_init（同 T11 的 watcher），不用 ev_*_init 宏：不新增 strict-aliasing 告警；回调与参数由 event_loop() 设
 		memset(&udp_flush_watcher,0,sizeof(udp_flush_watcher));
+		memset(&tick_timer,0,sizeof(tick_timer));
+		memset(&ctrl_watcher,0,sizeof(ctrl_watcher));
+		memset(&thread,0,sizeof(thread));
+		pthread_mutex_init(&ctrl_mutex,0);
 	}
 };
 //worker_t 很大（udp_batch 约 4.2 MiB）：在 mmap 的匿名页上就地构造，进程生命周期内不释放（myexit 直接 _exit）。页面清零、按需分配：
@@ -1012,7 +1074,7 @@ struct worker_t:not_copy_able_t
 //不用透明大页（M1 审查 L1）：THP=always 时，第一次写入整段落在映射内、按 2 MiB 对齐的区间就分配一个 2 MiB 大页，khugepaged
 //也会把只有一页常驻的这种区间合并成大页（原来的 BSS 同样如此）；有的内核把这么大的匿名映射按 2 MiB 对齐，构造函数的写入就在启动时
 //整页分配。溢出区于是不再按需常驻。没有 THP 的内核返回 EINVAL，不用管
-static worker_t *worker_new(struct ev_loop *loop)
+static worker_t *worker_new(int id,struct ev_loop *loop)
 {
 	void *p=mmap(0,sizeof(worker_t),PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS,-1,0);
 	if(p==MAP_FAILED)
@@ -1021,10 +1083,18 @@ static worker_t *worker_new(struct ev_loop *loop)
 		myexit(1);
 	}
 	madvise(p,sizeof(worker_t),MADV_NOHUGEPAGE);
-	return new(p) worker_t(loop);
+	return new(p) worker_t(id,loop);
 }
-//主线程的 worker 表（M1：threads=1 时只有一个）：定时器、SIGUSR1、DNS 结果经它找到各 worker 的规则。worker 的热路径不碰它
+//主线程的 worker 表：启动时建好，之后只用来给各 worker 发消息（S4）。worker 的热路径不碰它
 static vector<worker_t *> workers;
+//主线程给 worker 发一条控制消息：进队列后经 ev_async 唤醒它的 loop（libev 保证 ev_async_send 可从别的线程调用）
+static void worker_post(worker_t &w,const worker_msg_t &m)
+{
+	pthread_mutex_lock(&w.ctrl_mutex);
+	w.ctrl_queue.push_back(m);
+	pthread_mutex_unlock(&w.ctrl_mutex);
+	ev_async_send(w.loop,&w.ctrl_watcher);
+}
 
 int conn_manager_tcp_t::erase(tcp_pair_t *pair)
 {
@@ -1045,6 +1115,7 @@ int conn_manager_tcp_t::erase(tcp_pair_t *pair)
 	if(pair->local.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
 	if(pair->remote.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->remote.pipe);
 	worker->tcp_pair_pool.put(pair);
+	conns->fetch_sub(1,memory_order_relaxed);
 	return 0;
 }
 int conn_manager_tcp_t::erase_closed(tcp_pair_t *pair)//just a copy of erase()
@@ -1063,6 +1134,7 @@ int conn_manager_tcp_t::erase_closed(tcp_pair_t *pair)//just a copy of erase()
 	if(pair->local.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
 	if(pair->remote.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->remote.pipe);
 	worker->tcp_pair_pool.put(pair);
+	conns->fetch_sub(1,memory_order_relaxed);
 	return 0;
 }
 int conn_manager_udp_t::erase(udp_pair_t *pair)
@@ -1081,6 +1153,7 @@ int conn_manager_udp_t::erase(udp_pair_t *pair)
 	close(pair->fd);
 	lru.erase(pair);
 	worker->udp_pair_pool.put(pair);
+	conns->fetch_sub(1,memory_order_relaxed);
 
 	return 0;
 }
@@ -1125,6 +1198,20 @@ static std::deque<dns_refresh_request_t> dns_requests;
 static std::deque<dns_refresh_result_t> dns_results;
 static struct ev_loop *dns_loop=0;
 static int dns_worker_started=0;
+
+//主线程的 DNS 主表（M3，S5）：每个域名 remote 一项。调度与查询结果都只在主线程处理，地址变化经 worker_post() 下发给各 worker 的规则副本
+struct dns_target_t
+{
+	int rule_index;
+	int remote_index;
+	char host[max_domain_len];
+	u32_t port;
+	address_t addr;
+	my_time_t last_dns_refresh_time;
+	int dns_query_pending;
+};
+static vector<dns_target_t> dns_targets;
+static loop_clock_t main_clock;//主线程（默认 loop）自己的时间缓存：不能跨线程读 worker 的 loop（§6.5"时间"）
 
 static void dns_worker_main()
 {
@@ -1181,59 +1268,72 @@ static void dns_worker_main()
 	}
 }
 
-//把一条 DNS 结果写进一个 worker 的规则副本（D60：M3 之前 DNS 状态留在各 worker 的规则里，M3 改为主线程主表加消息下发）
-static void dns_apply_result(worker_t &w,dns_refresh_result_t &result)
+//一条 DNS 结果（主线程）：更新主表，地址变了就让每个 worker 换自己规则副本里的地址（worker_dns_update）
+static void dns_apply_result(dns_refresh_result_t &result)
 {
-	forward_rule_t *rule_p=0;
-	for(auto rule_it=w.rules.begin();rule_it!=w.rules.end();++rule_it)
+	dns_target_t *t=0;
+	for(size_t i=0;i<dns_targets.size();i++)
 	{
-		if(rule_it->index==result.rule_index)
+		if(dns_targets[i].rule_index==result.rule_index&&dns_targets[i].remote_index==result.remote_index)
 		{
-			rule_p=&*rule_it;
+			t=&dns_targets[i];
 			break;
 		}
 	}
-	if(rule_p==0)
+	if(t==0)
 	{
 		return;
 	}
-	forward_rule_t &rule=*rule_p;
-	if(result.remote_index<0||result.remote_index>=(int)rule.remote_targets.size())
+	if(strcmp(t->host,result.host)!=0||t->port!=result.port)
 	{
 		return;
 	}
-	remote_target_t &target=rule.remote_targets[result.remote_index];
-	if(target.is_domain==0)
-	{
-		return;
-	}
-	if(strcmp(target.host,result.host)!=0||target.port!=result.port)
-	{
-		return;
-	}
-	target.dns_query_pending=0;
+	t->dns_query_pending=0;
 
 	if(result.ok==0)
 	{
-		mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",rule.index,result.remote_index,target.host,target.port,result.err);
+		mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",t->rule_index,t->remote_index,t->host,t->port,result.err);
 		return;
 	}
 	if(result.current_still_valid)
 	{
 		return;
 	}
-	if(result.next_addr==target.addr)
+	if(result.next_addr==t->addr)
 	{
 		return;
 	}
-	char old_addr[max_addr_len];
-	char new_addr[max_addr_len];
-	target.addr.to_str(old_addr);
-	result.next_addr.to_str(new_addr);
-	target.addr=result.next_addr;
-	int tcp_closed=rule.tcp_manager.clear_remote_index(result.remote_index);
-	int udp_closed=rule.udp_manager.clear_remote_index(result.remote_index);
-	mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,result.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
+	t->addr=result.next_addr;
+	worker_msg_t m(worker_msg_dns);
+	m.rule_index=t->rule_index;
+	m.remote_index=t->remote_index;
+	m.addr=result.next_addr;
+	for(size_t i=0;i<workers.size();i++)
+		worker_post(*workers[i],m);
+}
+
+//worker 收到 DNS 更新（S5）：换自己规则副本里的地址，只清本 worker 里连到这个 remote 的连接与会话，记一行（N 个 worker 各一行）
+static void worker_dns_update(worker_t &w,const worker_msg_t &m)
+{
+	for(auto rule_it=w.rules.begin();rule_it!=w.rules.end();++rule_it)
+	{
+		if(rule_it->index!=m.rule_index)
+		{
+			continue;
+		}
+		forward_rule_t &rule=*rule_it;
+		remote_target_t &target=rule.remote_targets[m.remote_index];
+		address_t next_addr=m.addr;
+		char old_addr[max_addr_len];
+		char new_addr[max_addr_len];
+		target.addr.to_str(old_addr);
+		next_addr.to_str(new_addr);
+		target.addr=next_addr;
+		int tcp_closed=rule.tcp_manager.clear_remote_index(m.remote_index);
+		int udp_closed=rule.udp_manager.clear_remote_index(m.remote_index);
+		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,m.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
+		return;
+	}
 }
 
 static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int revents)
@@ -1246,8 +1346,7 @@ static void dns_result_cb(struct ev_loop *loop, struct ev_async *watcher, int re
 
 	for(auto it=results.begin();it!=results.end();++it)
 	{
-		for(size_t i=0;i<workers.size();i++)
-			dns_apply_result(*workers[i],*it);
+		dns_apply_result(*it);
 	}
 }
 
@@ -1257,23 +1356,7 @@ static void start_dns_worker(struct ev_loop *loop)
 	{
 		return;
 	}
-	int has_domain=0;
-	for(auto it=app_config.rules.begin();it!=app_config.rules.end();++it)
-	{
-		for(size_t i=0;i<it->remote_targets.size();i++)
-		{
-			if(it->remote_targets[i].is_domain)
-			{
-				has_domain=1;
-				break;
-			}
-		}
-		if(has_domain)
-		{
-			break;
-		}
-	}
-	if(!has_domain)
+	if(dns_targets.empty())
 	{
 		return;
 	}
@@ -1285,16 +1368,12 @@ static void start_dns_worker(struct ev_loop *loop)
 	dns_thread.detach();
 }
 
-static void schedule_dns_refresh(forward_rule_t &rule)
+static void schedule_dns_refresh()
 {
-	my_time_t now=rule.worker->clock.now();
-	for(size_t i=0;i<rule.remote_targets.size();i++)
+	my_time_t now=main_clock.now();
+	for(size_t i=0;i<dns_targets.size();i++)
 	{
-		remote_target_t &target=rule.remote_targets[i];
-		if(target.is_domain==0)
-		{
-			continue;
-		}
+		dns_target_t &target=dns_targets[i];
 		if(target.dns_query_pending)
 		{
 			continue;
@@ -1305,8 +1384,8 @@ static void schedule_dns_refresh(forward_rule_t &rule)
 		}
 		dns_refresh_request_t request;
 		memset(&request,0,sizeof(request));
-		request.rule_index=rule.index;
-		request.remote_index=(int)i;
+		request.rule_index=target.rule_index;
+		request.remote_index=target.remote_index;
 		snprintf(request.host,sizeof(request.host),"%s",target.host);
 		request.port=target.port;
 		request.current_addr=target.addr;
@@ -1520,7 +1599,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		int spliced=0;
 		//B2：本方向上一次读够大（D46）就 splice 进 scratch pipe，再从 pipe 写出，不经用户态；拿不到 pipe 时这次照常 recv（D47）。
 		//上游建连中不写出，只走 recv
-		if(my_info.splice_next&&other_info.connected&&!disable_splice)
+		if(my_info.splice_next&&other_info.connected&&!disable_splice.load(memory_order_relaxed))
 		{
 			if(w.tcp_pipe_scratch.r<0&&w.tcp_pipe_pool.get(w.tcp_pipe_scratch)!=0)
 			{
@@ -1538,7 +1617,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				{
 					//splice 本身不可用（如 seccomp 白名单里没有它）：什么都没读，整个进程改走拷贝（审查 L1）
 					mylog(log_warn,"[tcp]splice failed (%s), forwarding all TCP by copy from now on\n",get_sock_error());
-					disable_splice=1;
+					disable_splice.store(1,memory_order_relaxed);
 					spliced=0;
 				}
 			}
@@ -1721,9 +1800,10 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//当作没写出、继续等可写（D50）；越限期间这样的 socket 每轮重试一次
 			if(errno==EAGAIN)
 			{
-				static int logged=0;//越限期间这样的 socket 每轮重试，第一次记 info 便于从日志对上 CPU 占用，之后 debug
-				mylog(logged?log_debug:log_info,"[tcp]send to fd=%d returned EAGAIN although writable (TCP memory above net.ipv4.tcp_mem or a cgroup limit?), retrying\n",my_fd);
-				logged=1;
+				//越限期间这样的 socket 每轮重试，第一次记 info 便于从日志对上 CPU 占用，之后 debug；各 worker 共用（M2），级别先算好：mylog 会把级别参数求值两次
+				static std::atomic<int> logged(0);
+				int level=logged.exchange(1,memory_order_relaxed)?log_debug:log_info;
+				mylog(level,"[tcp]send to fd=%d returned EAGAIN although writable (TCP memory above net.ipv4.tcp_mem or a cgroup limit?), retrying\n",my_fd);
 				return;
 			}
 			mylog(log_info,"[tcp]send_len=%d,connection {%s} closed bc of %s\n",send_len,tcp_pair.addr.get_str(),get_sock_error());
@@ -1821,8 +1901,10 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	address_t tmp_addr;
 	tmp_addr.from_sockaddr((sockaddr*)&tmp_sockaddr_in,tmp_len);
 
-	if(conn_manager_tcp.lru.size()>=max_conn_num)
+	//max_conn_num 按本规则在所有 worker 合计的连接数（M4）：先占一个名额，之后没建成连接对的路径都还回去
+	if(conn_manager_tcp.conns->fetch_add(1,memory_order_relaxed)>=max_conn_num)
 	{
+		conn_manager_tcp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",tmp_addr.get_str());
 		close(new_fd);
 		return 1;
@@ -1832,6 +1914,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair_t *new_pair=w.tcp_pair_pool.get();
 	if(new_pair==0)
 	{
+		conn_manager_tcp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_warn,"[tcp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 		close(new_fd);
 		return 1;
@@ -1847,6 +1930,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	{
 		mylog(log_warn,"[tcp]new connection from {%s},but create new_remote_fd failed,%s\n",tmp_addr.get_str(),get_sock_error());
 		w.tcp_pair_pool.put(new_pair);
+		conn_manager_tcp.conns->fetch_sub(1,memory_order_relaxed);
 		close(new_fd);
 		return 1;
 	}
@@ -1859,6 +1943,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		//立即失败（如无路由的 ENETUNREACH、本地端口耗尽的 EADDRNOTAVAIL）：不建连接对
 		mylog(log_warn,"[tcp]new connection from {%s},but connect to remote {%s} failed,%s\n",tmp_addr.get_str(),rule->remote_targets[remote_index].remote_str,get_sock_error());
 		w.tcp_pair_pool.put(new_pair);
+		conn_manager_tcp.conns->fetch_sub(1,memory_order_relaxed);
 		close(new_remote_fd);
 		close(new_fd);
 		//EADDRNOTAVAIL 要先扫完整个临时端口范围（每次可达数 ms）：结束本轮，端口耗尽时回到每次迭代拒绝一个
@@ -1932,7 +2017,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 }
 
-//一个 worker 每个定时器周期要做的事（M1）：清空闲连接、重启被停掉的监听 watcher、pipe 池标志复位与重扩。M2 起由每个 worker 自己 loop 上的定时器调用
+//一个 worker 每个定时器周期要做的事（M1）：清空闲连接、重启被停掉的监听 watcher、pipe 池标志复位与重扩。由 worker 自己 loop 上的定时器调用（L7）
 static void worker_tick(worker_t &w)
 {
 	for(auto it=w.rules.begin();it!=w.rules.end();++it)
@@ -1957,15 +2042,18 @@ static void worker_tick(worker_t &w)
 	}
 	if(w.tcp_pipe_pool.resize_fail!=0&&w.tcp_pipe_scratch.r>=0) w.tcp_pipe_pool.regrow(w.tcp_pipe_scratch);
 }
-//threads=1 时 worker 与主线程共用默认 loop（D59）：这一个定时器先做各 worker 的事，再做主线程的事（DNS 调度、刷新日志）
+//worker 的定时器（每 timer_interval）
 void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 {
-	for(size_t i=0;i<workers.size();i++)
-		worker_tick(*workers[i]);
-	for(size_t i=0;i<workers.size();i++)
-		for(auto it=workers[i]->rules.begin();it!=workers[i]->rules.end();++it)
-			schedule_dns_refresh(*it);
-	//stdout 不是终端时 log0 不逐行刷新，日志最多晚一个 timer_interval 写出（D3）
+	worker_tick(*(worker_t *)timer->data);
+}
+//主线程的定时器（每 timer_interval）：DNS 调度，刷新日志
+static void stats_check_late();
+static void main_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
+{
+	schedule_dns_refresh();
+	stats_check_late();
+	//stdout 不是终端时 log0 不逐行刷新，各线程写的日志最多晚一个 timer_interval 写出（D3）
 	fflush(stdout);
 }
 //U5：给 UDP socket 开 UDP_GRO（5.0 起）：网卡 GRO 阶段为它聚合同一条流的包，收到时带 UDP_GRO cmsg。
@@ -2047,14 +2135,17 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 {
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
 	worker_t &w=*rule->worker;
-	if(conn_manager_udp.lru.size()>=max_conn_num)
+	//同 TCP（M4）：按本规则所有 worker 合计的会话数，先占一个名额，没建成会话的路径都还回去
+	if(conn_manager_udp.conns->fetch_add(1,memory_order_relaxed)>=max_conn_num)
 	{
+		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
 		return 0;
 	}
 	//会话表要扩容时在选上游、建 socket 之前做：失败只丢这个包，轮询序号不前进
 	if(conn_manager_udp.sessions.reserve_one()!=0)
 	{
+		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 		return 0;
 	}
@@ -2065,6 +2156,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 		new_udp_fd=remote_addr.new_connected_udp_fd();
 	if(new_udp_fd==-1)
 	{
+		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 		return 0;
 	}
@@ -2075,6 +2167,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	udp_pair_t *new_pair=w.udp_pair_pool.get();
 	if(new_pair==0)
 	{
+		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
 		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 		close(new_udp_fd);
 		return 0;
@@ -2137,16 +2230,16 @@ static void udp_send_warn(int dir,int ret,int dropped)
 //U5（审查 L1）：5.0–5.15 未打补丁的内核（v5.16 修复，回移到 5.4.151–180、5.10.81–100 之间）按含 IP/UDP 头的长度判断段数上限，
 //64 个满段必报 EINVAL。碰到一次就置 1，之后每次 GSO 至多 udp_gso_cap() 段，段数加头长不超过 64 段。6.13 以前段长超过路径 MTU
 //也报 EINVAL，段长 ≤1023 B 的 64 段合并包碰上它时会误置：只是此后 64 段的合并包拆成两块发，那个会话随后照常回退
-static int udp_gso_hdr_cap=0;
+static std::atomic<int> udp_gso_hdr_cap(0);//各 worker 共用（M2）：relaxed，两个 worker 同时碰上时各记一行 debug
 static inline int udp_gso_cap(int gso)
 {
-	return udp_gso_hdr_cap?udp_gso_max_segs-(48+gso-1)/gso:udp_gso_max_segs;
+	return udp_gso_hdr_cap.load(memory_order_relaxed)?udp_gso_max_segs-(48+gso-1)/gso:udp_gso_max_segs;
 }
 //段长 gso、segs 段的 GSO 发送报 err 时：是上面的旧内核上限就记住并返回 1（按更小的块重发即可，不关 GSO），否则 0
 static int udp_gso_old_limit(int err,int gso,int segs)
 {
-	if(err!=EINVAL||udp_gso_hdr_cap||segs<=udp_gso_max_segs-(48+gso-1)/gso) return 0;
-	udp_gso_hdr_cap=1;
+	if(err!=EINVAL||udp_gso_hdr_cap.load(memory_order_relaxed)||segs<=udp_gso_max_segs-(48+gso-1)/gso) return 0;
+	udp_gso_hdr_cap.store(1,memory_order_relaxed);
 	mylog(log_debug,"[udp]GSO send of %d segments failed with EINVAL (Linux 5.0-5.15 count the IP/UDP headers against UDP_MAX_SEGMENTS, or the path MTU is smaller), sending at most %d segments at a time from now on\n",segs,udp_gso_cap(gso));
 	return 1;
 }
@@ -2188,8 +2281,7 @@ static void __attribute__((noinline,cold)) udp_gso_turn_off(udp_send_ctx_t &c,mm
 		if(pair!=0) pair->gso_off[1]=1;
 	}
 	c.mgr.gso_fallback[c.dir]++;
-	int level=c.mgr.gso_logged[c.dir]?log_debug:log_info;
-	c.mgr.gso_logged[c.dir]=1;
+	int level=c.mgr.gso_logged[c.dir].exchange(1,memory_order_relaxed)?log_debug:log_info;
 	mylog(level,"[udp]GSO send %s {%s} on %s fd %d failed (%s), sending its GRO packets datagram by datagram from now on\n",
 		c.dir==0?"from":"to",client->get_str(),c.dir==0?"session":"listen",c.fd,get_sock_error());
 }
@@ -2486,59 +2578,281 @@ void udp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 	udp_forward_batch(loop,rule,n);
 }
-//SIGUSR1 输出统计（O1，D25–D27）：一个 worker 的每条规则 TCP、UDP 各一行，再加一行它的池。当前连接数、半关闭对数、
-//持有的块数在这里沿 LRU 现数，热路径上只累加转发计数。只在回调之间调用：这时池的计数与连接对能对上。
-//threads=1 时只有一个 worker，输出与 M1 之前相同；多 worker 的格式在 M3 定（L8）
+//SIGUSR1 统计（O1，D25–D27，D63）：worker 在自己线程上、两个回调之间取快照（这时池的计数与连接对能对上），回传主线程；
+//主线程收齐后求和输出。当前连接数、半关闭对数、持有的块数在这里沿 LRU 现数，热路径上只累加转发计数
+struct rule_stats_t
+{
+	int index,enable_tcp,enable_udp;
+	int tcp_conns,half_closed,udp_sessions,table_cnt;
+	u64_t tcp_total,tcp_bytes[2],splice_bytes[2],splice_fallback;
+	u64_t udp_total,pkts[2],udp_bytes[2],drop[2],gro[2],gso_fallback[2];
+};
+struct worker_stats_t
+{
+	int id;
+	vector<rule_stats_t> rules;
+	int bufs_alloc,bufs_held,bufs_free,scratch;
+	int tcp_slabs,tcp_free,udp_slabs,udp_free;
+	int pipes_alloc,pipes_held,pipes_free,pipe_scratch;
+	u64_t resize_fail;
+	int tcp_conns,udp_conns;
+	u64_t tcp_total,udp_total;
+};
+static ev_async stats_watcher;//worker 回传快照时唤醒主线程
+static pthread_mutex_t stats_mutex=PTHREAD_MUTEX_INITIALIZER;//同 worker_t::ctrl_mutex，不用 std::mutex
+static vector<worker_stats_t> stats_replies;//stats_mutex 保护
+static vector<worker_stats_t> stats_got;//本轮已收到的（主线程）
+static int stats_waiting=0;//本轮已发出、还没收齐
+static int stats_again=0;//本轮没收齐时又来了 SIGUSR1：收齐后再来一轮
+static my_time_t stats_sent_time=0;//本轮发出的时间（main_clock）
+static int stats_late_logged=0;//本轮超时没收齐已记过 warn
+static const my_time_t stats_answer_timeout=5000;
+
+//worker 线程：取一份快照回传主线程
 static void worker_stats(worker_t &w)
 {
-	int held=0,pipes_held=0,tcp_conns=0,udp_conns=0;
+	worker_stats_t st;
+	st.id=w.id;
+	int held=0,pipes_held=0;
+	st.tcp_conns=st.udp_conns=0;
+	st.tcp_total=st.udp_total=0;
 	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 	{
 		forward_rule_t &rule=*it;
 		conn_manager_tcp_t &tcp=rule.tcp_manager;
 		conn_manager_udp_t &udp=rule.udp_manager;
-		int half_closed=0;
+		rule_stats_t r;
+		r.index=rule.index;
+		r.enable_tcp=rule.enable_tcp;
+		r.enable_udp=rule.enable_udp;
+		r.half_closed=0;
 		for(lru_node_t *node=tcp.lru.head.next;node!=&tcp.lru.head;node=node->next)
 		{
 			tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
-			half_closed+=(pair->local.eof||pair->remote.eof);
+			r.half_closed+=(pair->local.eof||pair->remote.eof);
 			held+=(pair->local.buf!=0)+(pair->remote.buf!=0);
 			pipes_held+=(pair->local.pipe.r>=0)+(pair->remote.pipe.r>=0);
 		}
-		tcp_conns+=tcp.lru.size();
-		udp_conns+=udp.lru.size();
-		if(rule.enable_tcp)
-			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu up_splice=%llu down_splice=%llu splice_fallback=%llu\n",
-				rule.index,tcp.lru.size(),tcp.total,half_closed,tcp.bytes[0],tcp.bytes[1],tcp.splice_bytes[0],tcp.splice_bytes[1],tcp.splice_fallback);
-		if(rule.enable_udp&&!udp_gro)
-			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu\n",
-				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1]);
-		if(rule.enable_udp&&udp_gro)//D42：只在 --udp-gro 时多这四项
-			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu up_gro=%llu down_gro=%llu up_gso_fallback=%llu down_gso_fallback=%llu\n",
-				rule.index,udp.lru.size(),udp.total,udp.pkts[0],udp.bytes[0],udp.pkts[1],udp.bytes[1],udp.drop[0],udp.drop[1],
-				udp.gro[0],udp.gro[1],udp.gso_fallback[0],udp.gso_fallback[1]);
+		r.tcp_conns=tcp.lru.size();
+		r.tcp_total=tcp.total;
+		memcpy(r.tcp_bytes,tcp.bytes,sizeof(r.tcp_bytes));
+		memcpy(r.splice_bytes,tcp.splice_bytes,sizeof(r.splice_bytes));
+		r.splice_fallback=tcp.splice_fallback;
+		r.udp_sessions=udp.lru.size();
+		r.table_cnt=udp.sessions.cnt;
+		r.udp_total=udp.total;
+		memcpy(r.pkts,udp.pkts,sizeof(r.pkts));
+		memcpy(r.udp_bytes,udp.bytes,sizeof(r.udp_bytes));
+		memcpy(r.drop,udp.drop,sizeof(r.drop));
+		memcpy(r.gro,udp.gro,sizeof(r.gro));
+		memcpy(r.gso_fallback,udp.gso_fallback,sizeof(r.gso_fallback));
+		st.tcp_conns+=r.tcp_conns;
+		st.udp_conns+=r.udp_sessions;
+		st.tcp_total+=r.tcp_total;
+		st.udp_total+=r.udp_total;
+		st.rules.push_back(r);
 	}
-	int scratch=(w.tcp_scratch!=0);
-	int pipe_scratch=(w.tcp_pipe_scratch.r>=0);
+	st.bufs_alloc=w.tcp_buf_pool.alloc;
+	st.bufs_held=held;
+	st.bufs_free=w.tcp_buf_pool.free_bufs.cnt;
+	st.scratch=(w.tcp_scratch!=0);
+	st.tcp_slabs=w.tcp_pair_pool.slabs;
+	st.tcp_free=w.tcp_pair_pool.free_objs.cnt;
+	st.udp_slabs=w.udp_pair_pool.slabs;
+	st.udp_free=w.udp_pair_pool.free_objs.cnt;
+	st.pipes_alloc=w.tcp_pipe_pool.alloc;
+	st.pipes_held=pipes_held;
+	st.pipes_free=w.tcp_pipe_pool.free_cnt;
+	st.pipe_scratch=(w.tcp_pipe_scratch.r>=0);
+	st.resize_fail=w.tcp_pipe_pool.resize_fail;
+	pthread_mutex_lock(&stats_mutex);
+	stats_replies.push_back(st);
+	pthread_mutex_unlock(&stats_mutex);
+	ev_async_send(main_clock.loop,&stats_watcher);
+}
+//主线程：给每个 worker 发一轮统计请求
+static void stats_request()
+{
+	stats_waiting=1;
+	stats_sent_time=main_clock.now();
+	stats_late_logged=0;
+	for(size_t i=0;i<workers.size();i++)
+		worker_post(*workers[i],worker_msg_t(worker_msg_stats));
+}
+//主线程：收齐一轮后输出（D63）。N>1 时先每 worker 一行，再按规则求和的 tcp/udp 行，最后求和的 pool 行（一组的结尾：读者等到它就是写完了）；
+//1 个 worker 时与 M2 之前逐字节相同。整组写完之前锁住 stdout：worker 线程这时写的日志行排在整组之后，不会插进来（测试与 bench/lib.sh
+//从 pool 行往前找连续的规则行）。写出之后再对每个 worker 的快照核对不变式：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
+static void stats_print(vector<worker_stats_t> &all)
+{
+	sort(all.begin(),all.end(),[](const worker_stats_t &a,const worker_stats_t &b){return a.id<b.id;});
+	flockfile(stdout);//log0 的 fwrite 在同一线程里再加锁不会阻塞（stdio 的锁可重入）
+	if(all.size()>1)
+	{
+		for(size_t i=0;i<all.size();i++)
+			mylog_unfiltered(log_info,"stats worker %d: tcp_conns=%d tcp_total=%llu udp_sessions=%d udp_total=%llu\n",
+				all[i].id,all[i].tcp_conns,all[i].tcp_total,all[i].udp_conns,all[i].udp_total);
+	}
+	worker_stats_t sum=all[0];
+	for(size_t i=1;i<all.size();i++)
+	{
+		worker_stats_t &st=all[i];
+		for(size_t j=0;j<sum.rules.size();j++)
+		{
+			rule_stats_t &a=sum.rules[j],&b=st.rules[j];
+			a.tcp_conns+=b.tcp_conns;
+			a.half_closed+=b.half_closed;
+			a.udp_sessions+=b.udp_sessions;
+			a.tcp_total+=b.tcp_total;
+			a.splice_fallback+=b.splice_fallback;
+			a.udp_total+=b.udp_total;
+			for(int d=0;d<2;d++)
+			{
+				a.tcp_bytes[d]+=b.tcp_bytes[d];
+				a.splice_bytes[d]+=b.splice_bytes[d];
+				a.pkts[d]+=b.pkts[d];
+				a.udp_bytes[d]+=b.udp_bytes[d];
+				a.drop[d]+=b.drop[d];
+				a.gro[d]+=b.gro[d];
+				a.gso_fallback[d]+=b.gso_fallback[d];
+			}
+		}
+		sum.bufs_alloc+=st.bufs_alloc;
+		sum.bufs_held+=st.bufs_held;
+		sum.bufs_free+=st.bufs_free;
+		sum.scratch+=st.scratch;
+		sum.tcp_slabs+=st.tcp_slabs;
+		sum.tcp_free+=st.tcp_free;
+		sum.udp_slabs+=st.udp_slabs;
+		sum.udp_free+=st.udp_free;
+		sum.pipes_alloc+=st.pipes_alloc;
+		sum.pipes_held+=st.pipes_held;
+		sum.pipes_free+=st.pipes_free;
+		sum.pipe_scratch+=st.pipe_scratch;
+		sum.resize_fail+=st.resize_fail;
+	}
+	for(size_t j=0;j<sum.rules.size();j++)
+	{
+		rule_stats_t &r=sum.rules[j];
+		if(r.enable_tcp)
+			mylog_unfiltered(log_info,"stats rule %d tcp: conns=%d total=%llu half_closed=%d up_bytes=%llu down_bytes=%llu up_splice=%llu down_splice=%llu splice_fallback=%llu\n",
+				r.index,r.tcp_conns,r.tcp_total,r.half_closed,r.tcp_bytes[0],r.tcp_bytes[1],r.splice_bytes[0],r.splice_bytes[1],r.splice_fallback);
+		if(r.enable_udp&&!udp_gro)
+			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu\n",
+				r.index,r.udp_sessions,r.udp_total,r.pkts[0],r.udp_bytes[0],r.pkts[1],r.udp_bytes[1],r.drop[0],r.drop[1]);
+		if(r.enable_udp&&udp_gro)//D42：只在 --udp-gro 时多这四项
+			mylog_unfiltered(log_info,"stats rule %d udp: sessions=%d total=%llu up_pkts=%llu up_bytes=%llu down_pkts=%llu down_bytes=%llu up_drop=%llu down_drop=%llu up_gro=%llu down_gro=%llu up_gso_fallback=%llu down_gso_fallback=%llu\n",
+				r.index,r.udp_sessions,r.udp_total,r.pkts[0],r.udp_bytes[0],r.pkts[1],r.udp_bytes[1],r.drop[0],r.drop[1],
+				r.gro[0],r.gro[1],r.gso_fallback[0],r.gso_fallback[1]);
+	}
 	mylog_unfiltered(log_info,"stats pool: bufs alloc=%d held=%d free=%d scratch=%d tcp_pairs slabs=%d free=%d udp_pairs slabs=%d free=%d pipes alloc=%d held=%d free=%d scratch=%d resize_fail=%llu\n",
-		w.tcp_buf_pool.alloc,held,w.tcp_buf_pool.free_bufs.cnt,scratch,
-		w.tcp_pair_pool.slabs,w.tcp_pair_pool.free_objs.cnt,w.udp_pair_pool.slabs,w.udp_pair_pool.free_objs.cnt,
-		w.tcp_pipe_pool.alloc,pipes_held,w.tcp_pipe_pool.free_cnt,pipe_scratch,w.tcp_pipe_pool.resize_fail);
-	//先写出再检查：DEBUG_ASSERT 构建里对不上时日志里留着这一组数
+		sum.bufs_alloc,sum.bufs_held,sum.bufs_free,sum.scratch,
+		sum.tcp_slabs,sum.tcp_free,sum.udp_slabs,sum.udp_free,
+		sum.pipes_alloc,sum.pipes_held,sum.pipes_free,sum.pipe_scratch,sum.resize_fail);
 	fflush(stdout);
-	DEBUG_ASSERT(w.tcp_buf_pool.alloc==held+w.tcp_buf_pool.free_bufs.cnt+scratch);
-	DEBUG_ASSERT(w.tcp_pipe_pool.alloc==pipes_held+w.tcp_pipe_pool.free_cnt+pipe_scratch);
-	DEBUG_ASSERT(w.tcp_pair_pool.slabs*obj_pool_slab_objs-w.tcp_pair_pool.free_objs.cnt==tcp_conns);
-	DEBUG_ASSERT(w.udp_pair_pool.slabs*obj_pool_slab_objs-w.udp_pair_pool.free_objs.cnt==udp_conns);
-	for(auto it=w.rules.begin();it!=w.rules.end();++it)
-		DEBUG_ASSERT(it->udp_manager.sessions.cnt==it->udp_manager.lru.size());
+	funlockfile(stdout);
+	for(size_t i=0;i<all.size();i++)
+	{
+		worker_stats_t &st=all[i];
+		DEBUG_ASSERT(st.bufs_alloc==st.bufs_held+st.bufs_free+st.scratch);
+		DEBUG_ASSERT(st.pipes_alloc==st.pipes_held+st.pipes_free+st.pipe_scratch);
+		DEBUG_ASSERT(st.tcp_slabs*obj_pool_slab_objs-st.tcp_free==st.tcp_conns);
+		DEBUG_ASSERT(st.udp_slabs*obj_pool_slab_objs-st.udp_free==st.udp_conns);
+		for(size_t j=0;j<st.rules.size();j++)
+			DEBUG_ASSERT(st.rules[j].table_cnt==st.rules[j].udp_sessions);
+	}
+}
+static void stats_reply_cb(struct ev_loop *loop, ev_async *watcher, int revents)
+{
+	pthread_mutex_lock(&stats_mutex);
+	for(size_t i=0;i<stats_replies.size();i++)
+		stats_got.push_back(stats_replies[i]);
+	stats_replies.clear();
+	pthread_mutex_unlock(&stats_mutex);
+	if(stats_got.size()<workers.size()) return;
+	stats_print(stats_got);
+	stats_got.clear();
+	stats_waiting=0;
+	if(stats_again)
+	{
+		stats_again=0;
+		stats_request();
+	}
+}
+//主线程定时器里调用：一轮统计发出后 stats_answer_timeout 还没收齐（worker 卡在很长的回调或死循环里）就记一行 warn，指出没回的 worker，
+//继续等（审查 L-5：否则之后的 SIGUSR1 都被合并进这一轮，没有任何输出）
+static void stats_check_late()
+{
+	if(!stats_waiting||stats_late_logged||main_clock.now()-stats_sent_time<stats_answer_timeout) return;
+	stats_late_logged=1;
+	char ids[512];
+	int len=0;
+	ids[0]=0;
+	for(size_t i=0;i<workers.size();i++)
+	{
+		int got=0;
+		for(size_t j=0;j<stats_got.size();j++)
+			got|=(stats_got[j].id==workers[i]->id);
+		if(!got&&len<(int)sizeof(ids)-8)
+			len+=snprintf(ids+len,sizeof(ids)-len," %d",workers[i]->id);
+	}
+	mylog(log_warn,"stats: worker(s)%s did not answer SIGUSR1 within %d s, still waiting\n",ids,(int)(stats_answer_timeout/1000));
 }
 void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	for(size_t i=0;i<workers.size();i++)
-		worker_stats(*workers[i]);
+	if(stats_waiting)//上一轮还没收齐：收齐后再来一轮（同一时刻的多个 SIGUSR1 本来就会被合并）
+	{
+		stats_again=1;
+		return;
+	}
+	stats_request();
 }
 
+//worker 的控制消息（S4），在它自己的 loop 上、两个回调之间处理
+static void worker_ctrl_cb(struct ev_loop *loop, ev_async *watcher, int revents)
+{
+	worker_t &w=*(worker_t *)watcher->data;
+	std::deque<worker_msg_t> msgs;
+	pthread_mutex_lock(&w.ctrl_mutex);
+	msgs.swap(w.ctrl_queue);
+	pthread_mutex_unlock(&w.ctrl_mutex);
+	for(auto it=msgs.begin();it!=msgs.end();++it)
+	{
+		if(it->type==worker_msg_dns) worker_dns_update(w,*it);
+		else if(it->type==worker_msg_stats) worker_stats(w);
+		else if(it->type==worker_msg_exit) ev_break(loop,EVBREAK_ALL);
+	}
+}
+static sem_t workers_exited;//每个 worker 线程退出 loop 后 post 一次（M6）
+static void *worker_main(void *arg)
+{
+	worker_t &w=*(worker_t *)arg;
+	char name[16];
+	snprintf(name,sizeof(name),"worker%d",w.id);
+	prctl(PR_SET_NAME,name,0,0,0);//top -H、/proc/<pid>/task/<tid>/comm 里认得出
+	ev_run(w.loop,0);
+	if(w.udp_batch.rn!=0) udp_flush_return(w.udp_batch);//本轮收下的回包照发：ev_break 之后不再有 ev_prepare
+	sem_post(&workers_exited);
+	return 0;
+}
+//有序退出（M6，S8）：通知每个 worker 退出 loop，合计最多等 1 s，再由调用方 myexit。不用 pthread_join：worker 卡住时 SIGTERM 也要能退出，
+//musl 1.1.16 又没有 pthread_timedjoin_np。DNS 线程不等：它可能阻塞在 getaddrinfo 里，_exit 直接结束它
+static void workers_stop()
+{
+	for(size_t i=0;i<workers.size();i++)
+		worker_post(*workers[i],worker_msg_t(worker_msg_exit));
+	struct timespec deadline;
+	clock_gettime(CLOCK_REALTIME,&deadline);
+	deadline.tv_sec+=1;
+	for(size_t i=0;i<workers.size();i++)
+	{
+		while(sem_timedwait(&workers_exited,&deadline)!=0)
+		{
+			if(errno==EINTR) continue;
+			mylog(log_warn,"%d of %d workers did not stop within 1 s, exiting anyway\n",(int)(workers.size()-i),(int)workers.size());
+			return;
+		}
+	}
+}
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
 	mylog(log_info, "got sigpipe, ignored");
@@ -2547,12 +2861,14 @@ void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
 void sigterm_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
 	mylog(log_info, "got sigterm, exit");
+	workers_stop();
 	myexit(0);
 }
 
 void sigint_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
 	mylog(log_info, "got sigint, exit");
+	workers_stop();
 	myexit(0);
 }
 
@@ -2571,8 +2887,8 @@ static void check_and_record_listen(unordered_map<address_t,int,address_t::hash_
 }
 
 //U5：监听 socket 开 UDP_GRO。开成功时给所属 worker 的 udp_batch 挂上收 cmsg 的控制缓冲（每个 worker 一份批，重复挂是同样的指针）；
-//第一个就失败（5.0 以前的内核）时整个特性关闭，这时还没有 socket 开着 UDP_GRO。之后的失败只记一行：那个监听 socket 收到的都是普通数据报
-static void udp_gro_listen(forward_rule_t &rule)
+//第一个就失败（5.0 以前的内核）时整个特性关闭，这时还没有 socket 开着 UDP_GRO。之后的失败每条规则只记一行（warned 由调用方按规则给）：那个监听 socket 收到的都是普通数据报
+static void udp_gro_listen(forward_rule_t &rule,int &warned)
 {
 	static int gro_socks=0;
 	if(udp_gro_set(rule.local_listen_fd_udp)==0)
@@ -2581,157 +2897,237 @@ static void udp_gro_listen(forward_rule_t &rule)
 		rule.worker->udp_batch.attach_ctrl();
 		return;
 	}
-	mylog(log_warn,"rule %d [udp] setsockopt UDP_GRO failed (%s): --udp-gro needs Linux 5.0 or later%s\n",
-		rule.index,get_sock_error(),gro_socks==0?", UDP_GRO stays off":"");
+	if(!warned)//每条规则只记一行（各 worker 的监听 socket 一样，M2）
+		mylog(log_warn,"rule %d [udp] setsockopt UDP_GRO failed (%s): --udp-gro needs Linux 5.0 or later%s\n",
+			rule.index,get_sock_error(),gro_socks==0?", UDP_GRO stays off":"");
+	warned=1;
 	if(gro_socks==0) udp_gro=0;
 }
 
-static void start_forward_rule(struct ev_loop *loop, forward_rule_t &rule)
+//第 i 条规则在 worker w 里的运行时（rules 按规则序号排列）
+static forward_rule_t &worker_rule(worker_t &w,size_t i)
 {
-	assert(loop!=0);
-	char listen_addr[max_addr_len];
-	rule.local_addr.to_str(listen_addr);
-	int yes=1;
+	auto it=w.rules.begin();
+	advance(it,i);
+	return *it;
+}
 
-	if(rule.enable_tcp)
+//在 worker w 里建第 i 条规则的运行时（不含监听，见 start_forward_rule）：规则配置与 remote 地址的副本、roundrobin 状态（M4：每 worker 一份）、
+//两个管理器指向 w 与本规则的全局连接计数
+static void worker_add_rule(worker_t *w,size_t i)
+{
+	w->rules.emplace_back();
+	forward_rule_t &rule=w->rules.back();
+	rule.worker=w;
+	rule.tcp_manager.worker=rule.udp_manager.worker=w;
+	rule.tcp_manager.lru.clock=rule.udp_manager.lru.clock=&w->clock;
+	rule.tcp_manager.conns=&rule_shared[i].tcp;
+	rule.udp_manager.conns=&rule_shared[i].udp;
+	rule.udp_manager.gso_logged=rule_shared[i].gso_logged;
+	forward_rule_config_t &rule_config=app_config.rules[i];
+	rule.index=(int)i+1;
+	rule.local_addr=rule_config.local_addr;
+	rule.enable_tcp=rule_config.enable_tcp;
+	rule.enable_udp=rule_config.enable_udp;
+	rule.balance_strategy=rule_config.balance_strategy;
+	rule.balance_weights=rule_config.balance_weights;
+	assert(!rule_config.remote_targets.empty());
+	rule.remote_targets.reserve(rule_config.remote_targets.size());
+	for(size_t j=0;j<rule_config.remote_targets.size();j++)
 	{
-		rule.local_listen_fd_tcp=socket(rule.local_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
-		if(rule.local_listen_fd_tcp<0)
-		{
-			mylog(log_fatal,"rule %d [tcp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
-			myexit(1);
-		}
-
-		setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-		//accept 得到的 socket 继承监听 socket 的 TCP_NODELAY，客户端一侧不必每个连接再设一次
-		if(!disable_tcp_nodelay)
-			setsockopt(rule.local_listen_fd_tcp, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
-		//accept 得到的 socket 也继承缓冲大小和 SOCK_*BUF_LOCK 锁位：只有 --sock-buf 时在这里设一次
-		if(sock_buf_explicit)
-			set_buf_size(rule.local_listen_fd_tcp,socket_buf_size);
-
-		if(::bind(rule.local_listen_fd_tcp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
-		{
-			mylog(log_fatal,"rule %d [tcp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
-			myexit(1);
-		}
-
-		if(listen(rule.local_listen_fd_tcp, listen_backlog) !=0)
-		{
-			mylog(log_fatal,"rule %d [tcp] socket listen failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
-			myexit(1);
-		}
-
-		ev_io_init(&rule.tcp_accept_watcher, tcp_accept_cb, rule.local_listen_fd_tcp, EV_READ);
-		rule.tcp_accept_watcher.data=&rule;
-		ev_io_start(loop, &rule.tcp_accept_watcher);
+		const remote_target_config_t &config_target=rule_config.remote_targets[j];
+		remote_target_t target;
+		target.addr=config_target.addr;
+		target.is_domain=config_target.is_domain;
+		snprintf(target.remote_str,sizeof(target.remote_str),"%s",config_target.remote_str);
+		snprintf(target.host,sizeof(target.host),"%s",config_target.host);
+		target.port=config_target.port;
+		rule.remote_targets.push_back(target);
 	}
-
-	if(rule.enable_udp)
+	if(rule.balance_strategy!=balance_strategy_off)
 	{
-		rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
-		if(rule.local_listen_fd_udp<0)
+		assert(rule.balance_weights.size()==rule.remote_targets.size());
+	}
+	if(rule.balance_strategy==balance_strategy_roundrobin)
+	{
+		rule.rr_nodes.reserve(rule.remote_targets.size());
+		for(size_t j=0;j<rule.remote_targets.size();j++)
 		{
-			mylog(log_fatal,"rule %d [udp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
-			myexit(1);
+			int weight=rule.balance_weights[j];
+			balance_rr_node_t node;
+			node.current_weight=0;
+			node.effective_weight=weight;
+			node.weight=weight;
+			rule.rr_nodes.push_back(node);
 		}
-
-		setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-		set_udp_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
-		//内核保存的是请求值的 2 倍；没有 CAP_NET_ADMIN 时先被 rmem_max/wmem_max 截断（6.18 以前默认 212992）
-		int rcv=0,snd=0;
-		socklen_t opt_len=sizeof(rcv);
-		getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_RCVBUF, &rcv, &opt_len);
-		opt_len=sizeof(snd);
-		getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_SNDBUF, &snd, &opt_len);
-		if(rcv<2*listen_fd_buf_size||snd<2*listen_fd_buf_size)
-			mylog(log_info,"rule %d [udp] listen socket buffers are rcv %d / snd %d bytes instead of %d: capped by net.core.rmem_max/wmem_max, raise them to at least %d or run with CAP_NET_ADMIN\n",
-				rule.index,rcv,snd,2*listen_fd_buf_size,listen_fd_buf_size);
-		if(udp_gro) udp_gro_listen(rule);
-
-		if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
-		{
-			mylog(log_fatal,"rule %d [udp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
-			myexit(1);
-		}
-
-		ev_io_init(&rule.udp_accept_watcher, udp_accept_cb, rule.local_listen_fd_udp, EV_READ);
-		rule.udp_accept_watcher.data=&rule;
-		ev_io_start(loop, &rule.udp_accept_watcher);
 	}
 }
 
+//建监听组之前先用一个只带 SO_REUSEADDR、不带 SO_REUSEPORT 的 socket bind 一次再关掉（S2）：地址已被占用（另一个实例，本配置里重叠的地址
+//如 [::]:p 与 0.0.0.0:p，或同 uid 只设了 SO_REUSEPORT 的别的程序）时照旧报 bind 失败退出，否则同 uid 的 reuseport socket 会被静默加入同一组、
+//分走流量。只设 SO_REUSEADDR 的 UDP socket 照旧可以共用端口（审查 L-1：与 M2 之前相同）；探测时设了 SO_REUSEADDR，TIME_WAIT 不影响
+static void listen_probe(forward_rule_t &rule,int type,const char *protocol,const char *listen_addr)
+{
+	int yes=1;
+	int probe=socket(rule.local_addr.get_type(), type|SOCK_CLOEXEC, 0);
+	if(probe<0)
+	{
+		mylog(log_fatal,"rule %d [%s] create listen socket failed on %s, %s\n",rule.index,protocol,listen_addr,get_sock_error());
+		myexit(1);
+	}
+	setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+	if(::bind(probe, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
+	{
+		mylog(log_fatal,"rule %d [%s] socket bind failed on %s, %s\n",rule.index,protocol,listen_addr,get_sock_error());
+		myexit(1);
+	}
+	close(probe);
+}
 
+//建第 i 条规则的监听（M2，S2）：每个 worker 一个 socket；N>1 时都设 SO_REUSEPORT，内核按四元组哈希把新连接与 UDP 流分给它们。由主线程在启动
+//worker 线程之前全部建好、bind 完，组成员在进程生命周期内固定：成员一变，UDP 四元组到 socket 的映射就整体重排。
+//N=1 时与 M2 之前一样只设 SO_REUSEADDR（D67）：一个监听用不着分流，reuseport 却让发往监听的每个 SYN 与数据报在 softirq 里多一次选择
+//（loopback 实测 1400 B 单流正向客户端发包 −3%、转发器每数据报 CPU +2.5%）
+static void start_forward_rule(size_t i)
+{
+	forward_rule_t &rule0=worker_rule(*workers[0],i);
+	char listen_addr[max_addr_len];
+	rule0.local_addr.to_str(listen_addr);
+	int yes=1;
+
+	if(rule0.enable_tcp)
+	{
+		listen_probe(rule0,SOCK_STREAM,"tcp",listen_addr);
+		for(size_t k=0;k<workers.size();k++)
+		{
+			worker_t &w=*workers[k];
+			forward_rule_t &rule=worker_rule(w,i);
+			rule.local_listen_fd_tcp=socket(rule.local_addr.get_type(), SOCK_STREAM|SOCK_NONBLOCK|SOCK_CLOEXEC, 0);
+			if(rule.local_listen_fd_tcp<0)
+			{
+				mylog(log_fatal,"rule %d [tcp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+
+			setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+			if(worker_count>1&&setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))!=0)
+			{
+				mylog(log_fatal,"rule %d [tcp] setsockopt SO_REUSEPORT failed on %s (needs Linux 3.9 or later), %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+			//accept 得到的 socket 继承监听 socket 的 TCP_NODELAY，客户端一侧不必每个连接再设一次
+			if(!disable_tcp_nodelay)
+				setsockopt(rule.local_listen_fd_tcp, IPPROTO_TCP, TCP_NODELAY, &yes, sizeof(yes));
+			//accept 得到的 socket 也继承缓冲大小和 SOCK_*BUF_LOCK 锁位：只有 --sock-buf 时在这里设一次
+			if(sock_buf_explicit)
+				set_buf_size(rule.local_listen_fd_tcp,socket_buf_size);
+
+			if(::bind(rule.local_listen_fd_tcp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
+			{
+				mylog(log_fatal,"rule %d [tcp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+
+			if(listen(rule.local_listen_fd_tcp, listen_backlog) !=0)
+			{
+				mylog(log_fatal,"rule %d [tcp] socket listen failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+
+			ev_io_init(&rule.tcp_accept_watcher, tcp_accept_cb, rule.local_listen_fd_tcp, EV_READ);
+			rule.tcp_accept_watcher.data=&rule;
+			ev_io_start(w.loop, &rule.tcp_accept_watcher);
+		}
+	}
+
+	if(rule0.enable_udp)
+	{
+		listen_probe(rule0,SOCK_DGRAM,"udp",listen_addr);
+		int gro_warned=0;
+		for(size_t k=0;k<workers.size();k++)
+		{
+			worker_t &w=*workers[k];
+			forward_rule_t &rule=worker_rule(w,i);
+			rule.local_listen_fd_udp=socket(rule.local_addr.get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
+			if(rule.local_listen_fd_udp<0)
+			{
+				mylog(log_fatal,"rule %d [udp] create listen socket failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+
+			setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+			if(worker_count>1&&setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))!=0)
+			{
+				mylog(log_fatal,"rule %d [udp] setsockopt SO_REUSEPORT failed on %s (needs Linux 3.9 or later), %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+			set_udp_buf_size(rule.local_listen_fd_udp,listen_fd_buf_size);
+			if(k==0)//各 worker 的监听 socket 同样设置，每条规则只记一行（S11）
+			{
+				//内核保存的是请求值的 2 倍；没有 CAP_NET_ADMIN 时先被 rmem_max/wmem_max 截断（6.18 以前默认 212992）
+				int rcv=0,snd=0;
+				socklen_t opt_len=sizeof(rcv);
+				getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_RCVBUF, &rcv, &opt_len);
+				opt_len=sizeof(snd);
+				getsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_SNDBUF, &snd, &opt_len);
+				if(rcv<2*listen_fd_buf_size||snd<2*listen_fd_buf_size)
+					mylog(log_info,"rule %d [udp] listen socket buffers are rcv %d / snd %d bytes instead of %d: capped by net.core.rmem_max/wmem_max, raise them to at least %d or run with CAP_NET_ADMIN\n",
+						rule.index,rcv,snd,2*listen_fd_buf_size,listen_fd_buf_size);
+			}
+			if(udp_gro) udp_gro_listen(rule,gro_warned);
+
+			if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
+			{
+				mylog(log_fatal,"rule %d [udp] socket bind failed on %s, %s\n",rule.index,listen_addr,get_sock_error());
+				myexit(1);
+			}
+
+			ev_io_init(&rule.udp_accept_watcher, udp_accept_cb, rule.local_listen_fd_udp, EV_READ);
+			rule.udp_accept_watcher.data=&rule;
+			ev_io_start(w.loop, &rule.udp_accept_watcher);
+		}
+	}
+}
+
+//主线程（D62）：默认 loop 只管信号、DNS、统计汇总与刷新日志；转发全在 worker 线程，每个 worker 一个 ev_loop_new 的 epoll loop（§5）。
+//worker、规则运行时、监听与各 watcher 都由主线程在启动 worker 线程之前建好（之后主线程只经 worker_post 访问 worker）
 int event_loop()
 {
 	struct ev_loop * loop= ev_default_loop(0);
 	assert(loop != NULL);
 	mylog(log_info,"event backend: %s\n",ev_backend(loop)==EVBACKEND_EPOLL?"epoll":"unknown");
+	main_clock.loop=loop;
 	unordered_map<address_t,int,address_t::hash_function> tcp_listen_rules;
 	unordered_map<address_t,int,address_t::hash_function> udp_listen_rules;
 	tcp_listen_rules.reserve(app_config.rules.size());
 	udp_listen_rules.reserve(app_config.rules.size());
 
-
-	worker_t *w=worker_new(loop);//threads=1：唯一的 worker 用默认 loop（D59）
-	workers.push_back(w);
-
-	int any_udp=0;
 	if(app_config.rules.empty())
 	{
 		mylog(log_fatal,"no forward rules configured\n");
 		myexit(-1);
 	}
+	rule_shared=new rule_shared_t[app_config.rules.size()];
 
+	for(int k=0;k<worker_count;k++)
+	{
+		struct ev_loop *l=ev_loop_new(EVBACKEND_EPOLL);
+		if(l==0||ev_backend(l)!=EVBACKEND_EPOLL)
+		{
+			mylog(log_fatal,"failed to create epoll event loop for worker %d\n",k);
+			myexit(-1);
+		}
+		worker_t *w=worker_new(k,l);
+		workers.push_back(w);
+		for(size_t i=0;i<app_config.rules.size();i++)
+			worker_add_rule(w,i);
+	}
+	mylog(log_info,"worker threads: %d\n",worker_count);
+
+	int any_udp=0;
 	for(size_t i=0;i<app_config.rules.size();i++)
 	{
-		w->rules.emplace_back();
-		forward_rule_t &rule=w->rules.back();
-		rule.worker=w;
-		rule.tcp_manager.worker=rule.udp_manager.worker=w;
-		rule.tcp_manager.lru.clock=rule.udp_manager.lru.clock=&w->clock;
-		forward_rule_config_t &rule_config=app_config.rules[i];
-		rule.index=(int)i+1;
-		rule.local_addr=rule_config.local_addr;
-		rule.enable_tcp=rule_config.enable_tcp;
-		rule.enable_udp=rule_config.enable_udp;
-		rule.balance_strategy=rule_config.balance_strategy;
-		rule.balance_weights=rule_config.balance_weights;
-		assert(!rule_config.remote_targets.empty());
-		rule.remote_targets.reserve(rule_config.remote_targets.size());
-		my_time_t now=w->clock.now();
-		for(size_t j=0;j<rule_config.remote_targets.size();j++)
-		{
-			const remote_target_config_t &config_target=rule_config.remote_targets[j];
-			remote_target_t target;
-			target.addr=config_target.addr;
-			target.is_domain=config_target.is_domain;
-			snprintf(target.remote_str,sizeof(target.remote_str),"%s",config_target.remote_str);
-			snprintf(target.host,sizeof(target.host),"%s",config_target.host);
-			target.port=config_target.port;
-			if(target.is_domain)
-			{
-				target.last_dns_refresh_time=now;
-			}
-			rule.remote_targets.push_back(target);
-		}
-		if(rule.balance_strategy!=balance_strategy_off)
-		{
-			assert(rule.balance_weights.size()==rule.remote_targets.size());
-		}
-		if(rule.balance_strategy==balance_strategy_roundrobin)
-		{
-			rule.rr_nodes.reserve(rule.remote_targets.size());
-			for(size_t j=0;j<rule.remote_targets.size();j++)
-			{
-				int weight=rule.balance_weights[j];
-				balance_rr_node_t node;
-				node.current_weight=0;
-				node.effective_weight=weight;
-				node.weight=weight;
-				rule.rr_nodes.push_back(node);
-			}
-		}
+		forward_rule_t &rule=worker_rule(*workers[0],i);
 		if(rule.enable_tcp)
 		{
 			check_and_record_listen(tcp_listen_rules,rule,"tcp");
@@ -2741,20 +3137,80 @@ int event_loop()
 			check_and_record_listen(udp_listen_rules,rule,"udp");
 			any_udp=1;
 		}
-		start_forward_rule(w->loop,rule);
+		start_forward_rule(i);
 	}
 
+	//DNS 主表（S5）：每个域名 remote 一项，启动时算作刚刷新过
+	my_time_t now=main_clock.now();
+	for(size_t i=0;i<app_config.rules.size();i++)
+	{
+		for(size_t j=0;j<app_config.rules[i].remote_targets.size();j++)
+		{
+			const remote_target_config_t &config_target=app_config.rules[i].remote_targets[j];
+			if(!config_target.is_domain) continue;
+			dns_target_t target;
+			target.rule_index=(int)i+1;
+			target.remote_index=(int)j;
+			snprintf(target.host,sizeof(target.host),"%s",config_target.host);
+			target.port=config_target.port;
+			target.addr=config_target.addr;
+			target.last_dns_refresh_time=now;
+			target.dns_query_pending=0;
+			dns_targets.push_back(target);
+		}
+	}
+
+	struct ev_timer main_timer;
+	ev_timer_init(&main_timer, main_timer_cb, 0, timer_interval/1000.0);
+	ev_timer_start(loop, &main_timer);
+	//这几个 watcher 已清零（BSS、worker_t 的构造函数），等同 ev_init；只填回调与参数，不用 ev_*_init 宏：不新增 strict-aliasing 告警
+	stats_watcher.cb=stats_reply_cb;
+	ev_async_start(loop, &stats_watcher);
+
+	for(size_t k=0;k<workers.size();k++)
+	{
+		worker_t *w=workers[k];
+		w->tick_timer.cb=clear_timer_cb;
+		w->tick_timer.repeat=timer_interval/1000.0;//at 为 0：同 ev_timer_init(…, 0, timer_interval)，第一轮就跑一次
+		w->tick_timer.data=w;
+		ev_timer_start(w->loop, &w->tick_timer);
+		w->ctrl_watcher.cb=worker_ctrl_cb;
+		w->ctrl_watcher.data=w;
+		ev_async_start(w->loop, &w->ctrl_watcher);
+		w->udp_flush_watcher.cb=udp_flush_cb;
+		w->udp_flush_watcher.data=w;
+		if(any_udp)
+			ev_prepare_start(w->loop, &w->udp_flush_watcher);
+	}
+
+	sem_init(&workers_exited,0,0);
+	//worker 线程与 DNS 线程屏蔽信号（D62）：发给进程的信号都由主线程上 libev 的处理函数接住；worker 写向已 RST 的对端产生的 SIGPIPE
+	//留在那个线程上待决，不处理（send/splice 照样返回 EPIPE）。abort() 用的 SIGABRT 与同步的故障信号不屏蔽（审查 L-3：musl 1.1.20
+	//以前的 abort() 不解除屏蔽，worker 里的中止会变成 SIGSEGV/SIGILL）
+	sigset_t all,old;
+	sigfillset(&all);
+	sigdelset(&all,SIGABRT);
+	sigdelset(&all,SIGSEGV);
+	sigdelset(&all,SIGBUS);
+	sigdelset(&all,SIGFPE);
+	sigdelset(&all,SIGILL);
+	sigdelset(&all,SIGTRAP);
+	pthread_sigmask(SIG_BLOCK,&all,&old);
 	start_dns_worker(loop);
-
-	struct ev_timer clear_timer;
-
-	ev_timer_init(&clear_timer, clear_timer_cb, 0, timer_interval/1000.0);
-	ev_timer_start(loop, &clear_timer);
-
-	w->udp_flush_watcher.cb=udp_flush_cb;
-	w->udp_flush_watcher.data=w;
-	if(any_udp)
-		ev_prepare_start(w->loop, &w->udp_flush_watcher);
+	pthread_attr_t attr;
+	pthread_attr_init(&attr);
+	pthread_attr_setstacksize(&attr,worker_stack_size);
+	for(size_t k=0;k<workers.size();k++)
+	{
+		int err=pthread_create(&workers[k]->thread,&attr,worker_main,workers[k]);
+		if(err!=0)
+		{
+			mylog(log_fatal,"create thread for worker %d failed, %d:%s\n",(int)k,err,strerror(err));
+			myexit(-1);
+		}
+	}
+	pthread_attr_destroy(&attr);
+	pthread_sigmask(SIG_SETMASK,&old,0);
 
 	ev_run(loop, 0);
 	myexit(0);
@@ -2800,6 +3256,8 @@ void print_help()
 	printf("                                          above 256, bulk throughput rises and other connections wait longer\n");
 	printf("    --udp-gro                             receive UDP with UDP_GRO and forward merged packets with UDP_SEGMENT (GSO),\n");
 	printf("                                          Linux 5.0 or later, off by default\n");
+	printf("    --threads             <number|auto>   worker threads, >=1 and <=64, default 1; auto: the usable CPUs, at most 8.\n");
+	printf("                                          above 1, every rule gets one SO_REUSEPORT listener per worker (Linux 3.9+)\n");
 	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
 	printf("    --log-position                        enable file name, function name, line number in log\n");
@@ -2829,6 +3287,7 @@ void process_arg(int argc, char *argv[])
 		{"disable-splice", no_argument,    0, 1},
 		{"pipe-size", required_argument,    0, 1},
 		{"udp-gro", no_argument,    0, 1},
+		{"threads", required_argument,    0, 1},
 		{NULL, 0, 0, 0}
       };
     int option_index = 0;
@@ -3007,6 +3466,30 @@ void process_arg(int argc, char *argv[])
 			else if(strcmp(long_options[option_index].name,"udp-gro")==0)
 			{
 				udp_gro=1;
+			}
+			else if(strcmp(long_options[option_index].name,"threads")==0)
+			{
+				int tmp=-1;
+				if(strcmp(optarg,"auto")==0)
+				{
+					//可用的 CPU（taskset/cpuset 限制之后的），最多 worker_count_auto_max 个（D5）
+					cpu_set_t set;
+					CPU_ZERO(&set);
+					tmp=1;
+					if(sched_getaffinity(0,sizeof(set),&set)==0&&CPU_COUNT(&set)>0) tmp=CPU_COUNT(&set);
+					tmp=min(tmp,worker_count_auto_max);
+				}
+				else
+					sscanf(optarg,"%d",&tmp);
+				if(1<=tmp&&tmp<=worker_count_max)
+				{
+					worker_count=tmp;
+				}
+				else
+				{
+					mylog(log_fatal,"threads value must be between 1 and %d, or auto\n",worker_count_max);
+					myexit(-1);
+				}
 			}
 			else
 			{
