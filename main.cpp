@@ -1058,6 +1058,9 @@ struct worker_t:not_copy_able_t
 	std::deque<worker_msg_t> ctrl_queue;
 	pthread_t thread;
 	udp_batch_t udp_batch;
+	//建 UDP 会话碰上临时端口用完（connect 返回 EAGAIN）或 fd 用完（EMFILE/ENFILE）：到下一个定时器周期（worker_tick 清零）之前不再建。
+	//这两种失败与来源无关，下一个包注定同样失败；端口用完时每次 connect 都要扫完整个端口表（28232 个端口占满时约 1 ms，D80）
+	int udp_new_blocked;
 	worker_t(int i,struct ev_loop *l)
 	{
 		id=i;
@@ -1071,6 +1074,7 @@ struct worker_t:not_copy_able_t
 		memset(&ctrl_watcher,0,sizeof(ctrl_watcher));
 		memset(&thread,0,sizeof(thread));
 		pthread_mutex_init(&ctrl_mutex,0);
+		udp_new_blocked=0;
 	}
 };
 //worker_t 很大（udp_batch 约 4.2 MiB）：在 mmap 的匿名页上就地构造，进程生命周期内不释放（myexit 直接 _exit）。页面清零、按需分配：
@@ -2038,6 +2042,7 @@ static void worker_tick(worker_t &w)
 			ev_io_start(w.loop,&it->udp_accept_watcher);
 		}
 	}
+	w.udp_new_blocked=0;//建 UDP 会话同上（D80）；放在 clear_inactive 之后，过期会话刚还回的端口这一周期就能用上
 	w.tcp_pipe_pool.blocked=0;//创建 pipe 失败后每个周期最多再试一次（每次失败都会重新置位）
 	w.tcp_pipe_pool.grow_blocked=0;//扩容同上
 	if(w.tcp_pipe_pool.quota_hit)//复审 R1：配额满期间多留的空闲 pipe 裁回 max_free
@@ -2140,6 +2145,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 {
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
 	worker_t &w=*rule->worker;
+	if(w.udp_new_blocked) return 0;//D80：不占名额、不扩表、不推进轮询，也不记日志
 	//同 TCP（M4）：按本规则所有 worker 合计的会话数，先占一个名额，没建成会话的路径都还回去
 	if(conn_manager_udp.conns->fetch_add(1,memory_order_relaxed)>=max_conn_num)
 	{
@@ -2162,7 +2168,12 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	if(new_udp_fd==-1)
 	{
 		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
-		mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
+		if(errno==EAGAIN||errno==EMFILE||errno==ENFILE)
+		{
+			w.udp_new_blocked=1;
+			mylog(log_warn,"[udp]new connection from {%s},but no free local port or fd for udp fd (%s),not creating udp sessions until the next timer tick\n",tmp_addr.get_str(),get_sock_error());
+		}
+		else mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 		return 0;
 	}
 	//U5：回包经网卡时也聚合；失败时这个会话只是收不到合并包

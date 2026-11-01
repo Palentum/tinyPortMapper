@@ -690,6 +690,114 @@ func TestUDPMaxConn(t *testing.T) {
 	}
 }
 
+// hogEphemeralUDP 用 connect 自动绑定占满本网络命名空间的 UDP 临时端口，返回占用的个数与释放函数（用例结束时也会释放）。
+// 自动绑定失败时 connect 返回 EAGAIN（inet_dgram_connect），不是 TCP 的 EADDRNOTAVAIL
+func hogEphemeralUDP(t testing.TB) (int, func()) {
+	t.Helper()
+	var fds []int
+	release := func() {
+		for _, fd := range fds {
+			syscall.Close(fd)
+		}
+		fds = nil
+	}
+	t.Cleanup(release)
+	lo, hi := ephemeralRange()
+	sa := &syscall.SockaddrInet4{Port: 9, Addr: [4]byte{127, 0, 0, 1}}
+	for {
+		fd, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			t.Fatalf("占端口时建 socket 失败（已占 %d 个）：%v", len(fds), err)
+		}
+		if err := syscall.Connect(fd, sa); err != nil {
+			syscall.Close(fd)
+			if err != syscall.EAGAIN {
+				t.Fatalf("占端口时 connect 失败（已占 %d 个）：%v，期望端口用完时的 EAGAIN", len(fds), err)
+			}
+			return len(fds), release
+		}
+		fds = append(fds, fd)
+		if len(fds) > hi-lo+1 {
+			t.Fatalf("占了 %d 个端口仍未用完（临时端口范围 %d-%d）", len(fds), lo, hi)
+		}
+	}
+}
+
+// UDP 临时端口用完（审查 M4，D80）：建会话的 connect 自动绑定失败（EAGAIN），每次都要扫完整个端口表（默认 28232 个端口占满时约 1 ms），
+// 下一个包注定同样失败。失败后到下一个定时器周期（400 ms）之前这个 worker 不再建 UDP 会话：没有会话的来源连发的包不再每包扫一次、
+// 记两行日志；已有会话照常转发；端口释放后新来源在一个周期内建上会话。
+// 占满的是整个网络命名空间的临时端口，别的用例这期间建不了会话、拿不到自动绑定的端口：不调 t.Parallel()，在并行用例开始之前单独跑完
+func TestUDPPortExhaustion(t *testing.T) {
+	be := serveUDP(t, loopback4(t), "")
+	listen := loopback4(t)
+	m := forward(t, "u", listen, be.addr)
+	ra, err := net.ResolveUDPAddr("udp", listen)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 客户端绑在临时端口范围之外（freePort），占满端口之后照样能建
+	dial := func() *net.UDPConn {
+		c, err := net.DialUDP("udp", &net.UDPAddr{IP: net.IPv4(127, 0, 0, 1), Port: freePort(t)}, ra)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { c.Close() })
+		return c
+	}
+	old := dial()
+	udpEcho(t, old, []byte("before"))
+	n, release := hogEphemeralUDP(t)
+	t.Logf("占满 %d 个 UDP 临时端口", n)
+
+	fresh := dial()
+	const sends, gap = 200, 5 * time.Millisecond
+	start := time.Now()
+	for i := range sends {
+		if _, err := fresh.Write(fmt.Appendf(nil, "exhausted-%03d", i)); err != nil {
+			t.Fatal(err)
+		}
+		time.Sleep(gap)
+	}
+	elapsed := time.Since(start)
+	time.Sleep(logFlushWithin)
+	m.fatalIfExited(t, "端口用完期间")
+	fails := m.logLines("udp fd connect fail")
+	paused := m.logLines("[udp]new connection from", "not creating udp sessions until the next timer tick")
+	// 每个周期最多试一次：首尾两个不完整的周期再加 1 次余量
+	limit := int(elapsed/(400*time.Millisecond)) + 3
+	t.Logf("%v 内连发 %d 个包：connect 失败 %d 次，暂停日志 %d 行", elapsed.Round(time.Millisecond), sends, fails, paused)
+	if fails == 0 {
+		t.Fatalf("没有 connect 失败的日志：端口没占满？日志末尾：\n%s", m.logTail(10))
+	}
+	if fails > limit {
+		t.Errorf("connect 失败 %d 次，期望每个定时器周期至多 1 次（≤ %d）：失败后没有暂停建会话", fails, limit)
+	}
+	if paused != fails {
+		t.Errorf("暂停日志 %d 行，期望每次失败 1 行（%d）", paused, fails)
+	}
+	fresh.SetReadDeadline(time.Now().Add(50 * time.Millisecond))
+	if nr, err := fresh.Read(make([]byte, 64)); err == nil {
+		t.Errorf("端口用完时新来源收到 %d 字节回包", nr)
+	}
+	udpEcho(t, old, []byte("during"))
+
+	// 先让新来源再失败一次，在暂停期间释放端口：到下一个周期之前它的包照样丢，之后第一个包就建上会话（期间若刚好过了一个周期，立即建上）
+	if _, err := fresh.Write([]byte("blocked")); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+	release()
+	freed := time.Now()
+	got, err := udpTry(fresh, []byte("after"), 100*time.Millisecond, 20)
+	if err != nil {
+		t.Fatalf("释放端口后新来源仍建不了会话：%v", err)
+	}
+	if !bytes.Equal(got, []byte("after")) {
+		t.Fatalf("回包 %q，期望 %q", got, "after")
+	}
+	t.Logf("释放端口后 %v 建上会话", time.Since(freed).Round(time.Millisecond))
+}
+
 // ---- U1/U3：监听 socket 批量收包（recvmmsg）与按会话分组批量发送（sendmmsg）----
 //
 // 下面的用例在 tinymapper 暂停（SIGSTOP）期间把包逐个排进监听 socket 的接收队列，恢复后第一次回调就读到整批：每次 recvmmsg 最多

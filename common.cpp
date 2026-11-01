@@ -823,8 +823,10 @@ int address_t::new_connected_udp_fd()
 	mylog(log_debug, "created new udp_fd %d\n", new_udp_fd);
 	int ret = connect(new_udp_fd, (struct sockaddr *) &inner, get_len());
 	if (ret != 0) {
+		int err=errno;//调用方按 EAGAIN（自动绑定找不到空闲的临时端口）暂停建会话（D80）
 		mylog(log_warn, "udp fd connect fail %d %s\n",ret,get_sock_error() );
 		close(new_udp_fd);
+		errno=err;
 		return -1;
 	}
 
