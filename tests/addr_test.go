@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"io"
 	"net"
+	"net/netip"
 	"os"
 	"regexp"
 	"slices"
@@ -844,5 +845,66 @@ func TestDomainUnspecifiedRefresh(t *testing.T) {
 	}
 	if got := udpReplyFrom(t, udpDial(t, "", listen), "after"); got != "2" {
 		t.Fatalf("域名被拦截后新 UDP 会话应仍发往 127.0.0.2，实际 %q", got)
+	}
+}
+
+// D99：当前地址后来在本机没有路由了（IPv6 上联掉线、v6 路由消失），DNS 仍返回它时也要换成可达的地址；以前只要还在解析结果里就一直用它。
+// 域名同时有 127.0.0.2 与 lo 上的 2001:db8:99::1/128：两个都可达时 glibc、musl 都把 IPv6 排前（::/0 的 precedence 高于 IPv4），tinymapper 选 v6。
+// 不用 newLoAddrs6 的 fd00::/8：musl 给 ULA 的 precedence 是 3，低于 IPv4，启动时就选 v4。删掉 v6 地址（本机路由随之消失）后，
+// 下一次刷新（30 s）要换到 127.0.0.2
+func TestDomainUnroutableCurrent(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	needNetAdmin(t)
+	const name = "tpm-unroutable.test"
+	v6 := netip.MustParseAddr("2001:db8:99::1")
+	if err := setLoAddr6(true, v6); err != nil {
+		t.Fatalf("在 lo 上加 %s/128 失败：%v", v6, err)
+	}
+	t.Cleanup(func() { setLoAddr6(false, v6) }) // 用例里已经删掉，再删报 EADDRNOTAVAIL，忽略
+	waitLoAddr6(t, v6)
+	bport := freePort(t)
+	for _, b := range [][2]string{{v6.String(), "6"}, {"127.0.0.2", "4"}} {
+		serveTCP(t, hostPort(b[0], bport), echoHandler(b[1]+"\n"))
+		serveUDP(t, hostPort(b[0], bport), b[1])
+	}
+	hostsEntry(t, "127.0.0.2", name)
+	hostsEntry(t, v6.String(), name)
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
+	if got := readLine(t, dial(t, listen)); got != "6" {
+		t.Fatalf("两个地址都可达时应选 %s，实际连到后端 %q", v6, got)
+	}
+
+	if err := setLoAddr6(false, v6); err != nil {
+		t.Fatalf("删除 %s 失败：%v", v6, err)
+	}
+	start := time.Now()
+	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
+		c, err := net.DialTimeout("tcp", listen, ioTimeout)
+		if err != nil {
+			return err
+		}
+		defer c.Close()
+		c.SetReadDeadline(time.Now().Add(ioTimeout))
+		b := make([]byte, 2)
+		if _, err := io.ReadFull(c, b); err != nil {
+			return fmt.Errorf("%s 没有路由后新连接仍连不上：%v", v6, err)
+		}
+		if string(b) != "4\n" {
+			return fmt.Errorf("新连接连到后端 %q", b[:1])
+		}
+		return nil
+	})
+	t.Logf("删除 %s 后 %v 内切换到 127.0.0.2", v6, time.Since(start).Round(time.Second))
+	// 写到文件的日志每 400 ms 刷新一次
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if got, want := m.logLines("domain "+name+":", "changed from ["+v6.String()+"]:", "to 127.0.0.2:"), m.threads(); got != want {
+			return fmt.Errorf("changed from [%s] to 127.0.0.2 有 %d 行，期望 %d 行", v6, got, want)
+		}
+		return nil
+	})
+	if got := udpReplyFrom(t, udpDial(t, "", listen), "after"); got != "4" {
+		t.Fatalf("切换后新的 UDP 会话应发往 127.0.0.2，实际 %q", got)
 	}
 }

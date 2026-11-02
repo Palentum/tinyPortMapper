@@ -611,6 +611,28 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 	return 0;
 }
 
+//本机现在能否发往 addr（D99）：按它自己的地址族建 UDP socket 再 connect，只查路由、不发包，同 glibc 与 musl 1.1.20+ 排序时判断可用的办法。
+//fd、内存、临时端口不够只说明现在查不了，按可达算
+static int addr_routable(address_t addr)
+{
+	int fd=socket(addr.get_type(),SOCK_DGRAM|SOCK_CLOEXEC,IPPROTO_UDP);
+	if(fd<0) return errno==EMFILE||errno==ENFILE||errno==ENOBUFS||errno==ENOMEM;
+	int ret=connect(fd,(struct sockaddr*)&addr.inner,addr.get_len());
+	int err=errno;
+	close(fd);
+	return ret==0||err==EAGAIN||err==ENOBUFS||err==ENOMEM;
+}
+
+//从解析结果里选 remote 地址（D99）：current（仍在完整结果里时才传）可达就留着，否则取第一个可达的；都不可达时留着 current，没有 current 取 addrs[0]。
+//发布构建的 musl 1.1.16 用 v4 映射的 AF_INET6 socket 探测 IPv4，建不了 AF_INET6 socket 的机器上判不出任何候选可达，把 IPv6 排在 IPv4 前面（审查 Medium #10）
+address_t pick_remote_addr(const address_t *addrs,int addr_count,const address_t *current)
+{
+	if(current!=0&&addr_routable(*current)) return *current;
+	for(int i=0;i<addr_count;i++)
+		if(addr_routable(addrs[i])) return addrs[i];
+	return current!=0?*current:addrs[0];
+}
+
 int parse_remote_target(const char *str,address_t &addr,char *remote_host,int remote_host_len,u32_t &remote_port,int &remote_is_domain,char *err,int err_len)
 {
 	remote_is_domain=0;
@@ -725,7 +747,14 @@ int parse_remote_target(const char *str,address_t &addr,char *remote_host,int re
 	strcpy(remote_host,host);
 	remote_is_domain=1;
 	remote_port=port;
-	addr=addrs[0];
+	addr=pick_remote_addr(addrs,addr_count,0);
+	if(!(addr==addrs[0]))
+	{
+		char first[max_addr_len],picked[max_addr_len];
+		addrs[0].to_str(first);
+		addr.to_str(picked);
+		mylog(log_info,"remote %s:%u: %s is not routable from this host, using %s\n",host,port,first,picked);
+	}
 	return 0;
 }
 

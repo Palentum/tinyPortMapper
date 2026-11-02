@@ -1333,8 +1333,8 @@ static void dns_worker_main()
 		if(resolve_domain_addresses(request.host,request.port,addrs,dns_max_result,addr_count,err,sizeof(err),&request.current_addr,&current_found)==0)
 		{
 			result.ok=1;
-			result.current_still_valid=current_found;
-			result.next_addr=current_found?request.current_addr:addrs[0];
+			result.next_addr=pick_remote_addr(addrs,addr_count,current_found?&request.current_addr:0);
+			result.current_still_valid=result.next_addr==request.current_addr;
 		}
 		else
 		{

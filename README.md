@@ -64,10 +64,14 @@ and `hostname:port`; hostnames are resolved at startup and refreshed every
 30 seconds. Unspecified addresses in the answer (`0.0.0.0`, `::`, returned by
 filtering DNS servers and hosts blocklists for blocked names) are skipped; a
 hostname with no other address fails to resolve (fatal at startup, the current
-address is kept on refresh). `extra_remotes` is a Realm-style inline string array. `balance`
+address is kept on refresh). Of the remaining addresses, tinymapper uses one this
+host has a route to (checked with a UDP `connect`, which sends nothing): at
+startup the first one, on refresh the current one while it is still in the
+answer and routable. This keeps the release builds (musl 1.1.16) off IPv6 on
+hosts without IPv6, where their resolver sorts IPv6 first. `extra_remotes` is a Realm-style inline string array. `balance`
 supports `roundrobin` and `iphash`; the weight count must equal the total number
 of `remote` plus `extra_remotes` targets. When an active resolved address
-disappears from DNS results, new connections use the new address; connections
+disappears from DNS results or loses its route, new connections use the new address; connections
 that selected the old address are kept while they still work and closed once
 they stop responding (TCP: 3 unanswered retransmissions or probes; UDP: no reply
 for 10 seconds), checked at the change and every 30 seconds. JSON config,
