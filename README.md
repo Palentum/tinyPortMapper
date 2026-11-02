@@ -4,7 +4,7 @@ A Lightweight High-Performance Port Mapping/Forwarding Utility using epoll, Supp
 # Supported Platforms
 Linux only (including desktop/server Linux, Android phone/tablet, OpenWRT router, or Raspberry PI). Windows, macOS, FreeBSD and Cygwin builds are not supported. Binaries of `amd64` `x86` `mips_be` `mips_le` `arm` are provided.
 
-Build with `make all` on Linux. On a non-Linux development machine, `docker/build.sh` builds the same binaries inside Linux containers.
+Build with `make all` on Linux. It links statically, except against glibc older than 2.34 (for example Debian 11, Ubuntu 20.04 or RHEL 8), where it links dynamically: on Debian and Ubuntu, hostname remotes do not work in a static binary built against such a glibc. On a non-Linux development machine, `docker/build.sh` builds the same binaries inside Linux containers.
 
 # Getting Started
 

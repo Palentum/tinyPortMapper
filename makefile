@@ -17,6 +17,10 @@ NAME=tinymapper
 FLAGS= -std=c++11   -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-missing-field-initializers ${OPT} -pthread
 TARGETS=amd64 arm mips24kc_be x86  mips24kc_le
 
+#glibc 2.34 以前 all 改为动态链接（D95）：Debian/Ubuntu 上静态链接时 libstdc++ 经弱符号调用的 pthread_cond_*、pthread_detach 不会被链进来，有域名 remote
+#时启动即崩溃；NSS 另外载入的 libc.so.6 在 DNS 线程里也没有初始化，刷新时 getaddrinfo 崩溃或查不到 /etc/hosts。\043 即 #（make 4.3 前后 \# 的含义不同）
+old_glibc=$(shell printf '\043include <features.h>\n\043if defined(__GLIBC__) && !__GLIBC_PREREQ(2,34)\nyes\n\043endif\n' | ${cc_local} -E -P -x c++ - 2>/dev/null)
+
 TAR=${NAME}_binaries.tar.gz `echo ${TARGETS}|sed -r 's/([^ ]+)/${NAME}_\1/g'` version.txt
 
 export STAGING_DIR=/tmp/    #just for supress warning of staging_dir not define
@@ -24,9 +28,11 @@ export STAGING_DIR=/tmp/    #just for supress warning of staging_dir not define
 # targets for nativei (non-cross) compile 
 all:git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb -static -O2
+	$(if ${old_glibc},@echo "glibc < 2.34: linking ${NAME} dynamically (a static build against it can crash with hostname remotes)")
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb $(if ${old_glibc},,-static) -O2
 
 #targes for general cross compile
+#cross2、cross3 静态链接 arm-2014.05 的 glibc（2.34 以前），有域名 remote 时不能用（D95），这时用 cross
 
 cross:git_version
 	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -O2

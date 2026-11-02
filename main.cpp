@@ -1156,8 +1156,8 @@ struct worker_t:not_copy_able_t
 	ev_prepare udp_flush_watcher;//每轮阻塞之前发出回程批（U4），有规则开 UDP 时才 start
 	ev_timer tick_timer;//每 timer_interval 跑一次 worker_tick()（L7）
 	ev_async ctrl_watcher;//主线程发来消息时唤醒（S4）
-	//直接用 pthread 的锁（审查 I-5）：libstdc++ 的 std::mutex 在 _GLIBCXX_GTHREAD_USE_WEAK 为 1 的工具链上靠弱符号判断是否多线程，
-	//静态链接的 musl 里判断为否时加解锁全是空操作（OpenWRT SDK 的 GCC 5.4 没法在这里核对）
+	//直接用 pthread 的锁（审查 I-5）：libstdc++ 的 std::mutex 在 _GLIBCXX_GTHREAD_USE_WEAK 为 1 的工具链上靠弱符号判断是否多线程。
+	//OpenWRT SDK 的 GCC 5.4 与 Alpine 对 musl 都定义为 0，是真锁（D97）；为 1 的是 glibc<2.34，all 在那里动态链接（D95）
 	pthread_mutex_t ctrl_mutex;
 	std::deque<worker_msg_t> ctrl_queue;
 	pthread_t thread;
