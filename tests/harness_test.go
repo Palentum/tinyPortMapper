@@ -96,6 +96,21 @@ func inContainer(t testing.TB) {
 	}
 }
 
+// useLocalResolver 把容器的 /etc/resolv.conf 原地改成只用 127.0.0.1:53、每次查询最多等 30 s（timeout:30 attempts:1），用例结束时改回。
+// 调用的用例不能并行：并行的用例解析 /etc/hosts 之外的名字时会被它卡住
+func useLocalResolver(t testing.TB) {
+	t.Helper()
+	old, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 原地改写：容器的 /etc/resolv.conf 是 Docker bind mount 进来的文件
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 127.0.0.1\noptions timeout:30 attempts:1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.WriteFile("/etc/resolv.conf", old, 0644) })
+}
+
 // heavy 须在 t.Parallel() 之后调用，用例结束时自动释放
 func heavy(t testing.TB) {
 	heavySem <- struct{}{}

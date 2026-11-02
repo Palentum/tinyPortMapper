@@ -48,6 +48,8 @@ static app_config_t app_config;
 
 int listen_fd_buf_size=2*1024*1024;//UDP 监听 socket 的 SO_SNDBUF/SO_RCVBUF，--udp-listen-buf
 static const u32_t dns_refresh_interval=30000;
+//DNS 线程数取引用的域名个数，最多这么多（D108）：getaddrinfo 没有截止时间（glibc 的 TCP 回退可能永远不返回），一个线程只卡一个域名
+static const int dns_thread_max=4;
 //DNS 换掉的旧地址上的 UDP 会话：客户端发来的包这么久没等到一个回包就算不可用（remote_sweep）
 static const my_time_t udp_unans_timeout=10000;
 //同上，TCP：上游 socket 连续超时重传（含 SYN）或零窗口探测没有应答到这么多次就算不可用
@@ -1262,13 +1264,19 @@ static int tcp_pipe_trim(worker_t &w)
 	if(n>0) mylog(log_debug,"[tcp]out of file descriptors, closed %d idle pipes\n",n);
 	return n;
 }
-struct dns_refresh_request_t
+struct dns_refresh_entry_t
 {
 	int rule_index;
 	int remote_index;
-	char host[max_domain_len];
 	u32_t port;
 	address_t current_addr;
+};
+
+//一个域名一个请求（D108）：引用它的各（规则，remote）一起查一次
+struct dns_refresh_request_t
+{
+	char host[max_domain_len];
+	std::vector<dns_refresh_entry_t> entries;
 };
 
 struct dns_refresh_result_t
@@ -1284,7 +1292,6 @@ struct dns_refresh_result_t
 };
 
 static ev_async dns_async_watcher;
-static std::thread dns_thread;
 static std::mutex dns_mutex;
 static std::condition_variable dns_cv;
 static std::deque<dns_refresh_request_t> dns_requests;
@@ -1302,10 +1309,18 @@ struct dns_target_t
 	address_t addr;
 	my_time_t last_dns_refresh_time;
 	int dns_query_pending;
+	int dns_stuck_warned;//这次查询已超过 2 个刷新周期没有返回、记过 warn（结果到达时清零）
 };
 static vector<dns_target_t> dns_targets;
 static loop_clock_t main_clock;//主线程（默认 loop）自己的时间缓存：不能跨线程读 worker 的 loop（§6.5"时间"）
 
+static void set_addr_port(address_t &addr,u32_t port)
+{
+	if(addr.get_type()==AF_INET) addr.inner.ipv4.sin_port=htons((u16_t)port);
+	else if(addr.get_type()==AF_INET6) addr.inner.ipv6.sin6_port=htons((u16_t)port);
+}
+
+//DNS 线程（D108，最多 dns_thread_max 个）：一个请求查一次，按各项的端口与当前地址拆成各项的结果，一次加锁全部交给主线程
 static void dns_worker_main()
 {
 	for(;;)
@@ -1321,33 +1336,54 @@ static void dns_worker_main()
 			dns_requests.pop_front();
 		}
 
-		dns_refresh_result_t result;
-		memset(&result,0,sizeof(result));
-		result.rule_index=request.rule_index;
-		result.remote_index=request.remote_index;
-		snprintf(result.host,sizeof(result.host),"%s",request.host);
-		result.port=request.port;
-
+		//解析结果带 entries[0] 的端口：各项的当前地址换成这个端口再找
+		int n=(int)request.entries.size();
+		u32_t port=request.entries[0].port;
+		std::vector<address_t> find(n);
+		std::vector<int> found(n);
+		for(int k=0;k<n;k++)
+		{
+			find[k]=request.entries[k].current_addr;
+			set_addr_port(find[k],port);
+		}
 		address_t addrs[dns_max_result];
 		int addr_count=0;
-		int current_found=0;
 		char err[dns_error_len];
-		if(resolve_domain_addresses(request.host,request.port,addrs,dns_max_result,addr_count,err,sizeof(err),&request.current_addr,&current_found)==0)
+		int ret=resolve_domain_addresses(request.host,port,addrs,dns_max_result,addr_count,err,sizeof(err),&find[0],&found[0],n);
+
+		std::vector<dns_refresh_result_t> results(n);
+		for(int k=0;k<n;k++)
 		{
-			result.ok=1;
-			result.next_addr=pick_remote_addr(addrs,addr_count,current_found?&request.current_addr:0);
-			result.current_still_valid=result.next_addr==request.current_addr;
-		}
-		else
-		{
-			result.ok=0;
-			result.current_still_valid=0;
-			snprintf(result.err,sizeof(result.err),"%s",err);
+			const dns_refresh_entry_t &entry=request.entries[k];
+			dns_refresh_result_t &result=results[k];
+			memset(&result,0,sizeof(result));
+			result.rule_index=entry.rule_index;
+			result.remote_index=entry.remote_index;
+			snprintf(result.host,sizeof(result.host),"%s",request.host);
+			result.port=entry.port;
+			if(ret==0)
+			{
+				address_t entry_addrs[dns_max_result];
+				for(int i=0;i<addr_count;i++)
+				{
+					entry_addrs[i]=addrs[i];
+					set_addr_port(entry_addrs[i],entry.port);
+				}
+				result.ok=1;
+				result.next_addr=pick_remote_addr(entry_addrs,addr_count,found[k]?&entry.current_addr:0);
+				result.current_still_valid=result.next_addr==entry.current_addr;
+			}
+			else
+			{
+				result.ok=0;
+				result.current_still_valid=0;
+				snprintf(result.err,sizeof(result.err),"%s",err);
+			}
 		}
 
 		{
 			std::lock_guard<std::mutex> lock(dns_mutex);
-			dns_results.push_back(result);
+			dns_results.insert(dns_results.end(),results.begin(),results.end());
 		}
 		ev_async_send(dns_loop,&dns_async_watcher);
 	}
@@ -1374,6 +1410,12 @@ static void dns_apply_result(dns_refresh_result_t &result)
 		return;
 	}
 	t->dns_query_pending=0;
+	if(t->dns_stuck_warned)
+	{
+		for(size_t j=0;j<dns_targets.size();j++)
+			if(strcmp(dns_targets[j].host,t->host)==0) dns_targets[j].dns_stuck_warned=0;
+		mylog(log_info,"domain %s: lookup returned after %d s\n",t->host,(int)((main_clock.now()-t->last_dns_refresh_time)/1000));
+	}
 
 	if(result.ok==0)
 	{
@@ -1505,18 +1547,30 @@ static void start_dns_worker(struct ev_loop *loop)
 	ev_async_init(&dns_async_watcher,dns_result_cb);
 	ev_async_start(loop,&dns_async_watcher);
 	dns_worker_started=1;
-	try
+	//每个域名同时最多一个请求在途（schedule_dns_refresh），线程比域名多也用不上：一个域名的查询卡住只占一个线程
+	int hosts=0;
+	for(size_t i=0;i<dns_targets.size();i++)
 	{
-		dns_thread=std::thread(dns_worker_main);
+		size_t j=0;
+		while(j<i&&strcmp(dns_targets[j].host,dns_targets[i].host)!=0) j++;
+		if(j==i) hosts++;
 	}
-	catch(const std::system_error &e)//建不出线程（RLIMIT_NPROC、cgroup pids.max、内存）：与 worker 线程一样记 fatal 退出，不走 terminate/abort（D106）
+	int n=hosts<dns_thread_max?hosts:dns_thread_max;
+	for(int k=0;k<n;k++)
 	{
-		mylog(log_fatal,"create DNS thread failed, %d:%s\n",e.code().value(),e.code().message().c_str());
-		myexit(-1);
+		try
+		{
+			std::thread(dns_worker_main).detach();
+		}
+		catch(const std::system_error &e)//建不出线程（RLIMIT_NPROC、cgroup pids.max、内存）：与 worker 线程一样记 fatal 退出，不走 terminate/abort（D106）
+		{
+			mylog(log_fatal,"create DNS thread failed, %d:%s\n",e.code().value(),e.code().message().c_str());
+			myexit(-1);
+		}
 	}
-	dns_thread.detach();
 }
 
+//同一域名的各项合并为一个请求（D108）：一起入队、结果一起回来，此后一直同步
 static void schedule_dns_refresh()
 {
 	my_time_t now=main_clock.now();
@@ -1525,6 +1579,13 @@ static void schedule_dns_refresh()
 		dns_target_t &target=dns_targets[i];
 		if(target.dns_query_pending)
 		{
+			//同一域名的各项同步：每个域名每次卡住只记一行
+			if(!target.dns_stuck_warned&&now-target.last_dns_refresh_time>=2*dns_refresh_interval)
+			{
+				for(size_t j=0;j<dns_targets.size();j++)
+					if(strcmp(dns_targets[j].host,target.host)==0) dns_targets[j].dns_stuck_warned=1;
+				mylog(log_warn,"domain %s: no lookup result for %d s, keeping current address\n",target.host,(int)((now-target.last_dns_refresh_time)/1000));
+			}
 			continue;
 		}
 		if(now-target.last_dns_refresh_time<dns_refresh_interval)
@@ -1532,18 +1593,27 @@ static void schedule_dns_refresh()
 			continue;
 		}
 		dns_refresh_request_t request;
-		memset(&request,0,sizeof(request));
-		request.rule_index=target.rule_index;
-		request.remote_index=target.remote_index;
 		snprintf(request.host,sizeof(request.host),"%s",target.host);
-		request.port=target.port;
-		request.current_addr=target.addr;
+		for(size_t j=0;j<dns_targets.size();j++)
+		{
+			dns_target_t &t=dns_targets[j];
+			if(t.dns_query_pending||strcmp(t.host,target.host)!=0)
+			{
+				continue;
+			}
+			dns_refresh_entry_t entry;
+			entry.rule_index=t.rule_index;
+			entry.remote_index=t.remote_index;
+			entry.port=t.port;
+			entry.current_addr=t.addr;
+			request.entries.push_back(entry);
+			t.dns_query_pending=1;
+			t.last_dns_refresh_time=now;
+		}
 		{
 			std::lock_guard<std::mutex> lock(dns_mutex);
 			dns_requests.push_back(request);
 		}
-		target.dns_query_pending=1;
-		target.last_dns_refresh_time=now;
 		dns_cv.notify_one();
 	}
 }
@@ -3663,6 +3733,7 @@ int event_loop()
 			target.addr=config_target.addr;
 			target.last_dns_refresh_time=now;
 			target.dns_query_pending=0;
+			target.dns_stuck_warned=0;
 			dns_targets.push_back(target);
 		}
 	}

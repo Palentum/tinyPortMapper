@@ -534,7 +534,7 @@ int address_t::from_str(const char *str,char *err,int err_len)
 	return 0;
 }
 
-int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find,int *found)
+int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find,int *found,int find_count)
 {
 	addr_count=0;
 	if(host==0||host[0]==0)
@@ -565,7 +565,7 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 
 	if(found!=0)
 	{
-		*found=0;
+		for(int k=0;k<find_count;k++) found[k]=0;
 	}
 	int unspecified=0;
 	//只存前 max_addrs 条，但 find 要在完整结果里找：RRset 轮转会把它排到 max_addrs 条之后（审查 Medium #8）
@@ -590,9 +590,10 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 		{
 			addr.inner.ipv6.sin6_port=htons((u16_t)port);
 		}
-		if(find!=0&&addr==*find)
+		if(find!=0)
 		{
-			*found=1;
+			for(int k=0;k<find_count;k++)
+				if(addr==find[k]) found[k]=1;
 		}
 		if(addr_count<max_addrs)
 		{

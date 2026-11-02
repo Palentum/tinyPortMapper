@@ -457,8 +457,10 @@ func domainUnresponsive(t *testing.T, mode string, last byte) {
 }
 
 // 审查 Medium #8（D92）：解析结果超过 16 条时，当前地址被 RRset 轮转排到前 16 条之外、但仍在结果里，不算地址变化；
-// 真的从结果里消失才切换。三条规则在同一轮刷新：rot 把当前地址轮转到下标 17，gone 删掉当前地址，mark 是单条记录的标记域名。
-// DNS 请求按规则顺序排队、由一个线程依次解析，每个 worker 按顺序处理地址变化：mark 的 changed from 到齐时，前两条规则的结果都已生效
+// 真的从结果里消失才切换。四条规则在同一轮刷新：rot 把当前地址轮转到下标 17，gone 删掉当前地址，mark 是单条记录的标记域名。
+// rot 被两条后端端口不同的规则引用，合并为一次查询（D108），第二条的当前地址要换成第一条的端口再在结果里找。
+// 三个域名的查询同时入队、分在不同的 DNS 线程上（D108），结果到达的先后不定：等 gone 与 mark 的 changed from 都到齐，rot 没有日志可等，
+// 再等 2 s（三个都是 /etc/hosts 里的名字，毫秒级返回）
 func TestDomainRefreshLargeRRset(t *testing.T) {
 	t.Parallel()
 	inContainer(t)
@@ -471,19 +473,25 @@ func TestDomainRefreshLargeRRset(t *testing.T) {
 		return s
 	}
 	rotIPs, goneIPs := ips(9, 20), ips(10, 21) // goneIPs[20] 是删除后顶替的地址
-	bport := freePort(t)
+	bport, bport2 := freePort(t), freePort(t)
 	for _, ip := range append(slices.Clone(rotIPs), goneIPs...) {
 		serveTCP(t, hostPort(ip, bport), echoHandler(ip+"\n"))
+	}
+	for _, ip := range rotIPs {
+		serveTCP(t, hostPort(ip, bport2), echoHandler(ip+"\n"))
 	}
 	setRot := hostsBlock(t, rot, rotIPs)
 	setGone := hostsBlock(t, gone, goneIPs[:20])
 	setMark := hostsEntry(t, "127.0.11.2", mark)
-	lRot, lGone, lMark := loopback4(t), loopback4(t), loopback4(t)
+	lRot, lRot2, lGone, lMark := loopback4(t), loopback4(t), loopback4(t), loopback4(t)
 	var cfg strings.Builder
 	var wait []listenPoint
-	for _, e := range [][2]string{{lRot, rot}, {lGone, gone}, {lMark, mark}} {
-		fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = \"%s:%d\"\n\n", e[0], e[1], bport)
-		wait = append(wait, listenPoints("t", portOf(e[0]))...)
+	for _, e := range []struct {
+		listen, host string
+		port         int
+	}{{lRot, rot, bport}, {lRot2, rot, bport2}, {lGone, gone, bport}, {lMark, mark, bport}} {
+		fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = \"%s:%d\"\n\n", e.listen, e.host, e.port)
+		wait = append(wait, listenPoints("t", portOf(e.listen))...)
 	}
 	m := startMapper(t, wait, "-c", writeConfig(t, cfg.String()))
 	start := time.Now()
@@ -501,12 +509,15 @@ func TestDomainRefreshLargeRRset(t *testing.T) {
 	setMark('3')
 	workers := m.threads()
 	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
-		if got := m.logLines("domain "+mark+":", "changed from"); got < workers {
-			return fmt.Errorf("%s 的 changed from 有 %d 行，应有 %d 行", mark, got, workers)
+		for _, name := range []string{gone, mark} {
+			if got := m.logLines("domain "+name+":", "changed from"); got < workers {
+				return fmt.Errorf("%s 的 changed from 有 %d 行，应有 %d 行", name, got, workers)
+			}
 		}
 		return nil
 	})
 	t.Logf("修改 /etc/hosts 后 %v 内完成一轮刷新", time.Since(start).Round(time.Second))
+	time.Sleep(2 * time.Second)
 
 	// rot 这一轮解析失败时只记一行 warn、保留当前地址，下面的断言会空过
 	if got := m.logLines("domain "+rot+":", "resolve failed"); got != 0 {
@@ -516,8 +527,10 @@ func TestDomainRefreshLargeRRset(t *testing.T) {
 		t.Fatalf("%s 的当前地址轮转到下标 17（仍在解析结果里），却被当作地址变化（%d 行）：\n%s", rot, got, m.logTail(10))
 	}
 	mustEcho(t, oldRot, "still")
-	if got := readLine(t, dial(t, lRot)); got != rotIPs[0] {
-		t.Fatalf("%s 的新连接应仍连到 %s，实际 %q", rot, rotIPs[0], got)
+	for _, l := range []string{lRot, lRot2} {
+		if got := readLine(t, dial(t, l)); got != rotIPs[0] {
+			t.Fatalf("%s 经 %s 的新连接应仍连到 %s，实际 %q", rot, l, rotIPs[0], got)
+		}
 	}
 
 	if got := m.logLines("domain "+gone+":", "changed from "+goneIPs[0]+":", "to "+goneIPs[20]+":"); got != workers {
@@ -539,6 +552,257 @@ func TestDomainRefreshLargeRRset(t *testing.T) {
 	if got := readLine(t, dial(t, lGone)); got != goneIPs[20] {
 		t.Fatalf("%s 的新连接应连到 %s，实际 %q", gone, goneIPs[20], got)
 	}
+}
+
+// fakeDNS 是 127.0.0.1:53 上的进程内假 DNS（UDP，手拼报文，TTL 0）：a 里的名字答一条 A 记录、AAAA 答 NODATA，drop 里的名字不回，
+// tc 里的名字答 TC=1 的空应答（解析器改走 TCP），其他名字 NXDOMAIN；aq 按名字记收到的 A 查询数
+type fakeDNS struct {
+	mu   sync.Mutex
+	a    map[string]net.IP
+	drop map[string]bool
+	tc   map[string]bool
+	aq   map[string]int
+}
+
+// startFakeDNS 启动 fakeDNS，把容器的 /etc/resolv.conf 原地改成只用它、每次查询最多等 30 s（timeout:30 attempts:1，glibc 与 musl
+// 都是不回时等满 30 s 返回失败），用例结束时改回。改写 /etc/resolv.conf、占用 127.0.0.1:53 的用例不能并行：
+// 并行的用例解析 /etc/hosts 之外的名字时会被它卡住
+func startFakeDNS(t testing.TB) *fakeDNS {
+	t.Helper()
+	pc, err := net.ListenPacket("udp", "127.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	d := &fakeDNS{a: map[string]net.IP{}, drop: map[string]bool{}, tc: map[string]bool{}, aq: map[string]int{}}
+	go func() {
+		buf := make([]byte, 1500)
+		for {
+			n, src, err := pc.ReadFrom(buf)
+			if err != nil {
+				return
+			}
+			if r := d.reply(buf[:n]); r != nil {
+				pc.WriteTo(r, src)
+			}
+		}
+	}()
+	useLocalResolver(t)
+	return d
+}
+
+func (d *fakeDNS) reply(q []byte) []byte {
+	if len(q) < 12 || q[2]&0x80 != 0 || binary.BigEndian.Uint16(q[4:]) != 1 {
+		return nil
+	}
+	var labels []string
+	i := 12
+	for {
+		if i >= len(q) {
+			return nil
+		}
+		l := int(q[i])
+		i++
+		if l == 0 {
+			break
+		}
+		if l&0xc0 != 0 || i+l > len(q) {
+			return nil
+		}
+		labels = append(labels, strings.ToLower(string(q[i:i+l])))
+		i += l
+	}
+	if i+4 > len(q) {
+		return nil
+	}
+	name, qtype, qend := strings.Join(labels, "."), binary.BigEndian.Uint16(q[i:]), i+4
+	d.mu.Lock()
+	ip, ok := d.a[name]
+	drop, tc := d.drop[name], d.tc[name]
+	if qtype == 1 {
+		d.aq[name]++
+	}
+	d.mu.Unlock()
+	if drop {
+		return nil
+	}
+	r := make([]byte, 12, 512)
+	copy(r, q[:2])
+	r[2] = 0x80 | q[2]&0x79 | 0x04 // QR，沿用 opcode 与 RD，AA
+	r[3] = 0x80                    // RA
+	if !ok {
+		r[3] |= 3 // NXDOMAIN
+	}
+	binary.BigEndian.PutUint16(r[4:], 1)
+	r = append(r, q[12:qend]...)
+	if tc {
+		r[2] |= 0x02
+		return r
+	}
+	if ok && qtype == 1 {
+		binary.BigEndian.PutUint16(r[6:], 1)
+		r = append(r, 0xc0, 0x0c, 0, 1, 0, 1, 0, 0, 0, 0, 0, 4) // 指回问题里的名字，A，IN，TTL 0
+		r = append(r, ip.To4()...)
+	}
+	return r
+}
+
+// 审查 Low（D108）：一个域名的查询很慢时，别的域名照常每 30 s 刷新。四条规则：slow.hol.test 被规则 1、2 引用，mover.hol.test 被规则 3、4
+// 引用（各规则端口不同）；启动时都正常应答，之后 slow 不再回（每次查询等满 30 s），mover 的 A 记录从 127.0.3.1 换到 127.0.3.2。
+// 修复前所有请求在一个 DNS 线程里按（规则，remote）依次各查一次，mover 要排在 slow 的两次超时之后，约 90 s 才换地址；
+// 修复后同一域名合并为一次查询、不同域名在不同线程上查，mover 在第一轮刷新（约 30 s，slow 的查询还没返回）就换，这一轮只收到一个 A 查询，
+// 两条规则的新连接都连到 127.0.3.2。改写 /etc/resolv.conf，不并行（startFakeDNS）
+func TestDomainRefreshSlowHost(t *testing.T) {
+	inContainer(t)
+	const slowName, mover = "slow.hol.test", "mover.hol.test"
+	d := startFakeDNS(t)
+	d.mu.Lock()
+	d.a[slowName] = net.IPv4(127, 0, 3, 9)
+	d.a[mover] = net.IPv4(127, 0, 3, 1)
+	d.mu.Unlock()
+	var listens [4]string
+	var ports [4]int
+	var cfg strings.Builder
+	var wait []listenPoint
+	for i := range listens {
+		name := slowName
+		listens[i], ports[i] = loopback4(t), freePort(t)
+		if i >= 2 {
+			name = mover
+			for _, id := range []string{"1", "2"} {
+				serveTCP(t, hostPort("127.0.3."+id, ports[i]), echoHandler(id+"\n"))
+			}
+		}
+		fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = \"%s:%d\"\n\n", listens[i], name, ports[i])
+		wait = append(wait, listenPoints("t", portOf(listens[i]))...)
+	}
+	m := startMapper(t, wait, "-c", writeConfig(t, cfg.String()))
+	for i := 2; i < 4; i++ {
+		if got := readLine(t, dial(t, listens[i])); got != "1" {
+			t.Fatalf("启动时规则 %d 应连到 127.0.3.1，实际连到后端 %q", i+1, got)
+		}
+	}
+	d.mu.Lock()
+	d.drop[slowName] = true
+	d.a[mover] = net.IPv4(127, 0, 3, 2)
+	d.aq[slowName], d.aq[mover] = 0, 0
+	d.mu.Unlock()
+	start := time.Now()
+
+	workers := m.threads()
+	changed := func(i int) string {
+		return fmt.Sprintf("rule %d remote 0 domain %s:%d changed from 127.0.3.1:%d to 127.0.3.2:%d,", i+1, mover, ports[i], ports[i], ports[i])
+	}
+	eventually(t, 45*time.Second, 200*time.Millisecond, func() error {
+		for i := 2; i < 4; i++ {
+			if got := m.logLines(changed(i)); got < workers {
+				return fmt.Errorf("规则 %d 的 changed from 有 %d 行，应有 %d 行（每个 worker 一行）", i+1, got, workers)
+			}
+		}
+		return nil
+	})
+	t.Logf("改应答后 %v 两条规则都换到新地址", time.Since(start).Round(time.Second))
+	time.Sleep(time.Second) // 再等两个定时器周期：这一轮不能再查 mover，也不能广播两次
+	d.mu.Lock()
+	aSlow, aMover := d.aq[slowName], d.aq[mover]
+	d.mu.Unlock()
+	if aMover != 1 {
+		t.Errorf("这一轮 %s 收到 %d 个 A 查询，期望 1 个（规则 3、4 合并为一次查询）", mover, aMover)
+	}
+	if aSlow == 0 || m.logLines("domain "+slowName+":", "resolve failed") != 0 {
+		t.Fatalf("%s 在这一轮应已查询、还没超时（A 查询 %d 个），用例没有测到慢查询：\n%s", slowName, aSlow, m.logTail(10))
+	}
+	for i := 2; i < 4; i++ {
+		if got := m.logLines(changed(i)); got != workers {
+			t.Errorf("规则 %d 的 changed from 有 %d 行，期望恰好 %d 行", i+1, got, workers)
+		}
+		if got := readLine(t, dial(t, listens[i])); got != "2" {
+			t.Fatalf("地址变化后规则 %d 的新连接连到后端 %q，期望 127.0.3.2", i+1, got)
+		}
+	}
+}
+
+// D109：一个域名的查询在途超过 2 个刷新周期时记一行 warn（每次卡住只记一行），结果到达时记一行 info。启动后 UDP 应答改为
+// TC=1，glibc 改走 TCP，假 DNS 接受连接但不回：glibc 的 TCP 读没有超时，查询一直不返回。看到 warn 后关掉 TCP 监听与连接，查询失败返回。
+// musl 的 TCP 回退也算在 timeout 里，每次查询最多 30 s，卡不到 2 个刷新周期，只在 glibc 上测。约 95 s。改写 /etc/resolv.conf，不并行
+func TestDomainRefreshStuckWarn(t *testing.T) {
+	slow(t)
+	inContainer(t)
+	if os.Getenv("TPM_VARIANT") != "glibc" {
+		t.Skip("musl 每次查询最多等 timeout（含 TCP 回退），查询卡不住")
+	}
+	const name = "stuck.hol.test"
+	ln, err := net.Listen("tcp", "127.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var held []net.Conn
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			mu.Lock()
+			held = append(held, c)
+			mu.Unlock()
+		}
+	}()
+	release := func() {
+		ln.Close()
+		mu.Lock()
+		for _, c := range held {
+			c.Close()
+		}
+		mu.Unlock()
+	}
+	t.Cleanup(release)
+	d := startFakeDNS(t)
+	d.mu.Lock()
+	d.a[name] = net.IPv4(127, 0, 3, 9)
+	d.mu.Unlock()
+	m := forward(t, "t", loopback4(t), fmt.Sprintf("%s:%d", name, freePort(t)))
+	d.mu.Lock()
+	d.tc[name] = true
+	d.mu.Unlock()
+	start := time.Now()
+
+	warn := regexp.MustCompile(`domain ` + regexp.QuoteMeta(name) + `: no lookup result for (\d+) s, keeping current address$`)
+	warnLines := func() []string {
+		data, _ := os.ReadFile(m.logPath)
+		var s []string
+		for _, line := range strings.Split(string(data), "\n") {
+			if w := warn.FindStringSubmatch(line); w != nil {
+				s = append(s, w[1])
+			}
+		}
+		return s
+	}
+	eventually(t, 100*time.Second, 200*time.Millisecond, func() error {
+		if len(warnLines()) == 0 {
+			return fmt.Errorf("没有 no lookup result 行：\n%s", m.logTail(5))
+		}
+		return nil
+	})
+	t.Logf("改应答后 %v 记 warn", time.Since(start).Round(time.Second))
+	time.Sleep(time.Second) // 再等两个定时器周期：同一次卡住只记一行
+	if w := warnLines(); len(w) != 1 || (w[0] != "60" && w[0] != "61") {
+		t.Errorf("warn 行等待秒数 %v，期望恰好一行、60 s", w)
+	}
+	mu.Lock()
+	n := len(held)
+	mu.Unlock()
+	if n == 0 || m.logLines("domain "+name+":", "resolve failed") != 0 {
+		t.Fatalf("查询应卡在 TCP 上（%d 条连接）、还没返回：\n%s", n, m.logTail(10))
+	}
+	release()
+	eventually(t, 10*time.Second, 100*time.Millisecond, func() error {
+		if m.logLines("domain "+name+": lookup returned after 6") != 1 || m.logLines("domain "+name+":", "resolve failed") != 1 {
+			return fmt.Errorf("关掉 TCP 连接后应各有一行 lookup returned after 6x s 与 resolve failed：\n%s", m.logTail(5))
+		}
+		return nil
+	})
 }
 
 // udpSockets 返回进程 pid 持有的 UDP socket 个数（sock_diag 列出的 IPv4、IPv6 UDP socket 中 inode 属于该进程的；原来读 /proc/net/udp，

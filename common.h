@@ -258,8 +258,8 @@ struct address_t  //TODO scope id
 
     int new_connected_udp_fd();
 };
-//find 非空时，*found 表示 find 是否在完整解析结果里（不只是存下的前 max_addrs 条）
-int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find=0,int *found=0);
+//find 非空时，found[k] 表示 find[k]（k < find_count）是否在完整解析结果里（不只是存下的前 max_addrs 条）
+int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find=0,int *found=0,int find_count=1);
 address_t pick_remote_addr(const address_t *addrs,int addr_count,const address_t *current);
 int parse_remote_target(const char *str,address_t &addr,char *remote_host,int remote_host_len,u32_t &remote_port,int &remote_is_domain,char *err,int err_len);
 

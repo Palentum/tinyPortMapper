@@ -131,15 +131,7 @@ func TestStartupSignal(t *testing.T) {
 			}
 		}
 	}()
-	old, err := os.ReadFile("/etc/resolv.conf")
-	if err != nil {
-		t.Fatal(err)
-	}
-	// 原地改写：容器的 /etc/resolv.conf 是 Docker bind mount 进来的文件
-	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 127.0.0.1\noptions timeout:30 attempts:1\n"), 0644); err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { os.WriteFile("/etc/resolv.conf", old, 0644) })
+	useLocalResolver(t)
 	for _, c := range []struct {
 		name string
 		sig  syscall.Signal
