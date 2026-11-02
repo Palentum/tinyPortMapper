@@ -1350,21 +1350,13 @@ static void dns_worker_main()
 
 		address_t addrs[dns_max_result];
 		int addr_count=0;
+		int current_found=0;
 		char err[dns_error_len];
-		if(resolve_domain_addresses(request.host,request.port,addrs,dns_max_result,addr_count,err,sizeof(err))==0)
+		if(resolve_domain_addresses(request.host,request.port,addrs,dns_max_result,addr_count,err,sizeof(err),&request.current_addr,&current_found)==0)
 		{
 			result.ok=1;
-			result.current_still_valid=0;
-			result.next_addr=addrs[0];
-			for(int i=0;i<addr_count;i++)
-			{
-				if(addrs[i]==request.current_addr)
-				{
-					result.current_still_valid=1;
-					result.next_addr=request.current_addr;
-					break;
-				}
-			}
+			result.current_still_valid=current_found;
+			result.next_addr=current_found?request.current_addr:addrs[0];
 		}
 		else
 		{

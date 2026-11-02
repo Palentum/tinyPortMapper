@@ -533,7 +533,7 @@ static int copy_host_part(const char *begin,int len,char *host,int host_len,char
 	return 0;
 }
 
-int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len)
+int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find,int *found)
 {
 	addr_count=0;
 	if(host==0||host[0]==0)
@@ -562,22 +562,35 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 		return -1;
 	}
 
-	for(addrinfo *p=res;p!=0&&addr_count<max_addrs;p=p->ai_next)
+	if(found!=0)
+	{
+		*found=0;
+	}
+	//只存前 max_addrs 条，但 find 要在完整结果里找：RRset 轮转会把它排到 max_addrs 条之后（审查 Medium #8）
+	for(addrinfo *p=res;p!=0;p=p->ai_next)
 	{
 		if(p->ai_family!=AF_INET&&p->ai_family!=AF_INET6)
 		{
 			continue;
 		}
-		addrs[addr_count].from_sockaddr(p->ai_addr,(socklen_t)p->ai_addrlen);
-		if(addrs[addr_count].get_type()==AF_INET)
+		address_t addr;
+		addr.from_sockaddr(p->ai_addr,(socklen_t)p->ai_addrlen);
+		if(addr.get_type()==AF_INET)
 		{
-			addrs[addr_count].inner.ipv4.sin_port=htons((u16_t)port);
+			addr.inner.ipv4.sin_port=htons((u16_t)port);
 		}
-		else if(addrs[addr_count].get_type()==AF_INET6)
+		else if(addr.get_type()==AF_INET6)
 		{
-			addrs[addr_count].inner.ipv6.sin6_port=htons((u16_t)port);
+			addr.inner.ipv6.sin6_port=htons((u16_t)port);
 		}
-		addr_count++;
+		if(find!=0&&addr==*find)
+		{
+			*found=1;
+		}
+		if(addr_count<max_addrs)
+		{
+			addrs[addr_count++]=addr;
+		}
 	}
 
 	freeaddrinfo(res);

@@ -101,6 +101,65 @@ func hostsEntry(t testing.TB, ip, name string) func(last byte) {
 	}
 }
 
+// hostsBlock 在容器的 /etc/hosts 末尾追加一段 "ip name" 行（各 ip 等长），返回原地改写整段的函数：新的 ip 列表须条数相同、各 ip 与原来等长，
+// 单次 pwrite 写回，文件长度不变。测试结束时在每行行首写 '#'
+func hostsBlock(t testing.TB, name string, ips []string) func(ips []string) {
+	t.Helper()
+	ipLen := len(ips[0])
+	render := func(ips []string) []byte {
+		var b strings.Builder
+		for _, ip := range ips {
+			if len(ip) != ipLen {
+				t.Fatalf("hostsBlock：%q 有 %d 字节，应为 %d 字节，行首偏移会错位", ip, len(ip), ipLen)
+			}
+			b.WriteString(ip + " " + name + "\n")
+		}
+		return []byte(b.String())
+	}
+	f, err := os.OpenFile("/etc/hosts", os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { f.Close() })
+	block := render(ips)
+	var off int64
+	func() {
+		etcHostsMu.Lock()
+		defer etcHostsMu.Unlock()
+		if off, err = f.Seek(0, 2); err != nil {
+			t.Fatal(err)
+		}
+		last := make([]byte, 1)
+		if off > 0 {
+			f.ReadAt(last, off-1)
+			if last[0] != '\n' {
+				if _, err := f.WriteAt([]byte{'\n'}, off); err != nil {
+					t.Fatal(err)
+				}
+				off++
+			}
+		}
+		if _, err := f.WriteAt(block, off); err != nil {
+			t.Fatal(err)
+		}
+	}()
+	lineLen := int64(len(block) / len(ips))
+	t.Cleanup(func() {
+		for i := range ips {
+			f.WriteAt([]byte{'#'}, off+int64(i)*lineLen)
+		}
+	})
+	return func(ips []string) {
+		b := render(ips)
+		if len(b) != len(block) {
+			t.Fatalf("hostsBlock：新的 ip 列表有 %d 字节，原来 %d 字节", len(b), len(block))
+		}
+		if _, err := f.WriteAt(b, off); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
 // 域名 remote 每 30 s 重新解析：地址变化后新连接改连新地址，连往旧地址的 TCP 连接和 UDP 会话被关闭
 func TestDomainRefresh(t *testing.T) {
 	t.Parallel()
@@ -172,6 +231,79 @@ func TestDomainRefresh(t *testing.T) {
 	// O1：clear_remote_index 释放的旧会话与连接对都要归还对象池（statsAfterSignal 复核池不变式）；旧会话释放后同一客户端新建一个
 	if s := m.statsAfterSignal(t).udp[1]; s.sessions != 1 || s.total != 2 {
 		t.Errorf("统计 udp sessions=%d total=%d，期望 1/2", s.sessions, s.total)
+	}
+}
+
+// 审查 Medium #8（D92）：解析结果超过 16 条时，当前地址被 RRset 轮转排到前 16 条之外、但仍在结果里，不算地址变化；
+// 真的从结果里消失才切换。三条规则在同一轮刷新：rot 把当前地址轮转到下标 17，gone 删掉当前地址，mark 是单条记录的标记域名。
+// DNS 请求按规则顺序排队、由一个线程依次解析，每个 worker 按顺序处理地址变化：mark 的 changed from 到齐时，前两条规则的结果都已生效
+func TestDomainRefreshLargeRRset(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	const rot, gone, mark = "tpm-rrset-rot.test", "tpm-rrset-gone.test", "tpm-rrset-mark.test"
+	ips := func(c, n int) []string {
+		var s []string
+		for i := 0; i < n; i++ {
+			s = append(s, fmt.Sprintf("127.0.%d.%d", c, 10+i))
+		}
+		return s
+	}
+	rotIPs, goneIPs := ips(9, 20), ips(10, 21) // goneIPs[20] 是删除后顶替的地址
+	bport := freePort(t)
+	for _, ip := range append(slices.Clone(rotIPs), goneIPs...) {
+		serveTCP(t, hostPort(ip, bport), echoHandler(ip+"\n"))
+	}
+	setRot := hostsBlock(t, rot, rotIPs)
+	setGone := hostsBlock(t, gone, goneIPs[:20])
+	setMark := hostsEntry(t, "127.0.11.2", mark)
+	lRot, lGone, lMark := loopback4(t), loopback4(t), loopback4(t)
+	var cfg strings.Builder
+	var wait []listenPoint
+	for _, e := range [][2]string{{lRot, rot}, {lGone, gone}, {lMark, mark}} {
+		fmt.Fprintf(&cfg, "[[endpoints]]\nlisten = %q\nremote = \"%s:%d\"\n\n", e[0], e[1], bport)
+		wait = append(wait, listenPoints("t", portOf(e[0]))...)
+	}
+	m := startMapper(t, wait, "-c", writeConfig(t, cfg.String()))
+	start := time.Now()
+
+	oldRot, oldGone := dial(t, lRot), dial(t, lGone)
+	if got := readLine(t, oldRot); got != rotIPs[0] {
+		t.Fatalf("启动时 %s 应解析到 %s，实际连到后端 %q", rot, rotIPs[0], got)
+	}
+	if got := readLine(t, oldGone); got != goneIPs[0] {
+		t.Fatalf("启动时 %s 应解析到 %s，实际连到后端 %q", gone, goneIPs[0], got)
+	}
+
+	setRot(append(slices.Clone(rotIPs[3:]), rotIPs[:3]...))
+	setGone(append([]string{goneIPs[20]}, goneIPs[1:20]...))
+	setMark('3')
+	workers := m.threads()
+	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
+		if got := m.logLines("domain "+mark+":", "changed from"); got < workers {
+			return fmt.Errorf("%s 的 changed from 有 %d 行，应有 %d 行", mark, got, workers)
+		}
+		return nil
+	})
+	t.Logf("修改 /etc/hosts 后 %v 内完成一轮刷新", time.Since(start).Round(time.Second))
+
+	// rot 这一轮解析失败时只记一行 warn、保留当前地址，下面的断言会空过
+	if got := m.logLines("domain "+rot+":", "resolve failed"); got != 0 {
+		t.Fatalf("%s 解析失败（%d 行）：\n%s", rot, got, m.logTail(10))
+	}
+	if got := m.logLines("domain "+rot+":", "changed from"); got != 0 {
+		t.Fatalf("%s 的当前地址轮转到下标 17（仍在解析结果里），却被当作地址变化（%d 行）：\n%s", rot, got, m.logTail(10))
+	}
+	mustEcho(t, oldRot, "still")
+	if got := readLine(t, dial(t, lRot)); got != rotIPs[0] {
+		t.Fatalf("%s 的新连接应仍连到 %s，实际 %q", rot, rotIPs[0], got)
+	}
+
+	if got := m.logLines("domain "+gone+":", "changed from "+goneIPs[0]+":", "to "+goneIPs[20]+":"); got != workers {
+		t.Fatalf("%s 的当前地址被删除后应有 %d 行 changed from，实际 %d 行：\n%s", gone, workers, got, m.logTail(10))
+	}
+	expectClosed(t, oldGone, ioTimeout)
+	if got := readLine(t, dial(t, lGone)); got != goneIPs[20] {
+		t.Fatalf("%s 的新连接应连到 %s，实际 %q", gone, goneIPs[20], got)
 	}
 }
 
