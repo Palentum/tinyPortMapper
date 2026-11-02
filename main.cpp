@@ -955,18 +955,7 @@ struct remote_target_t
 	}
 };
 
-struct balance_rr_node_t
-{
-	int current_weight;
-	int effective_weight;
-	int weight;
-	balance_rr_node_t()
-	{
-		current_weight=0;
-		effective_weight=0;
-		weight=0;
-	}
-};
+struct rule_shared_t;
 
 struct forward_rule_t:not_copy_able_t
 {
@@ -977,7 +966,7 @@ struct forward_rule_t:not_copy_able_t
 	vector<remote_target_t> remote_targets;
 	balance_strategy_t balance_strategy;
 	vector<int> balance_weights;
-	vector<balance_rr_node_t> rr_nodes;
+	rule_shared_t *shared;//本规则所有 worker 共用的状态，roundrobin 经它选 remote（D85）
 	worker_t *worker;//所属 worker（M1）：本对象是这条规则在它那里的运行时，连接对与会话经 owner 找到它
 	int local_listen_fd_tcp;
 	int local_listen_fd_udp;
@@ -991,6 +980,7 @@ struct forward_rule_t:not_copy_able_t
 		enable_tcp=0;
 		enable_udp=0;
 		balance_strategy=balance_strategy_off;
+		shared=0;
 		worker=0;
 		local_listen_fd_tcp=-1;
 		local_listen_fd_udp=-1;
@@ -998,12 +988,15 @@ struct forward_rule_t:not_copy_able_t
 };
 
 //每条规则在所有 worker 之间共用的状态，主线程按规则分配，各 worker 的管理器存指针，relaxed：tcp/udp 是合计的连接数（M4，S7），
-//只在建连/建会话与释放时访问；gso_logged 是每个方向的 GSO 回退是否已记过 info（U5 审查 L3，按规则而不是按 worker）
+//只在建连/建会话与释放时访问；gso_logged 是每个方向的 GSO 回退是否已记过 info（U5 审查 L3，按规则而不是按 worker）；
+//rr_next 是 roundrobin 的选择序号，rr_seq 是一个周期的选择序列（D85，见 rr_build_seq），启动 worker 之前算好，之后只读
 struct rule_shared_t
 {
 	std::atomic<int> tcp,udp;
+	std::atomic<unsigned> rr_next;
 	std::atomic<int> gso_logged[2];
-	rule_shared_t():tcp(0),udp(0)
+	vector<unsigned char> rr_seq;
+	rule_shared_t():tcp(0),udp(0),rr_next(0)
 	{
 		gso_logged[0].store(0);
 		gso_logged[1].store(0);
@@ -1033,7 +1026,7 @@ struct worker_msg_t
 };
 
 //每个 worker 的全部可变状态（M1，D59、D60；M2 起每个 worker 一个线程，D62）：自己的 loop 与时间缓存、规则运行时（监听 fd 与 watcher、
-//管理器与计数、rr_nodes、remote 地址副本）、连接对象池、缓冲池与 scratch、pipe 池与 scratch pipe、UDP 批缓冲、定时器与控制消息队列。
+//管理器与计数、remote 地址副本）、连接对象池、缓冲池与 scratch、pipe 池与 scratch pipe、UDP 批缓冲、定时器与控制消息队列。
 //热路径经 forward_rule_t::worker（连接对与会话经 owner）取到它，不用 thread_local（mips24kc 上 TLS 指针是 rdhwr，可能由内核模拟，
 //T11 审查 F10），也不用 ev_userdata（ev.c 里的非内联函数）。除 ctrl_mutex 保护的 ctrl_queue 外只有本 worker 的线程访问；
 //主线程只在启动 worker 线程之前建它、之后只经 worker_post() 发消息
@@ -1420,24 +1413,13 @@ static int select_remote_index(forward_rule_t &rule, const address_t &client_add
 
 	if(rule.balance_strategy==balance_strategy_roundrobin)
 	{
-		DEBUG_ASSERT((int)rule.rr_nodes.size()==remote_count);
-		int best=-1;
-		int total=0;
-		for(int i=0;i<remote_count;i++)
-		{
-			balance_rr_node_t &node=rule.rr_nodes[i];
-			DEBUG_ASSERT(node.weight>0);
-			DEBUG_ASSERT(node.effective_weight>0);
-			node.current_weight+=node.effective_weight;
-			total+=node.effective_weight;
-			if(best==-1||node.current_weight>rule.rr_nodes[best].current_weight)
-			{
-				best=i;
-			}
-		}
-		DEBUG_ASSERT(best>=0);
-		DEBUG_ASSERT(total>0);
-		rule.rr_nodes[best].current_weight-=total;
+		//所有 worker 共用一条序列（D85）：本规则第 k 次选择（TCP 与 UDP 合计，按到达序号的先后）与 threads=1 的第 k 次相同。
+		//序号在 2^32 处回绕，周期不整除 2^32 时那一步相位不连续，约 43 亿次新建一次
+		const vector<unsigned char> &seq=rule.shared->rr_seq;
+		DEBUG_ASSERT(!seq.empty());
+		unsigned k=rule.shared->rr_next.fetch_add(1,memory_order_relaxed);
+		int best=seq[k%seq.size()];
+		DEBUG_ASSERT(best<remote_count);
 		return best;
 	}
 
@@ -2939,13 +2921,37 @@ static forward_rule_t &worker_rule(worker_t &w,size_t i)
 	return *it;
 }
 
-//在 worker w 里建第 i 条规则的运行时（不含监听，见 start_forward_rule）：规则配置与 remote 地址的副本、roundrobin 状态（M4：每 worker 一份）、
-//两个管理器指向 w 与本规则的全局连接计数
+//roundrobin 的选择序列（D85）：nginx 平滑加权轮询从全 0 开始走一个周期。每个周期里每个 remote 正好被选中"权重"次，走完各节点回到全 0，
+//之后按同样的顺序重复，所以权重和 T 步就是完整的序列（T ≤ 255×255）。主线程在启动 worker 之前给每条 roundrobin 规则算一次；remote 最多 255 个，下标存一个字节
+static void rr_build_seq(const vector<int> &weights,vector<unsigned char> &seq)
+{
+	int n=(int)weights.size();
+	int total=0;
+	for(int i=0;i<n;i++) total+=weights[i];
+	vector<int> current(n,0);
+	seq.resize(total);
+	for(int k=0;k<total;k++)
+	{
+		int best=-1;
+		for(int i=0;i<n;i++)
+		{
+			current[i]+=weights[i];
+			if(best==-1||current[i]>current[best]) best=i;
+		}
+		current[best]-=total;
+		seq[k]=(unsigned char)best;
+	}
+	for(int i=0;i<n;i++) assert(current[i]==0);
+}
+
+//在 worker w 里建第 i 条规则的运行时（不含监听，见 start_forward_rule）：规则配置与 remote 地址的副本，
+//两个管理器指向 w 与本规则的全局连接计数，roundrobin 经 shared 用所有 worker 共用的序列（D85）
 static void worker_add_rule(worker_t *w,size_t i)
 {
 	w->rules.emplace_back();
 	forward_rule_t &rule=w->rules.back();
 	rule.worker=w;
+	rule.shared=&rule_shared[i];
 	rule.tcp_manager.worker=rule.udp_manager.worker=w;
 	rule.tcp_manager.lru.clock=rule.udp_manager.lru.clock=&w->clock;
 	rule.tcp_manager.conns=&rule_shared[i].tcp;
@@ -2974,19 +2980,6 @@ static void worker_add_rule(worker_t *w,size_t i)
 	if(rule.balance_strategy!=balance_strategy_off)
 	{
 		assert(rule.balance_weights.size()==rule.remote_targets.size());
-	}
-	if(rule.balance_strategy==balance_strategy_roundrobin)
-	{
-		rule.rr_nodes.reserve(rule.remote_targets.size());
-		for(size_t j=0;j<rule.remote_targets.size();j++)
-		{
-			int weight=rule.balance_weights[j];
-			balance_rr_node_t node;
-			node.current_weight=0;
-			node.effective_weight=weight;
-			node.weight=weight;
-			rule.rr_nodes.push_back(node);
-		}
 	}
 }
 
@@ -3191,6 +3184,9 @@ int event_loop()
 		myexit(-1);
 	}
 	rule_shared=new rule_shared_t[app_config.rules.size()];
+	for(size_t i=0;i<app_config.rules.size();i++)
+		if(app_config.rules[i].balance_strategy==balance_strategy_roundrobin)
+			rr_build_seq(app_config.rules[i].balance_weights,rule_shared[i].rr_seq);
 	if(cpu_affinity) cpu_affinity_init();
 
 	for(int k=0;k<worker_count;k++)

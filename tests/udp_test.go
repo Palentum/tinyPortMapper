@@ -460,7 +460,7 @@ func TestUDPManySessions(t *testing.T) {
 //     （删除用后移，表不被打乱；noshift/shiftgt 变异会让部分 A 会话查不到→重建→计数超出，在此被杀）。
 func TestUDPSessionChurn(t *testing.T) {
 	t.Parallel()
-	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
+	singleWorkerOnly(t, "DNS 更新时每个 worker 各记一行 changed from（S5），udp= 只是该 worker 删掉的会话数，这里等的是 udp=numB 的一行")
 	inContainer(t)
 	const n = 600
 	const name = "tpm-u2churn.test"

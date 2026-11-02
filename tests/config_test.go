@@ -306,7 +306,6 @@ func TestConfigEquivalence(t *testing.T) {
 	})
 	t.Run("roundrobin", func(t *testing.T) {
 		t.Parallel()
-		singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 		weights := []int{2, 1, 1}
 		remotes := balancedBackends(t, len(weights))
 		cli, toml := loopback4(t), loopback4(t)

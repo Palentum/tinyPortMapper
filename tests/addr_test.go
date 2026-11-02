@@ -268,7 +268,6 @@ func balanceArgs(listen string, remotes []string, balance string, proto string) 
 // 平滑加权轮询的选择序列与 nginx 算法完全一致（因此比例精确）
 func TestBalanceRoundRobin(t *testing.T) {
 	t.Parallel()
-	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 	for _, weights := range [][]int{{2, 1, 1}, {3, 1, 2}, {1, 1}} {
 		t.Run(fmt.Sprint(weights), func(t *testing.T) {
 			t.Parallel()
@@ -292,7 +291,6 @@ func TestBalanceRoundRobin(t *testing.T) {
 // TCP 与 UDP 共享同一规则的轮询状态：交替建立 TCP 连接和 UDP 会话时按同一序列推进
 func TestBalanceRoundRobinSharedTCPUDP(t *testing.T) {
 	t.Parallel()
-	singleWorkerOnly(t, "roundrobin 的轮询状态每 worker 一份（M1、S7），顺序建的连接按四元组散列到各 worker，选择序列在各 worker 之间交错")
 	weights := []int{2, 1, 1}
 	listen := loopback4(t)
 	remotes := balancedBackends(t, len(weights))
@@ -312,6 +310,42 @@ func TestBalanceRoundRobinSharedTCPUDP(t *testing.T) {
 	}
 	if !slices.Equal(got, want) {
 		t.Fatalf("TCP/UDP 交替时的选择序列 = %v，期望 %v", got, want)
+	}
+}
+
+// D85：多个 worker 共用规则的一个选择序列（原子计数取一个周期的平滑加权轮询表），第 k 次选择与 threads=1 时的第 k 次相同，与连接、会话
+// 散列到哪个 worker 无关。自带 --threads 4（默认的 threads=1 套件也跑到），TCP 与 UDP 同一个监听地址：先顺序建 8 个 UDP 会话（每个一个
+// 新 socket，源端口各不相同），再顺序建 8 条 TCP 连接、一直开到最后，16 次选择恰好是 swrr([1, 1], 16)。之后从统计核对 UDP 会话确实分到
+// 了至少 2 个 worker（8 个会话都落在 4 个 worker 中同一个的概率 4×(1/4)^8 ≈ 6e-5），否则序列对了也说明不了跨 worker。修复前每个 worker
+// 一份从 current_weight=0 起的轮询状态，几个长连接多半都落到 remote 0（审查 Medium #5）。UDP 组不挂 cBPF（D73），TPM_AFFINITY=1 时也按
+// 哈希分；TCP 可能按 CPU 分流，不影响序列
+func TestBalanceRoundRobinWorkers(t *testing.T) {
+	t.Parallel()
+	const n = 4
+	affinityTooMany(t, n)
+	weights := []int{1, 1}
+	listen := loopback4(t)
+	remotes := balancedBackends(t, len(weights))
+	m := startMapper(t, listenPoints("tu", portOf(listen)),
+		append(balanceArgs(listen, remotes, weightsSpec("roundrobin", weights), "tu"), "--threads", strconv.Itoa(n))...)
+	want := swrr(weights, 16)
+	got := make([]int, len(want))
+	for i := range got {
+		var id string
+		if i < len(got)/2 {
+			id = udpReplyFrom(t, udpDial(t, "", listen), "x")
+		} else {
+			id = readLine(t, dial(t, listen)) // dial 的连接到用例结束才关
+		}
+		fmt.Sscan(id, &got[i])
+	}
+	d := m.statsAfterSignal(t)
+	t.Logf("选择序列 %v；worker 行 %+v", got, d.workers)
+	if !slices.Equal(got, want) {
+		t.Errorf("%d 个 worker 时的选择序列（前 8 个 UDP、后 8 个 TCP）= %v，期望 %v", n, got, want)
+	}
+	if k := busyWorkers(d, "udp"); k < 2 {
+		t.Errorf("8 个 UDP 会话只分到了 %d 个 worker（worker 行 %+v），期望至少 2 个", k, d.workers)
 	}
 }
 

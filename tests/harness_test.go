@@ -294,7 +294,7 @@ func (m *mapper) threads() int {
 }
 
 // singleWorkerOnly 用于本身假设只有一个 worker 的用例（同一轮事件循环里的确定性批次、accept 轮次、fd 复用，每个 loop 一份的池计数，
-// 每 worker 一份的轮询状态，按地址只查得到 reuseport 组里一个 socket 的 sock_diag 等）：TPM_THREADS 大于 1 时跳过，reason 写明假设
+// 每 worker 一行的日志，按地址只查得到 reuseport 组里一个 socket 的 sock_diag 等）：TPM_THREADS 大于 1 时跳过，reason 写明假设
 func singleWorkerOnly(t testing.TB, reason string) {
 	t.Helper()
 	if n := envThreads(); n > 1 {
