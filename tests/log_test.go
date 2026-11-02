@@ -452,3 +452,58 @@ func TestLogClosedStdFDs(t *testing.T) {
 		})
 	}
 }
+
+// D93（审查 Medium #6）：--log-level、--disable-color、--enable-color 与其他选项是同一套 getopt_long 解析，--log-level=N 和唯一前缀
+// 缩写都生效（以前开头的预扫描只认精确拼写，其余被静默忽略）。harness 总在最前面加 --disable-color，颜色用例在它之后再开、再关。
+// 每个用例转发一个连接后发 SIGUSR1：统计行不受级别过滤（0 除外）且写完就 fflush，此前记下的日志都已在文件里，这时没有的行就是被过滤了。
+// 参数前放一个位置参数 foo：预扫描在 argv 的副本上跑，argc= 回显仍是命令行原序（GNU getopt、musl 都会重排它解析的 argv）
+func TestLogOptionForms(t *testing.T) {
+	t.Parallel()
+	ansi := regexp.MustCompile("\x1b\\[[0-9;]*m")
+	for _, c := range []struct {
+		name        string
+		args        []string
+		info, debug bool // 期望有 INFO 行（argc= 回显与 connLogs）、有 DEBUG 行
+		color       bool // 期望有 ANSI 颜色
+	}{
+		{"level_eq3", []string{"--log-level=3"}, false, false, false},
+		{"level_abbrev3", []string{"--log-l", "3"}, false, false, false},
+		{"level_eq5", []string{"--log-level=5"}, true, true, false},
+		{"level_abbrev5", []string{"--log-lev", "5"}, true, true, false},
+		{"enable_abbrev", []string{"--enable-c"}, true, false, true},
+		{"enable_shortest", []string{"--en"}, true, false, true},
+		{"disable_abbrev", []string{"--enable-color", "--disable-c"}, true, false, false},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			be := serveTCP(t, loopback4(t), echoHandler(""))
+			listen := loopback4(t)
+			args := append(append([]string{"foo"}, c.args...), "-l", listen, "-r", be.addr, "-t")
+			m := startMapper(t, listenPoints("t", portOf(listen)), args...)
+			if err := cycleConn(listen); err != nil {
+				t.Fatalf("经 tinymapper 转发连接失败：%v", err)
+			}
+			m.statsAfterSignal(t)
+			data, _ := os.ReadFile(m.logPath)
+			log := string(data)
+			want := 0
+			if c.info {
+				want = 1
+			}
+			if got := append([]int{m.logLines("argc=")}, connLogCounts(m)...); slices.ContainsFunc(got, func(n int) bool { return n != want }) {
+				t.Errorf("argc= 回显与 %v 分别有 %v 行，期望各 %d 行：\n%s", connLogs, got, want, log)
+			}
+			if got := m.logLines("[DEBUG]") > 0; got != c.debug {
+				t.Errorf("有 DEBUG 行：%v，期望 %v：\n%s", got, c.debug, log)
+			}
+			if got := strings.Contains(log, "\x1b["); got != c.color {
+				t.Errorf("有 ANSI 颜色：%v，期望 %v：\n%s", got, c.color, log)
+			}
+			if c.info {
+				if echo := strings.Join(args, " ") + " "; !strings.Contains(ansi.ReplaceAllString(log, ""), echo) {
+					t.Errorf("argc= 回显中没有按原序排列的 %q：\n%s", echo, log)
+				}
+			}
+		})
+	}
+}

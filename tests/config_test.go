@@ -443,6 +443,14 @@ func TestConfigInvalid(t *testing.T) {
 		{"cli_udp_listen_buf_missing", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf"}, "", "requires an argument"},
 		{"toml_udp_listen_buf_9", []string{"-c", "CFG", "--udp-listen-buf", "9"}, ep("use_udp = true\n"), udpListenBufFatal},
 		{"cli_log_level", []string{"--log-level", "9", "-l", l, "-r", r1, "-t"}, "", "invalid log_level"},
+		// D93：--log-level 的预扫描与正式解析是同一套 getopt_long，--log-level=N、缩写也校验；非数字、空串、负数（以前不报错就退出）都拒绝
+		{"cli_log_level_eq", []string{"--log-level=9", "-l", l, "-r", r1, "-t"}, "", "invalid log_level"},
+		{"cli_log_level_abbrev", []string{"--log-l", "9", "-l", l, "-r", r1, "-t"}, "", "invalid log_level"},
+		{"cli_log_level_abc", []string{"-l", l, "-r", r1, "-t", "--log-level", "abc"}, "", "invalid log_level"},
+		{"cli_log_level_empty", []string{"-l", l, "-r", r1, "-t", "--log-level="}, "", "invalid log_level"},
+		{"cli_log_level_negative", []string{"-l", l, "-r", r1, "-t", "--log-level", "-1"}, "", "invalid log_level"},
+		// 没给值：getopt_long 把下一个参数 -t 当作值，预扫描也一样
+		{"cli_log_level_no_value", []string{"-l", l, "-r", r1, "--log-level", "-t"}, "", "invalid log_level"},
 		{"cli_config_missing", []string{"-c", filepath.Join(dir, "missing.toml")}, "", "cannot be accessed"},
 		{"cli_config_dir", []string{"-c", dir}, "", "must be a regular file"},
 		{"toml_empty", []string{"-c", "CFG"}, "# 只有注释\n", "at least one [[endpoints]]"},

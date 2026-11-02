@@ -3624,32 +3624,39 @@ void process_arg(int argc, char *argv[])
 			myexit(0);
 		}
 	}
-	for (i = 0; i < argc; i++)
+	//日志级别和颜色要在第一行日志之前定下来，所以先用同一张 long_options 单独过一遍 getopt_long：
+	//--log-level=N、缩写、"--" 之后不再解析、哪个参数被当作选项的值，都与下面的正式解析一致。
+	//在 argv 的副本上做（GNU getopt 会重排 argv，下面回显的仍是原始顺序）；opterr=0，未知选项、缺值等留给正式解析报
+	vector<char*> argv_copy(argv,argv+argc+1);
+	opterr=0;
+	optind=1;
+	while ((opt = getopt_long(argc, &argv_copy[0], "c:l:r:tuh",long_options,&option_index)) != -1)
 	{
-		if(strcmp(argv[i],"--log-level")==0)
+		if(opt!=1) continue;
+		if(strcmp(long_options[option_index].name,"log-level")==0)
 		{
-			if(i<argc -1)
+			int tmp=-1;
+			sscanf(optarg,"%d",&tmp);
+			if(0<=tmp&&tmp<log_end)
 			{
-				sscanf(argv[i+1],"%d",&log_level);
-				if(0<=log_level&&log_level<log_end)
-				{
-				}
-				else
-				{
-					log_bare(log_fatal,"invalid log_level\n");
-					myexit(-1);
-				}
+				log_level=tmp;
+			}
+			else
+			{
+				log_bare(log_fatal,"invalid log_level\n");
+				myexit(-1);
 			}
 		}
-		if(strcmp(argv[i],"--disable-color")==0)
+		else if(strcmp(long_options[option_index].name,"disable-color")==0)
 		{
 			enable_log_color=0;
 		}
-		if(strcmp(argv[i],"--enable-color")==0)
+		else if(strcmp(long_options[option_index].name,"enable-color")==0)
 		{
 			enable_log_color=1;
 		}
 	}
+	opterr=1;
 
     mylog(log_info,"argc=%d ", argc);
 
@@ -3706,7 +3713,7 @@ void process_arg(int argc, char *argv[])
 		case 'h':
 			break;
 		case 1:
-			if(strcmp(long_options[option_index].name,"log-level")==0)
+			if(strcmp(long_options[option_index].name,"log-level")==0)//log-level、disable-color、enable-color 已在开头的预扫描里处理
 			{
 			}
 			else if(strcmp(long_options[option_index].name,"disable-color")==0)
