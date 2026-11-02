@@ -765,3 +765,84 @@ func TestBalanceIPHash(t *testing.T) {
 		})
 	}
 }
+
+// D98：拦截型 DNS（AdGuard Home default、Pi-hole NULL）与 hosts 黑名单把被拦截的域名解析为未指定地址。
+// connect/sendto 到 0.0.0.0、::、::ffff:0.0.0.0 会落到本机回环的同号端口，所以这些地址要跳过；全是未指定地址时与 NXDOMAIN 一样算解析失败，
+// 启动时退出
+func TestDomainUnspecifiedStartup(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	for i, ip := range []string{"0.0.0.0", "::", "::ffff:0.0.0.0"} {
+		name := fmt.Sprintf("tpm-unspec-%d.test", i)
+		hostsEntry(t, ip, name)
+		out := runExpectFail(t, 5*time.Second, "-l", loopback4(t), "-r", fmt.Sprintf("%s:%d", name, freePort(t)), "-t", "-u")
+		if !strings.Contains(out, "-r remote: only unspecified addresses") {
+			t.Errorf("%s 解析为 %s：输出中没有 only unspecified addresses：\n%s", name, ip, out)
+		}
+	}
+}
+
+// D98：应答里同时有未指定地址与真实地址时只用真实地址。回环 127.0.0.1 上的同号端口放一个后端，连到它说明用了 0.0.0.0
+func TestDomainUnspecifiedMixed(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	const name = "tpm-unspec-mixed.test"
+	bport := freePort(t)
+	for _, b := range [][2]string{{"127.0.0.1", "lo"}, {"127.0.0.2", "2"}} {
+		serveTCP(t, hostPort(b[0], bport), echoHandler(b[1]+"\n"))
+		serveUDP(t, hostPort(b[0], bport), b[1])
+	}
+	hostsEntry(t, "0.0.0.0", name)
+	hostsEntry(t, "127.0.0.2", name)
+	listen := loopback4(t)
+	forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
+	if got := readLine(t, dial(t, listen)); got != "2" {
+		t.Fatalf("应答里有 0.0.0.0 与 127.0.0.2，TCP 应连到 127.0.0.2，实际连到后端 %q", got)
+	}
+	if got := udpReplyFrom(t, udpDial(t, "", listen), "mixed"); got != "2" {
+		t.Fatalf("应答里有 0.0.0.0 与 127.0.0.2，UDP 应发往 127.0.0.2，实际 %q", got)
+	}
+}
+
+// D98：运行中域名被拦截（解析结果变成 0.0.0.0）时按解析失败处理：只记 resolve failed、保留当前地址，新连接与新会话仍去原来的后端，
+// 旧连接不受影响。不能变成 changed from ... to 0.0.0.0（新连接会落到 127.0.0.1 的同号端口）
+func TestDomainUnspecifiedRefresh(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	const name = "tpm-unspec-refresh.test"
+	bport := freePort(t)
+	for _, b := range [][2]string{{"127.0.0.1", "lo"}, {"127.0.0.2", "2"}} {
+		serveTCP(t, hostPort(b[0], bport), echoHandler(b[1]+"\n"))
+		serveUDP(t, hostPort(b[0], bport), b[1])
+	}
+	setIPs := hostsBlock(t, name, []string{"127.0.0.2"})
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
+	old := dial(t, listen)
+	if got := readLine(t, old); got != "2" {
+		t.Fatalf("启动时应解析到 127.0.0.2，实际连到后端 %q", got)
+	}
+
+	setIPs([]string{"0.0.0.0  "}) // 与 127.0.0.2 等长，行首偏移不变
+	start := time.Now()
+	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
+		if n := m.logLines("domain "+name+":", "changed from"); n > 0 {
+			return nil
+		}
+		if n := m.logLines("domain "+name+":", "resolve failed: only unspecified addresses", "keeping current address"); n == 0 {
+			return fmt.Errorf("没有 resolve failed 行")
+		}
+		return nil
+	})
+	t.Logf("修改 /etc/hosts 后 %v 看到刷新结果", time.Since(start).Round(time.Second))
+	if n := m.logLines("domain "+name+":", "changed from"); n != 0 {
+		t.Fatalf("域名解析为 0.0.0.0 后被当作地址变化（%d 行）：\n%s", n, m.logTail(10))
+	}
+	mustEcho(t, old, "still")
+	if got := readLine(t, dial(t, listen)); got != "2" {
+		t.Fatalf("域名被拦截后新 TCP 连接应仍连到 127.0.0.2，实际连到后端 %q", got)
+	}
+	if got := udpReplyFrom(t, udpDial(t, "", listen), "after"); got != "2" {
+		t.Fatalf("域名被拦截后新 UDP 会话应仍发往 127.0.0.2，实际 %q", got)
+	}
+}

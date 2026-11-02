@@ -533,6 +533,18 @@ static int copy_host_part(const char *begin,int len,char *host,int host_len,char
 	return 0;
 }
 
+//0.0.0.0、::、::ffff:0.0.0.0：拦截型 DNS（AdGuard Home、Pi-hole 的默认应答）与 hosts 黑名单给出的"没有地址"，
+//作为目的地址时 Linux 连到本机回环的同号端口，remote 端口与监听端口相同时连回自己的通配监听（D98）
+static int is_unspecified(const address_t &addr)
+{
+	static const unsigned char v4any[16]={0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0};
+	if(addr.inner.ipv4.sin_family==AF_INET)
+	{
+		return addr.inner.ipv4.sin_addr.s_addr==htonl(INADDR_ANY);
+	}
+	return IN6_IS_ADDR_UNSPECIFIED(&addr.inner.ipv6.sin6_addr)||memcmp(&addr.inner.ipv6.sin6_addr,v4any,sizeof(v4any))==0;
+}
+
 int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find,int *found)
 {
 	addr_count=0;
@@ -566,6 +578,7 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 	{
 		*found=0;
 	}
+	int unspecified=0;
 	//只存前 max_addrs 条，但 find 要在完整结果里找：RRset 轮转会把它排到 max_addrs 条之后（审查 Medium #8）
 	for(addrinfo *p=res;p!=0;p=p->ai_next)
 	{
@@ -575,6 +588,11 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 		}
 		address_t addr;
 		addr.from_sockaddr(p->ai_addr,(socklen_t)p->ai_addrlen);
+		if(is_unspecified(addr))
+		{
+			unspecified++;
+			continue;
+		}
 		if(addr.get_type()==AF_INET)
 		{
 			addr.inner.ipv4.sin_port=htons((u16_t)port);
@@ -596,7 +614,9 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 	freeaddrinfo(res);
 	if(addr_count==0)
 	{
-		set_err(err,err_len,"no A or AAAA address found");
+		//全是未指定地址时与 NXDOMAIN 一样算解析失败：启动时退出，刷新时保留当前地址
+		if(unspecified>0) set_err(err,err_len,"only unspecified addresses (0.0.0.0 or ::), the domain may be blocked by the DNS server or /etc/hosts");
+		else set_err(err,err_len,"no A or AAAA address found");
 		return -1;
 	}
 	return 0;

@@ -61,7 +61,10 @@ defaults with `no_tcp` / `use_udp`, plus `[[endpoints]]` entries with `listen`,
 `remote`, `extra_remotes`, `balance`, `no_tcp`, and `use_udp`. `listen` remains
 an IP literal. `remote` and `extra_remotes` support `ipv4:port`, `[ipv6]:port`,
 and `hostname:port`; hostnames are resolved at startup and refreshed every
-30 seconds. `extra_remotes` is a Realm-style inline string array. `balance`
+30 seconds. Unspecified addresses in the answer (`0.0.0.0`, `::`, returned by
+filtering DNS servers and hosts blocklists for blocked names) are skipped; a
+hostname with no other address fails to resolve (fatal at startup, the current
+address is kept on refresh). `extra_remotes` is a Realm-style inline string array. `balance`
 supports `roundrobin` and `iphash`; the weight count must equal the total number
 of `remote` plus `extra_remotes` targets. When an active resolved address
 disappears from DNS results, new connections use the new address; connections
