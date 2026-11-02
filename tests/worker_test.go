@@ -1319,7 +1319,53 @@ func TestWorkerSignalExit(t *testing.T) {
 		if k := m.logLines("got sigterm, exit"); k != 1 {
 			t.Errorf("日志里有 %d 行 got sigterm, exit，期望 1 行", k)
 		}
+		expectWholeLogLines(t, m) // 退出行以前没有换行，紧接着的超时 warn 拼在同一行上
 	})
+}
+
+// D106：建不出线程时（这里是非 root uid 加 RLIMIT_NPROC=1，见 execNprocLimit；生产上还有 cgroup pids.max）以 fatal 退出，状态 255。
+// dns：域名 remote 的 DNS 线程（std::thread，抛出的 std::system_error 以前没人接，terminate 后 SIGABRT，非终端 stdout 缓冲中的
+// 启动日志一并丢失）；worker：IP remote 时第一个建的是 worker 线程（一直如此，作对照）
+func TestThreadCreateFail(t *testing.T) {
+	t.Parallel()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	uid := uint32(41000 + rand.IntN(1000)) // 与 splice 用例的 42000–61999 错开
+	for _, c := range []struct{ name, remote, want string }{
+		{"dns", fmt.Sprintf("localhost:%d", freePort(t)), "[FATAL]create DNS thread failed"},
+		{"worker", loopback4(t), "[FATAL]create thread for worker 0 failed"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			argv := mapperArgv("-l", loopback4(t), "-r", c.remote, "-t", "--threads", "1")
+			cmd := exec.Command(self, append([]string{mapperBin}, argv...)...)
+			cmd.Env = append(os.Environ(), nprocLimitEnv+"=1")
+			cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: uid, Gid: uid}}
+			var out strings.Builder
+			cmd.Stdout, cmd.Stderr = &out, &out
+			if err := startCmd(cmd, nil); err != nil {
+				t.Fatal(err)
+			}
+			done := make(chan error, 1)
+			go func() { done <- cmd.Wait() }()
+			var err error
+			select {
+			case err = <-done:
+			case <-time.After(5 * time.Second):
+				cmd.Process.Kill()
+				<-done
+				t.Fatalf("5 s 内未退出：\n%s", out.String())
+			}
+			var ee *exec.ExitError
+			if !errors.As(err, &ee) || ee.ExitCode() != 255 {
+				t.Fatalf("退出状态 %v，期望 255：\n%s", err, out.String())
+			}
+			if !strings.Contains(out.String(), c.want) {
+				t.Fatalf("输出中没有 %q：\n%s", c.want, out.String())
+			}
+		})
+	}
 }
 
 // S2：启动时的端口冲突。TCP 先用一个不带 SO_REUSEPORT 的 socket 试 bind：

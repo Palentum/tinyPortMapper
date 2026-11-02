@@ -1,6 +1,7 @@
 package tests
 
 import (
+	"context"
 	"errors"
 	"fmt"
 	"net"
@@ -91,6 +92,9 @@ func sigtermExits(t testing.TB, remote string, conns int) {
 	if m.logLines("got sigterm, exit") != 1 {
 		t.Fatalf("日志中没有 \"got sigterm, exit\"：\n%s", m.logTail(5))
 	}
+	if data, _ := os.ReadFile(m.logPath); !strings.Contains(string(data), "got sigterm, exit\n") {
+		t.Fatalf("\"got sigterm, exit\" 没有以换行结尾：\n%q", m.logTail(3))
+	}
 }
 
 func TestSigtermExit(t *testing.T) {
@@ -102,6 +106,78 @@ func TestSigtermExit(t *testing.T) {
 func TestSigtermExitDomain(t *testing.T) {
 	t.Parallel()
 	sigtermExits(t, fmt.Sprintf("localhost:%d", freePort(t)), 0)
+}
+
+// D105：启动时同步解析域名 remote 期间（getaddrinfo 在等一个只收不回的 DNS 服务器），SIGTERM、SIGINT 按默认处置立即终止进程，
+// 不再等解析超时、监听与 worker 都起来之后才退出；SIGUSR1 仍由 libev 接住（它的默认处置也是终止进程），进程照旧等解析。
+// 要改写容器的 /etc/resolv.conf、占用 127.0.0.1:53，所以不并行：并行的用例解析 /etc/hosts 之外的名字时会被它卡住
+func TestStartupSignal(t *testing.T) {
+	inContainer(t)
+	pc, err := net.ListenPacket("udp", "127.0.0.1:53")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { pc.Close() })
+	queries := make(chan struct{}, 64)
+	go func() {
+		buf := make([]byte, 2048)
+		for {
+			if _, _, err := pc.ReadFrom(buf); err != nil {
+				return
+			}
+			select {
+			case queries <- struct{}{}:
+			default:
+			}
+		}
+	}()
+	old, err := os.ReadFile("/etc/resolv.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	// 原地改写：容器的 /etc/resolv.conf 是 Docker bind mount 进来的文件
+	if err := os.WriteFile("/etc/resolv.conf", []byte("nameserver 127.0.0.1\noptions timeout:30 attempts:1\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.WriteFile("/etc/resolv.conf", old, 0644) })
+	for _, c := range []struct {
+		name string
+		sig  syscall.Signal
+	}{{"sigterm", syscall.SIGTERM}, {"sigint", syscall.SIGINT}, {"sigusr1", syscall.SIGUSR1}} {
+		t.Run(c.name, func(t *testing.T) {
+			for len(queries) > 0 {
+				<-queries
+			}
+			m := startMapper(t, nil, "-l", loopback4(t), "-r", fmt.Sprintf("blackhole.test:%d", freePort(t)), "-t")
+			select {
+			case <-queries:
+			case <-time.After(5 * time.Second):
+				t.Fatalf("5 s 内 DNS 服务器没有收到查询：\n%s", m.logTail(10))
+			}
+			sig := c.sig
+			if sig == syscall.SIGUSR1 {
+				m.cmd.Process.Signal(sig)
+				if !m.aliveAfter(500 * time.Millisecond) {
+					t.Fatalf("解析期间收到 SIGUSR1 后退出：%v", m.exitErr)
+				}
+				sig = syscall.SIGTERM
+			}
+			start := time.Now()
+			m.cmd.Process.Signal(sig)
+			if m.aliveAfter(time.Second) {
+				t.Fatalf("解析期间收到 %v 后 1 s 内没有退出", sig)
+			}
+			t.Logf("%v 之后 %v 退出", sig, time.Since(start).Round(time.Millisecond))
+			m.stop(t, true)
+			var ee *exec.ExitError
+			if !errors.As(m.exitErr, &ee) {
+				t.Fatalf("退出状态 %v，期望被 %v 终止", m.exitErr, sig)
+			}
+			if ws := ee.Sys().(syscall.WaitStatus); !ws.Signaled() || ws.Signal() != sig {
+				t.Fatalf("退出状态 %v，期望被 %v 终止", m.exitErr, sig)
+			}
+		})
+	}
 }
 
 // C8：myexit 用 _exit，不经过 exit 刷新 stdio。stdout 是管道时全缓冲，约 1.6 KB 的帮助文本要靠 myexit 里的 fflush 写出
@@ -656,4 +732,97 @@ func TestConfigReadError(t *testing.T) {
 	if want := fmt.Sprintf("%s:%d: path: failed to read config file", cfg, strings.Count(first, "\n")+1); m.logLines("[FATAL]", want) != 1 {
 		t.Errorf("日志里没有一行 fatal %q：\n%s", want, m.logTail(20))
 	}
+}
+
+// D107：remote 指回本进程同协议的监听且成环（规则自身，或跨规则）时以 fatal 退出；确定会落到监听上才算：remote 等于具体监听地址
+// （0.0.0.0、[::] 按回环算），或 TCP 通配监听（[::] 也收 IPv4）同端口且 remote 是回环、本机网卡地址。A→B→后端的链照常转发；
+// UDP 通配监听同端口只 warn：带 SO_REUSEADDR 绑在具体地址上的 UDP socket 会接走发往它的包（如 systemd-resolved 的 127.0.0.53:53）
+func TestForwardLoop(t *testing.T) {
+	t.Parallel()
+	p := strconv.Itoa(freePort(t))
+	a, b := loopback4(t), loopback4(t)
+	ext := loopback4(t)
+	ep := func(listen, remote, extra string) string {
+		return fmt.Sprintf("[[endpoints]]\nlisten = %q\nremote = %q\n%s", listen, remote, extra)
+	}
+	for _, c := range []struct {
+		name string
+		args []string // 含 "CFG" 时替换为 toml 写出的文件路径
+		toml string
+		want string
+	}{
+		{"tcp_exact", []string{"-l", "127.0.0.1:" + p, "-r", "127.0.0.1:" + p, "-t"}, "", "remote 127.0.0.1:" + p + " reaches the listen address 127.0.0.1:" + p + " of rule 1: forwarding loop"},
+		{"tcp_unspecified", []string{"-l", "127.0.0.1:" + p, "-r", "0.0.0.0:" + p, "-t"}, "", "of rule 1: forwarding loop"},
+		{"tcp_wildcard_loopback", []string{"-l", "0.0.0.0:" + p, "-r", "127.0.0.2:" + p, "-t"}, "", "of rule 1: forwarding loop"},
+		{"tcp_dualstack_v4", []string{"-l", "[::]:" + p, "-r", "127.0.0.1:" + p, "-t"}, "", "of rule 1: forwarding loop"},
+		// localhost 解析成 127.0.0.1 还是 ::1 取决于 libc 的排序，[::] 两个都收
+		{"tcp_domain", []string{"-l", "[::]:" + p, "-r", "localhost:" + p, "-t"}, "", "remote localhost:" + p + " ("},
+		{"tcp_balance", []string{"-l", "127.0.0.1:" + p, "-r", ext, "-r", "127.0.0.1:" + p, "-t", "--balance", "roundrobin: 1, 1"}, "", "of rule 1: forwarding loop"},
+		{"udp_exact", []string{"-l", "127.0.0.1:" + p, "-r", "127.0.0.1:" + p, "-u"}, "", "rule 1 [udp] remote 127.0.0.1:" + p + " reaches"},
+		{"toml_cycle", []string{"-c", "CFG"}, ep(a, b, "") + ep(b, a, ""), "rule 1 [tcp] remote " + b + " reaches the listen address " + b + " of rule 2, which forwards back to rule 1: forwarding loop"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			args := slices.Clone(c.args)
+			if c.toml != "" {
+				cfg := writeConfig(t, c.toml)
+				for i, a := range args {
+					if a == "CFG" {
+						args[i] = cfg
+					}
+				}
+			}
+			out := runExpectFail(t, 5*time.Second, args...)
+			if !strings.Contains(out, c.want) || !strings.Contains(out, "[FATAL]") {
+				t.Fatalf("输出中没有 fatal %q：\n%s", c.want, out)
+			}
+		})
+	}
+	t.Run("tcp_local_iface", func(t *testing.T) {
+		loAlias4(t, [4]byte{192, 0, 2, 77})
+		out := runExpectFail(t, 5*time.Second, "-l", "0.0.0.0:"+p, "-r", "192.0.2.77:"+p, "-t")
+		if !strings.Contains(out, "remote 192.0.2.77:"+p+" reaches the listen address 0.0.0.0:"+p+" of rule 1: forwarding loop") {
+			t.Fatalf("输出中没有 forwarding loop：\n%s", out)
+		}
+	})
+	t.Run("chain", func(t *testing.T) {
+		be := serveTCP(t, loopback4(t), echoHandler(""))
+		startMapper(t, append(listenPoints("t", portOf(a)), listenPoints("t", portOf(b))...), "-c", writeConfig(t, ep(a, b, "")+ep(b, be.addr, "")))
+		if err := cycleConn(a); err != nil {
+			t.Fatal(err)
+		}
+	})
+	t.Run("udp_wildcard_holder", func(t *testing.T) {
+		lc := net.ListenConfig{Control: func(_, _ string, rc syscall.RawConn) error {
+			var err error
+			rc.Control(func(fd uintptr) { err = syscall.SetsockoptInt(int(fd), syscall.SOL_SOCKET, syscall.SO_REUSEADDR, 1) })
+			return err
+		}}
+		up := freePort(t)
+		holder, err := lc.ListenPacket(context.Background(), "udp", hostPort("127.0.0.2", up))
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { holder.Close() })
+		go func() {
+			buf := make([]byte, 2048)
+			for {
+				n, from, err := holder.ReadFrom(buf)
+				if err != nil {
+					return
+				}
+				holder.WriteTo(buf[:n], from)
+			}
+		}()
+		m := startMapper(t, listenPoints("u", up), "-l", hostPort("0.0.0.0", up), "-r", hostPort("127.0.0.2", up), "-u")
+		udpEcho(t, udpDial(t, "", hostPort("127.0.0.1", up)), []byte("holder"))
+		if n := udpSockets(m.pid()); n > m.threads()+1 {
+			t.Errorf("tinymapper 有 %d 个 UDP socket，期望监听 %d 个加 1 个会话：包回到了自己的监听", n, m.threads())
+		}
+		eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
+			if m.logLines("[WARN]", "rule 1 [udp] remote 127.0.0.2:"+strconv.Itoa(up), "forwarding loop unless another socket") != 1 {
+				return errors.New("日志里没有 UDP 通配监听的 warn")
+			}
+			return nil
+		})
+	})
 }

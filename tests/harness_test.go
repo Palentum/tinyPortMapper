@@ -52,6 +52,9 @@ func TestMain(m *testing.M) {
 	if os.Getenv(noNetAdminEnv) != "" {
 		execNoNetAdmin()
 	}
+	if s := os.Getenv(nprocLimitEnv); s != "" {
+		execNprocLimit(s)
+	}
 	mapperBin = os.Getenv("TINYMAPPER_BIN")
 	if mapperBin == "" || runtime.GOOS != "linux" {
 		fmt.Fprintln(os.Stderr, "需要在 Linux 上运行并设置 TINYMAPPER_BIN；在开发机上请用 tests/run.sh")
@@ -571,6 +574,27 @@ func execNoNetAdmin() {
 	}
 	err := syscall.Exec(os.Args[1], os.Args[1:], os.Environ())
 	fail("exec %s：%v", os.Args[1], err)
+}
+
+// TestThreadCreateFail 以非 root 的 uid、环境变量 nprocLimitEnv（值为上限）重新执行测试二进制自身，TestMain 见到它就设 RLIMIT_NPROC
+// 后 exec tinymapper（os.Args[1:]）。不用 sh 的 ulimit -u：ubuntu 的 dash 没有 -u。RLIMIT_NPROC 按 uid 计整个 Docker VM 的线程，
+// 测试二进制自己的几个线程在 exec 时退出，tinymapper 起步时这个 uid 只有它一个；exec 走 RawSyscall，其间 Go 不会再建线程
+const nprocLimitEnv = "TPM_NPROC_LIMIT"
+
+func execNprocLimit(s string) {
+	const rlimitNproc = 6 // RLIMIT_NPROC（amd64、arm64），syscall 包里没有这个常量
+	n, err := strconv.ParseUint(s, 10, 64)
+	if err == nil && len(os.Args) < 2 {
+		err = errors.New("缺少要执行的程序")
+	}
+	if err == nil {
+		err = syscall.Setrlimit(rlimitNproc, &syscall.Rlimit{Cur: n, Max: n})
+	}
+	if err == nil {
+		err = syscall.Exec(os.Args[1], os.Args[1:], os.Environ())
+	}
+	fmt.Fprintf(os.Stderr, "以 RLIMIT_NPROC=%s 执行 %q 失败：%v\n", s, os.Args[1:], err)
+	os.Exit(127)
 }
 
 // startMapperNoNetAdmin 同 startMapper，但 tinymapper 没有 CAP_NET_ADMIN；wait 中的监听就绪时已 exec 成 tinymapper，随即核对它的 CapEff

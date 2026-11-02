@@ -10,6 +10,7 @@
 #include <netinet/tcp.h>
 #include <netinet/udp.h>
 #include <sys/prctl.h>
+#include <ifaddrs.h>
 #include <pthread.h>
 #include <semaphore.h>
 #include <signal.h>
@@ -17,6 +18,7 @@
 #include <limits.h>
 #include <linux/filter.h>
 #include <thread>
+#include <system_error>
 #include <mutex>
 #include <condition_variable>
 #include <deque>
@@ -1503,7 +1505,15 @@ static void start_dns_worker(struct ev_loop *loop)
 	ev_async_init(&dns_async_watcher,dns_result_cb);
 	ev_async_start(loop,&dns_async_watcher);
 	dns_worker_started=1;
-	dns_thread=std::thread(dns_worker_main);
+	try
+	{
+		dns_thread=std::thread(dns_worker_main);
+	}
+	catch(const std::system_error &e)//建不出线程（RLIMIT_NPROC、cgroup pids.max、内存）：与 worker 线程一样记 fatal 退出，不走 terminate/abort（D106）
+	{
+		mylog(log_fatal,"create DNS thread failed, %d:%s\n",e.code().value(),e.code().message().c_str());
+		myexit(-1);
+	}
 	dns_thread.detach();
 }
 
@@ -3104,19 +3114,19 @@ static void workers_stop()
 }
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	mylog(log_info, "got sigpipe, ignored");
+	mylog(log_info, "got sigpipe, ignored\n");
 }
 
 void sigterm_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	mylog(log_info, "got sigterm, exit");
+	mylog(log_info, "got sigterm, exit\n");
 	workers_stop();
 	myexit(0);
 }
 
 void sigint_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	mylog(log_info, "got sigint, exit");
+	mylog(log_info, "got sigint, exit\n");
 	workers_stop();
 	myexit(0);
 }
@@ -3335,6 +3345,145 @@ static void cpu_steer_attach(forward_rule_t &rule)
 	warned=1;
 }
 
+//D107：remote 指回本进程的监听（自环或跨规则成环）。一条流每过一跳就成为同一监听的新客户端，直到 fd 或 max_conn_num 用完，
+//同进程的其他规则随之停转。启动时按各 remote 当时的地址查（之后 DNS 变成本机地址不查）：边 = 规则 u 的某个 remote 落到规则 v 的同协议监听；
+//在环上的边确定时 fatal，A→B→外部这样的链照常。确定：remote 等于具体监听地址；或 TCP 通配监听（[::] 在 v6only=0 时也收 IPv4）
+//同端口且 remote 是回环、未指定或本机网卡地址（TCP 监听在时，别的 socket 绑不了同端口的具体地址，只有之后起来的同 uid SO_REUSEPORT socket 能）。UDP 通配监听那种只 warn：
+//带 SO_REUSEADDR 的 UDP socket 能与它共存并接走发往具体地址的包（如 systemd-resolved 的 127.0.0.53:53）
+struct loop_edge_t
+{
+	int from,to;//规则下标
+	size_t remote;
+	int sure;
+};
+static void loop_ip(const address_t &a,in6_addr &ip)//IPv4 写成 v4-mapped
+{
+	if(a.inner.ipv4.sin_family==AF_INET)
+	{
+		memset(&ip,0,sizeof(ip));
+		ip.s6_addr[10]=ip.s6_addr[11]=0xff;
+		memcpy(&ip.s6_addr[12],&a.inner.ipv4.sin_addr,4);
+	}
+	else ip=a.inner.ipv6.sin6_addr;
+}
+static int loop_port(const address_t &a)
+{
+	return ntohs(a.inner.ipv4.sin_family==AF_INET?a.inner.ipv4.sin_port:a.inner.ipv6.sin6_port);
+}
+//remote 是否落到 rule 的 tcp（udp=0）或 udp 监听上；落到时 sure 为 0 表示可能被更具体的 socket 接走
+static int loop_reaches(const address_t &remote,forward_rule_t &rule,int udp,const vector<in6_addr> &locals,int &sure)
+{
+	static const unsigned char v4any[16]={0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0};
+	if(loop_port(remote)!=loop_port(rule.local_addr)) return 0;
+	in6_addr ip,l;
+	loop_ip(remote,ip);
+	loop_ip(rule.local_addr,l);
+	int v4=IN6_IS_ADDR_V4MAPPED(&ip);
+	if(v4?memcmp(ip.s6_addr,v4any,16)==0:IN6_IS_ADDR_UNSPECIFIED(&ip))//connect 到未指定地址实际发往回环
+	{
+		if(v4) ip.s6_addr[12]=127,ip.s6_addr[15]=1;
+		else ip=in6addr_loopback;
+	}
+	sure=1;
+	if(memcmp(&ip,&l,sizeof(ip))==0) return 1;
+	if(memcmp(l.s6_addr,v4any,16)==0)
+	{
+		if(!v4) return 0;
+	}
+	else if(IN6_IS_ADDR_UNSPECIFIED(&l))
+	{
+		int v6only=0;
+		socklen_t len=sizeof(v6only);
+		getsockopt(udp?rule.local_listen_fd_udp:rule.local_listen_fd_tcp,IPPROTO_IPV6,IPV6_V6ONLY,&v6only,&len);
+		if(v4&&v6only) return 0;
+	}
+	else return 0;
+	int local=v4?ip.s6_addr[12]==127:IN6_IS_ADDR_LOOPBACK(&ip);
+	for(size_t i=0;i<locals.size()&&!local;i++)
+		local=memcmp(&locals[i],&ip,sizeof(ip))==0;
+	sure=!udp;
+	return local;
+}
+static int loop_path(const vector<loop_edge_t> &edges,int from,int to,int sure_only)//from 能否经边走到 to
+{
+	vector<int> seen(app_config.rules.size(),0),stack(1,from);
+	seen[from]=1;
+	while(!stack.empty())
+	{
+		int u=stack.back();
+		stack.pop_back();
+		if(u==to) return 1;
+		for(size_t i=0;i<edges.size();i++)
+			if(edges[i].from==u&&(edges[i].sure||!sure_only)&&!seen[edges[i].to])
+				seen[edges[i].to]=1,stack.push_back(edges[i].to);
+	}
+	return 0;
+}
+static void check_forward_loops()
+{
+	vector<in6_addr> locals;
+	struct ifaddrs *ifs=0;
+	if(getifaddrs(&ifs)==0)
+	{
+		for(struct ifaddrs *p=ifs;p;p=p->ifa_next)
+		{
+			if(!p->ifa_addr||(p->ifa_addr->sa_family!=AF_INET&&p->ifa_addr->sa_family!=AF_INET6)) continue;
+			address_t a;
+			a.from_sockaddr(p->ifa_addr,p->ifa_addr->sa_family==AF_INET?sizeof(sockaddr_in):sizeof(sockaddr_in6));
+			locals.push_back(in6_addr());
+			loop_ip(a,locals.back());
+		}
+		freeifaddrs(ifs);
+	}
+	else mylog(log_warn,"getifaddrs failed, %s: the forwarding loop check only knows loopback addresses\n",get_sock_error());
+	for(int udp=0;udp<=1;udp++)
+	{
+		const char *proto=udp?"udp":"tcp";
+		vector<loop_edge_t> edges;
+		for(size_t u=0;u<app_config.rules.size();u++)
+		{
+			forward_rule_t &from=worker_rule(*workers[0],u);
+			if(!(udp?from.enable_udp:from.enable_tcp)) continue;
+			for(size_t j=0;j<from.remote_targets.size();j++)
+				for(size_t v=0;v<app_config.rules.size();v++)
+				{
+					forward_rule_t &to=worker_rule(*workers[0],v);
+					loop_edge_t e;
+					if((udp?to.enable_udp:to.enable_tcp)&&loop_reaches(from.remote_targets[j].addr,to,udp,locals,e.sure))
+					{
+						e.from=(int)u,e.to=(int)v,e.remote=j;
+						edges.push_back(e);
+					}
+				}
+		}
+		for(size_t i=0;i<edges.size();i++)
+		{
+			const loop_edge_t &e=edges[i];
+			if(!loop_path(edges,e.to,e.from,e.sure)) continue;
+			forward_rule_t &from=worker_rule(*workers[0],e.from),&to=worker_rule(*workers[0],e.to);
+			remote_target_t &r=from.remote_targets[e.remote];
+			char remote[max_remote_len+max_addr_len+4],listen_addr[max_addr_len],via[64]="";
+			if(r.is_domain)
+			{
+				char addr[max_addr_len];
+				r.addr.to_str(addr);
+				snprintf(remote,sizeof(remote),"%s (%s)",r.remote_str,addr);
+			}
+			else snprintf(remote,sizeof(remote),"%s",r.remote_str);
+			to.local_addr.to_str(listen_addr);
+			if(e.to!=e.from) snprintf(via,sizeof(via),", which forwards back to rule %d",from.index);
+			if(e.sure)
+			{
+				mylog(log_fatal,"rule %d [%s] remote %s reaches the listen address %s of rule %d%s: forwarding loop\n",
+					from.index,proto,remote,listen_addr,to.index,via);
+				myexit(-1);
+			}
+			mylog(log_warn,"rule %d [%s] remote %s has the port of the wildcard listen address %s of rule %d%s: forwarding loop unless another socket is bound to that address and port\n",
+				from.index,proto,remote,listen_addr,to.index,via);
+		}
+	}
+}
+
 //建第 i 条规则的监听（M2，S2）：每个 worker 一个 socket；N>1 时都设 SO_REUSEPORT，内核按四元组哈希（--cpu-affinity 时 TCP 先按 CPU，M5）把新连接与 UDP 流分给它们。由主线程在启动
 //worker 线程之前全部建好、bind 完，组成员在进程生命周期内固定：成员一变，UDP 四元组到 socket 的映射就整体重排。
 //N=1 时与 M2 之前一样只设 SO_REUSEADDR（D67）：一个监听用不着分流，reuseport 却让发往监听的每个 SYN 与数据报在 softirq 里多一次选择
@@ -3496,6 +3645,7 @@ int event_loop()
 		}
 		start_forward_rule(i);
 	}
+	check_forward_loops();
 
 	//DNS 主表（S5）：每个域名 remote 一项，启动时算作刚刷新过
 	my_time_t now=main_clock.now();
@@ -4025,15 +4175,6 @@ int main(int argc, char *argv[])
     ev_signal_init(&signal_watcher_sigpipe, sigpipe_cb, SIGPIPE);
     ev_signal_start(loop, &signal_watcher_sigpipe);
 
-
-    ev_signal signal_watcher_sigterm;
-    ev_signal_init(&signal_watcher_sigterm, sigterm_cb, SIGTERM);
-    ev_signal_start(loop, &signal_watcher_sigterm);
-
-    ev_signal signal_watcher_sigint;
-    ev_signal_init(&signal_watcher_sigint, sigint_cb, SIGINT);
-    ev_signal_start(loop, &signal_watcher_sigint);
-
     ev_signal signal_watcher_sigusr1;
     ev_signal_init(&signal_watcher_sigusr1, sigusr1_cb, SIGUSR1);
     ev_signal_start(loop, &signal_watcher_sigusr1);
@@ -4045,6 +4186,16 @@ int main(int argc, char *argv[])
 	assert(sizeof(i32_t)==4);
 	int i, j, k;
 	process_arg(argc,argv);
+	//SIGTERM、SIGINT 解析完参数才交给 libev（D105）：process_arg 里同步解析域名 remote，解析器在 EINTR 后接着等，期间保持默认处置，收到即终止；
+	//之后的启动步骤都很快，信号留到 ev_run 走有序退出。SIGPIPE、SIGUSR1 在上面就接住：它们的默认处置也是终止进程
+    ev_signal signal_watcher_sigterm;
+    ev_signal_init(&signal_watcher_sigterm, sigterm_cb, SIGTERM);
+    ev_signal_start(loop, &signal_watcher_sigterm);
+
+    ev_signal signal_watcher_sigint;
+    ev_signal_init(&signal_watcher_sigint, sigint_cb, SIGINT);
+    ev_signal_start(loop, &signal_watcher_sigint);
+
 	if(!disable_splice) tcp_pipe_probe();
 
 	event_loop();

@@ -92,6 +92,18 @@ not supported.
 ./tinymapper_amd64 -l[::]:4433 -r[::ffff:10.222.2.1]:443 -t -u
 ./tinymapper_amd64 -l[::ffff:0.0.0.0]:4433 -r[::ffff:10.222.2.1]:443 -t -u
 ```
+
+A remote that leads back into one of tinymapper's own listeners of the same
+protocol makes every flow loop until file descriptors or the connection limit
+run out, which stops the other rules too, so such a configuration is refused at
+startup: a rule's remote equal to its own or another rule's listen address
+(`-l127.0.0.1:443 -r127.0.0.1:443`, or two rules pointing at each other), or a
+loopback, `0.0.0.0` or local interface address on the port of a TCP wildcard
+listener (`0.0.0.0`, or `[::]`, which also takes IPv4). A chain through another
+rule to an outside host is fine. For UDP behind a wildcard listener only a
+warning is logged, because another socket bound to that exact address with
+`SO_REUSEADDR` (such as systemd-resolved on 127.0.0.53:53) receives the
+datagrams instead. Hostname remotes are checked with their startup address.
 # Options
 ```
 tinyPortMapper
