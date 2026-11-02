@@ -402,81 +402,6 @@ int set_timer(int epollfd,int &timer_fd)
 	return 0;
 }*/
 
-int address_t::from_str(char *str)
-{
-	clear();
-
-	char ip_addr_str[100];u32_t port;
-	mylog(log_info,"parsing address: %s\n",str);
-	int is_ipv6=0;
-	if(sscanf(str, "[%[^]]]:%u", ip_addr_str,&port)==2)
-	{
-		mylog(log_info,"its an ipv6 adress\n");
-		inner.ipv6.sin6_family=AF_INET6;
-		is_ipv6=1;
-	}
-	else if(sscanf(str, "%[^:]:%u", ip_addr_str,&port)==2)
-	{
-		mylog(log_info,"its an ipv4 adress\n");
-		inner.ipv4.sin_family=AF_INET;
-	}
-	else
-	{
-		mylog(log_error,"failed to parse\n");
-		myexit(-1);
-	}
-
-	mylog(log_info,"ip_address is {%s}, port is {%u}\n",ip_addr_str,port);
-
-	if(port>65535)
-	{
-		mylog(log_error,"invalid port: %d\n",port);
-		myexit(-1);
-	}
-
-	int ret=-100;
-	if(is_ipv6)
-	{
-		ret=inet_pton(AF_INET6, ip_addr_str,&(inner.ipv6.sin6_addr));
-		inner.ipv6.sin6_port=htons(port);
-		if(ret==0)  // 0 if address type doesnt match
-		{
-			mylog(log_error,"ip_addr %s is not an ipv6 address, %d\n",ip_addr_str,ret);
-			myexit(-1);
-		}
-		else if(ret==1) // inet_pton returns 1 on success
-		{
-			//okay
-		}
-		else
-		{
-			mylog(log_error,"ip_addr %s is invalid, %d\n",ip_addr_str,ret);
-			myexit(-1);
-		}
-	}
-	else
-	{
-		ret=inet_pton(AF_INET, ip_addr_str,&(inner.ipv4.sin_addr));
-		inner.ipv4.sin_port=htons(port);
-
-		if(ret==0)
-		{
-			mylog(log_error,"ip_addr %s is not an ipv4 address, %d\n",ip_addr_str,ret);
-			myexit(-1);
-		}
-		else if(ret==1)
-		{
-			//okay
-		}
-		else
-		{
-			mylog(log_error,"ip_addr %s is invalid, %d\n",ip_addr_str,ret);
-			myexit(-1);
-		}
-	}
-
-	return 0;
-}
 static void set_err(char *err,int err_len,const char *fmt,...)
 {
 	if(err==0||err_len<=0)
@@ -505,12 +430,13 @@ static int parse_port_str(const char *port_str,u32_t &port,char *err,int err_len
 			set_err(err,err_len,"invalid port");
 			return -1;
 		}
-		value=value*10+(u32_t)(*p-'0');
-		if(value>65535)
-		{
-			set_err(err,err_len,"invalid port");
-			return -1;
-		}
+		if(value<=65535) value=value*10+(u32_t)(*p-'0');//超过之后不再累加，不会回绕
+	}
+	//端口 0：监听时内核给每个 socket 各挑一个随机端口，远端则每个连接都失败，启动时就拒绝（D103）
+	if(value==0||value>65535)
+	{
+		set_err(err,err_len,"port must be between 1 and 65535");
+		return -1;
 	}
 	port=value;
 	return 0;
@@ -543,6 +469,69 @@ static int is_unspecified(const address_t &addr)
 		return addr.inner.ipv4.sin_addr.s_addr==htonl(INADDR_ANY);
 	}
 	return IN6_IS_ADDR_UNSPECIFIED(&addr.inner.ipv6.sin6_addr)||memcmp(&addr.inner.ipv6.sin6_addr,v4any,sizeof(v4any))==0;
+}
+
+//监听地址（-l 与配置文件的 listen 共用）：切分与报错用语同 parse_remote_target() 的字面量分支，不解析域名（D102）
+int address_t::from_str(const char *str,char *err,int err_len)
+{
+	clear();
+	char host[max_addr_len];
+	u32_t port=0;
+	if(str[0]==0)
+	{
+		set_err(err,err_len,"empty address");
+		return -1;
+	}
+	if(str[0]=='[')
+	{
+		const char *end=strchr(str,']');
+		if(end==0)
+		{
+			set_err(err,err_len,"missing ']'");
+			return -1;
+		}
+		if(end[1]!=':')
+		{
+			set_err(err,err_len,"missing ':'");
+			return -1;
+		}
+		if(copy_host_part(str+1,(int)(end-str-1),host,sizeof(host),err,err_len)!=0||parse_port_str(end+2,port,err,err_len)!=0)
+		{
+			return -1;
+		}
+		inner.ipv6.sin6_family=AF_INET6;
+		if(inet_pton(AF_INET6,host,&inner.ipv6.sin6_addr)!=1)
+		{
+			set_err(err,err_len,"invalid IPv6 address");
+			return -1;
+		}
+		inner.ipv6.sin6_port=htons((u16_t)port);
+		return 0;
+	}
+
+	const char *colon=strchr(str,':');
+	if(colon==0)
+	{
+		set_err(err,err_len,"missing ':'");
+		return -1;
+	}
+	if(strchr(colon+1,':')!=0)
+	{
+		set_err(err,err_len,"IPv6 address must be enclosed in []");
+		return -1;
+	}
+	if(copy_host_part(str,(int)(colon-str),host,sizeof(host),err,err_len)!=0||parse_port_str(colon+1,port,err,err_len)!=0)
+	{
+		return -1;
+	}
+	inner.ipv4.sin_family=AF_INET;
+	if(inet_pton(AF_INET,host,&inner.ipv4.sin_addr)!=1)
+	{
+		set_err(err,err_len,"invalid IPv4 address");
+		return -1;
+	}
+	inner.ipv4.sin_port=htons((u16_t)port);
+	return 0;
 }
 
 int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find,int *found)

@@ -10,9 +10,11 @@ import (
 	"slices"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 func writeConfig(t testing.TB, content string) string {
@@ -390,6 +392,9 @@ func TestConfigUDPOnly(t *testing.T) {
 // udpListenBufFatal 是 --udp-listen-buf 的值越界或不是数字时的 fatal 行
 const udpListenBufFatal = "udp-listen-buf value must be between 10 and 10240 (kbyte)"
 
+// sockBufFatal 是 --sock-buf 的值越界或不是数字时的完整 fatal 行（以前写的范围是 1..10240，实际下限 10，行尾还多一个空格）
+const sockBufFatal = "sock-buf value must be between 10 and 10240 (kbyte)\n"
+
 // 非法配置：进程以非零状态退出并给出原因
 func TestConfigInvalid(t *testing.T) {
 	t.Parallel()
@@ -404,6 +409,11 @@ func TestConfigInvalid(t *testing.T) {
 		return fmt.Sprintf("[[endpoints]]\nlisten = %q\nremote = %q\n%s", l, r1, extra)
 	}
 	dir := t.TempDir()
+	// 以前被宽松接受的监听地址与 cli_positional_echo 各用一个空闲端口：旧版本会真的监听在上面并一直运行，而不是撞上别的用例的端口
+	lp := func() int { return portOf(loopback4(t)) }
+	junkListen, colonListen, v6JunkListen, plusListen, wrapListen := fmt.Sprintf("127.0.0.1:%dabc", lp()), fmt.Sprintf("127.0.0.1:%d:90", lp()),
+		fmt.Sprintf("[::1]:%djunk", lp()), fmt.Sprintf("127.0.0.1:+%d", lp()), fmt.Sprintf("127.0.0.1:%d", 1<<32+lp())
+	echoListen := loopback4(t)
 
 	cases := []struct {
 		name string
@@ -417,6 +427,16 @@ func TestConfigInvalid(t *testing.T) {
 		{"cli_c_with_l", []string{"-c", "CFG", "-l", l}, ep(""), "cannot be combined"},
 		{"cli_c_with_t", []string{"-c", "CFG", "-t"}, ep(""), "cannot be combined"},
 		{"cli_duplicate_c", []string{"-c", "CFG", "-c", "CFG"}, ep(""), "duplicate -c"},
+		// D101：重复的 -l 与多余的位置参数以前被静默忽略（后一个 -l 覆盖前一个；"-r a b" 只用 a，"-c a b" 只读 a，"--" 之后的都不看）
+		{"cli_duplicate_l", []string{"-l", l, "-l", loopback4(t), "-r", r1, "-t"}, "", "duplicate -l option"},
+		{"cli_extra_remote", []string{"-l", l, "-r", r1, r2, "-t"}, "", "unexpected argument '" + r2 + "'"},
+		{"cli_c_extra", []string{"-c", "CFG", "extra"}, ep(""), "unexpected argument 'extra'"},
+		{"cli_after_dashdash", []string{"-l", l, "-r", r1, "-t", "--", "-u"}, "", "unexpected argument '-u'"},
+		// 空参数（systemd 的 ${VAR} 未设置时恰好展开成一个）也是多余参数，加了引号才看得出来
+		{"cli_empty_positional", []string{"-c", "CFG", ""}, ep(""), "unexpected argument ''"},
+		// GNU getopt、musl 把位置参数挪到最后再报；预扫描在 argv 的副本上跑，argc= 回显仍是命令行原序（D93）
+		{"cli_positional_first", []string{"foo", "-l", l, "-r", r1, "-t"}, "", "unexpected argument 'foo'"},
+		{"cli_positional_echo", []string{"foo", "-l", echoListen, "-r", r1, "-t"}, "", fmt.Sprintf("foo -l %s -r %s -t \n", echoListen, r1)},
 		{"cli_multi_r_no_balance", []string{"-l", l, "-r", r1, "-r", r2, "-t"}, "", "balance is required"},
 		{"cli_weight_count", []string{"-l", l, "-r", r1, "-r", r2, "-t", "--balance", "roundrobin: 1"}, "", "weight count must equal remote count"},
 		{"cli_weight_zero", []string{"-l", l, "-r", r1, "-r", r2, "-t", "--balance", "roundrobin: 0, 1"}, "", "between 1 and 255"},
@@ -427,12 +447,38 @@ func TestConfigInvalid(t *testing.T) {
 		{"cli_duplicate_balance", []string{"-l", l, "-r", r1, "-t", "--balance", "off:", "--balance", "off:"}, "", "duplicate --balance"},
 		{"cli_bad_ipv4_remote", []string{"-l", l, "-r", "1.2.3:80", "-t"}, "", "invalid IPv4 address"},
 		{"cli_unbracketed_ipv6_remote", []string{"-l", l, "-r", "::1:80", "-t"}, "", "IPv6 address must be enclosed"},
-		{"cli_bad_port_remote", []string{"-l", l, "-r", "127.0.0.1:70000", "-t"}, "", "invalid port"},
-		{"cli_listen_no_port", []string{"-l", "127.0.0.1", "-r", r1, "-t"}, "", "failed to parse"},
-		{"cli_listen_hostname", []string{"-l", "localhost:80", "-r", r1, "-t"}, "", "is not an ipv4 address"},
+		{"cli_bad_port_remote", []string{"-l", l, "-r", "127.0.0.1:70000", "-t"}, "", "-r remote: port must be between 1 and 65535"},
+		// D103：端口 0 监听时每个 socket 各绑一个随机端口，远端时每个连接都失败
+		{"cli_remote_port_0", []string{"-l", l, "-r", "127.0.0.1:0", "-t"}, "", "-r remote: port must be between 1 and 65535"},
+		// D102：-l 与配置文件的 listen 同一个严格的解析（以前 sscanf("%[^:]:%u") 不管端口后面的内容、接受符号、按 32 位回绕），
+		// 用语同 -r；出错是 fatal，--log-level 1 时也看得到原因（以前是 log_error，静默以 255 退出）
+		{"cli_listen_no_port", []string{"-l", "127.0.0.1", "-r", r1, "-t"}, "", "-l 127.0.0.1: missing ':'"},
+		{"cli_listen_no_port_level1", []string{"--log-level", "1", "-l", "127.0.0.1", "-r", r1, "-t"}, "", "-l 127.0.0.1: missing ':'"},
+		{"cli_listen_hostname", []string{"-l", "localhost:80", "-r", r1, "-t"}, "", "-l localhost:80: invalid IPv4 address"},
+		{"cli_listen_port_junk", []string{"-l", junkListen, "-r", r1, "-t"}, "", "-l " + junkListen + ": invalid port"},
+		{"cli_listen_two_colons", []string{"-l", colonListen, "-r", r1, "-t"}, "", "-l " + colonListen + ": IPv6 address must be enclosed in []"},
+		{"cli_listen_ipv6_port_junk", []string{"-l", v6JunkListen, "-r", r1, "-t"}, "", "-l " + v6JunkListen + ": invalid port"},
+		{"cli_listen_port_plus", []string{"-l", plusListen, "-r", r1, "-t"}, "", "-l " + plusListen + ": invalid port"},
+		{"cli_listen_port_wrap", []string{"-l", wrapListen, "-r", r1, "-t"}, "", "-l " + wrapListen + ": port must be between 1 and 65535"},
+		{"cli_listen_port_0", []string{"-l", "127.0.0.1:0", "-r", r1, "-t"}, "", "-l 127.0.0.1:0: port must be between 1 and 65535"},
+		{"cli_listen_empty", []string{"-l", "", "-r", r1, "-t"}, "", "-l : empty address"},
+		{"cli_listen_v6_no_close", []string{"-l", "[::1:80", "-r", r1, "-t"}, "", "-l [::1:80: missing ']'"},
+		{"cli_listen_v6_no_colon", []string{"-l", "[::1]80", "-r", r1, "-t"}, "", "-l [::1]80: missing ':'"},
+		{"cli_listen_v6_empty_host", []string{"-l", "[]:80", "-r", r1, "-t"}, "", "-l []:80: empty host"},
+		{"cli_listen_v6_bad", []string{"-l", "[1.2.3.4]:80", "-r", r1, "-t"}, "", "-l [1.2.3.4]:80: invalid IPv6 address"},
+		{"cli_listen_empty_port", []string{"-l", "127.0.0.1:", "-r", r1, "-t"}, "", "-l 127.0.0.1:: empty port"},
 		{"cli_listen_not_local", []string{"-l", "192.0.2.1:80", "-r", r1, "-t"}, "", "bind failed"},
 		{"cli_listen_busy", []string{"-l", busy.Addr().String(), "-r", r1, "-t"}, "", "bind failed"},
-		{"cli_sock_buf", []string{"-l", l, "-r", r1, "-t", "--sock-buf", "5"}, "", "sock-buf value"},
+		{"cli_sock_buf", []string{"-l", l, "-r", r1, "-t", "--sock-buf", "5"}, "", sockBufFatal},
+		// D100：数值选项只认十进制数字，以前 sscanf("%d") 不管后面的内容、接受符号、按 32 位回绕（4294968320 = 2^32+1024）
+		{"cli_sock_buf_suffix", []string{"-l", l, "-r", r1, "-t", "--sock-buf", "1024x"}, "", sockBufFatal},
+		{"cli_sock_buf_wrap", []string{"-l", l, "-r", r1, "-t", "--sock-buf", "4294968320"}, "", sockBufFatal},
+		{"cli_udp_listen_buf_plus", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "+100"}, "", udpListenBufFatal},
+		{"cli_pipe_size_suffix", []string{"-l", l, "-r", r1, "-t", "--pipe-size", "256k"}, "", pipeSizeFatal},
+		{"cli_threads_list", []string{"-l", l, "-r", r1, "-t", "--threads", "4,8"}, "", threadsFatal},
+		{"cli_threads_wrap", []string{"-l", l, "-r", r1, "-t", "--threads", "4294967297"}, "", threadsFatal},
+		{"cli_log_level_suffix", []string{"-l", l, "-r", r1, "-t", "--log-level", "3abc"}, "", "invalid log_level"},
+		{"cli_log_level_wrap", []string{"-l", l, "-r", r1, "-t", "--log-level", "4294967300"}, "", "invalid log_level"},
 		// U6：--udp-listen-buf 只接受 10–10240（KiB）；边界值 10、10240 的生效见 TestUDPSockBuf
 		{"cli_udp_listen_buf_9", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "9"}, "", udpListenBufFatal},
 		{"cli_udp_listen_buf_10241", []string{"-l", l, "-r", r1, "-u", "--udp-listen-buf", "10241"}, "", udpListenBufFatal},
@@ -466,9 +512,16 @@ func TestConfigInvalid(t *testing.T) {
 		{"toml_bad_bool", []string{"-c", "CFG"}, ep("use_udp = yes\n"), "expected boolean literal"},
 		{"toml_unquoted_string", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = %s\nremote = %q\n", l, r1), "expected double quoted string"},
 		{"toml_unterminated_string", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"%s\nremote = %q\n", l, r1), "unterminated double quoted string"},
-		{"toml_listen_hostname", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"localhost:%d\"\nremote = %q\n", portOf(l), r1), "invalid ipv4 address literal"},
-		{"toml_listen_unbracketed_ipv6", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"::1:%d\"\nremote = %q\n", portOf(l), r1), "must be surrounded with []"},
-		{"toml_listen_bad_port", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"127.0.0.1:70000\"\nremote = %q\n", r1), "port must be between 0 and 65535"},
+		{"toml_listen_hostname", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"localhost:%d\"\nremote = %q\n", portOf(l), r1), "listen: invalid IPv4 address"},
+		{"toml_listen_unbracketed_ipv6", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"::1:%d\"\nremote = %q\n", portOf(l), r1), "listen: IPv6 address must be enclosed in []"},
+		{"toml_listen_bad_port", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"127.0.0.1:70000\"\nremote = %q\n", r1), "listen: port must be between 1 and 65535"},
+		{"toml_listen_port_0", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"127.0.0.1:0\"\nremote = %q\n", r1), "listen: port must be between 1 and 65535"},
+		{"toml_listen_empty", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"\"\nremote = %q\n", r1), "listen: empty address"},
+		{"toml_listen_v6_no_colon", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"[::1]%d\"\nremote = %q\n", portOf(l), r1), "listen: missing ':'"},
+		// 字符串里的 NUL：值按 c_str() 解析，NUL 之后的内容以前被静默丢掉（listen 曾由 validate_address_literal 按整个 string 拒绝）
+		{"toml_listen_nul", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"%s\x00junk\"\nremote = %q\n", l, r1), "listen: NUL byte inside string"},
+		{"toml_extra_nul", []string{"-c", "CFG"}, ep(fmt.Sprintf("extra_remotes = [\"%s\x00junk\"]\nbalance = \"roundrobin: 1, 1\"\n", r2)), "extra_remotes: NUL byte inside string"},
+		{"toml_remote_port_0", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = %q\nremote = \"127.0.0.1:0\"\n", l), "remote: port must be between 1 and 65535"},
 		{"toml_no_protocol", []string{"-c", "CFG"}, ep("no_tcp = true\n"), "both tcp and udp are disabled"},
 		{"toml_network_no_protocol", []string{"-c", "CFG"}, "[network]\nno_tcp = true\n" + ep(""), "both tcp and udp are disabled"},
 		{"toml_extra_not_array", []string{"-c", "CFG"}, ep(fmt.Sprintf("extra_remotes = %q\nbalance = \"roundrobin: 1, 1\"\n", r2)), "expected inline string array"},
@@ -496,5 +549,111 @@ func TestConfigInvalid(t *testing.T) {
 				t.Fatalf("输出中没有 %q：\n%s", c.want, out)
 			}
 		})
+	}
+}
+
+// 选项本身有错（getopt_long 返回 '?'：缺值、未知选项）：getopt_long 已把具体原因写到 stderr（tinymapper 把它并到了 stdout），随后是一行
+// fatal "invalid command line option, see -h"，以换行结尾。以前这一行是 "unknown option <3f>"（'?' 的十六进制）且没有换行。
+// 两种 libc 的措辞不同（glibc "option '--threads' requires an argument"、"unrecognized option '--bogus'"；musl "option requires an
+// argument: threads"、"unrecognized option: bogus"），都有同一行里的原因与选项名。harness 总带 --disable-color，myexit 不再补颜色复位行
+func TestConfigOptionError(t *testing.T) {
+	t.Parallel()
+	for _, c := range []struct{ name, arg, reason string }{
+		{"missing-value", "--threads", "requires an argument"},
+		{"unknown", "--bogus", "unrecognized option"},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			out := runExpectFail(t, 5*time.Second, "-l", loopback4(t), "-r", loopback4(t), "-t", c.arg)
+			opt := strings.TrimPrefix(c.arg, "--")
+			if !slices.ContainsFunc(strings.Split(out, "\n"), func(l string) bool { return strings.Contains(l, c.reason) && strings.Contains(l, opt) }) {
+				t.Errorf("输出中没有同时含 %q 与 %q 的一行（getopt_long 的原因）：\n%s", c.reason, opt, out)
+			}
+			if !strings.HasSuffix(out, "[FATAL]invalid command line option, see -h\n") || strings.Contains(out, "<3f>") {
+				t.Errorf("输出应以 fatal 行 \"invalid command line option, see -h\" 加换行结束、不含 \"<3f>\"：%q", out)
+			}
+		})
+	}
+}
+
+// ptyPair 返回一对伪终端（打开方式同 startMapperTTY）：主设备，与关掉输出处理 OPOST 的从设备（否则 ONLCR 把 \n 写成 \r\n）。
+// Fd() 把两端都切成阻塞模式
+func ptyPair(t testing.TB) (master, slave *os.File) {
+	t.Helper()
+	master, err := os.OpenFile("/dev/ptmx", os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Skipf("打不开 /dev/ptmx（%v）：环境中没有伪终端", err)
+	}
+	t.Cleanup(func() { master.Close() })
+	var unlock int32
+	var n uint32
+	if err := ioctl(int(master.Fd()), syscall.TIOCSPTLCK, unsafe.Pointer(&unlock)); err != nil {
+		t.Fatalf("解锁伪终端失败：%v", err)
+	}
+	if err := ioctl(int(master.Fd()), syscall.TIOCGPTN, unsafe.Pointer(&n)); err != nil {
+		t.Fatalf("读取伪终端编号失败：%v", err)
+	}
+	slave, err = os.OpenFile(fmt.Sprintf("/dev/pts/%d", n), os.O_RDWR|syscall.O_NOCTTY, 0)
+	if err != nil {
+		t.Fatalf("打开伪终端从设备失败：%v", err)
+	}
+	t.Cleanup(func() { slave.Close() })
+	var tio syscall.Termios
+	if err := ioctl(int(slave.Fd()), syscall.TCGETS, unsafe.Pointer(&tio)); err != nil {
+		t.Fatalf("TCGETS：%v", err)
+	}
+	tio.Oflag &^= syscall.OPOST
+	if err := ioctl(int(slave.Fd()), syscall.TCSETS, unsafe.Pointer(&tio)); err != nil {
+		t.Fatalf("TCSETS：%v", err)
+	}
+	return master, slave
+}
+
+// D104：配置文件读到一半出错时以 fatal 退出，不按已读到的部分启动。经 seccomp 通知把 tinymapper 打开配置文件的 open/openat 换成伪终端的主设备：
+// 从设备写入文件的前一段（一个完整的 [[endpoints]]）后关闭，主设备先读出缓冲的这一段，读完再读就是 EIO（startMapperTTY 收尾也靠这一点），
+// 相当于磁盘在第一块之后读出错，文件里的第二个 [[endpoints]] 永远读不到。以前 libstdc++ 的 underflow 抛出的 ios_failure 被 getline 接住、
+// 只置 badbit，循环像读到文件尾一样结束，只按第一条规则启动
+func TestConfigReadError(t *testing.T) {
+	t.Parallel()
+	l1, l2, remote := loopback4(t), loopback4(t), loopback4(t)
+	first := fmt.Sprintf("[[endpoints]]\nlisten = %q\nremote = %q\n", l1, remote)
+	cfg := writeConfig(t, first+fmt.Sprintf("\n[[endpoints]]\nlisten = %q\nremote = %q\n", l2, remote))
+	master, slave := ptyPair(t)
+	if _, err := slave.WriteString(first); err != nil {
+		t.Fatal(err)
+	}
+	slave.Close()
+	masterFD := int(master.Fd())
+	var opens atomic.Int64
+	m, _ := startMapperNotifyWith(t, func(n *notifier) {
+		n.setAddFD(func(call notifyCall) int {
+			if path, ok := openPath(call); ok && path == cfg {
+				opens.Add(1)
+				return masterFD
+			}
+			return -1
+		})
+	}, nil, "-c", cfg)
+	deadline := time.Now().Add(10 * time.Second)
+	for !m.exited() {
+		if listening(m.pid(), "tcp", portOf(l1)) {
+			t.Fatalf("读配置文件出错后仍按读到的部分启动：监听了第一条规则的 %s（第二条的 %s：%v），配置文件经 notifier 打开 %d 次",
+				l1, l2, listening(m.pid(), "tcp", portOf(l2)), opens.Load())
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("tinymapper 在 10 s 内既没有退出也没有监听 %s", l1)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	m.stop(t, true)
+	var ee *exec.ExitError
+	if !errors.As(m.exitErr, &ee) {
+		t.Errorf("tinymapper 退出：%v，期望非零状态", m.exitErr)
+	}
+	if n := opens.Load(); n != 1 {
+		t.Errorf("配置文件经 notifier 换成伪终端 %d 次，期望 1 次", n)
+	}
+	if want := fmt.Sprintf("%s:%d: path: failed to read config file", cfg, strings.Count(first, "\n")+1); m.logLines("[FATAL]", want) != 1 {
+		t.Errorf("日志里没有一行 fatal %q：\n%s", want, m.logTail(20))
 	}
 }

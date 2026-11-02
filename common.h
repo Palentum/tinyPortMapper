@@ -222,7 +222,8 @@ struct address_t  //TODO scope id
 	{
 		memset(&inner,0,sizeof(inner));
 	}
-	int from_str(char * str);
+	//监听地址：只认 a.b.c.d:port 或 [ipv6]:port 字面量，端口 1–65535；失败返回 -1，原因写进 err（可为 0），不写日志、不退出（D102）
+	int from_str(const char *str,char *err,int err_len);
 
 	int from_sockaddr(sockaddr *,socklen_t);
 

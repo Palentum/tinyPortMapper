@@ -456,7 +456,7 @@ func TestLogClosedStdFDs(t *testing.T) {
 // D93（审查 Medium #6）：--log-level、--disable-color、--enable-color 与其他选项是同一套 getopt_long 解析，--log-level=N 和唯一前缀
 // 缩写都生效（以前开头的预扫描只认精确拼写，其余被静默忽略）。harness 总在最前面加 --disable-color，颜色用例在它之后再开、再关。
 // 每个用例转发一个连接后发 SIGUSR1：统计行不受级别过滤（0 除外）且写完就 fflush，此前记下的日志都已在文件里，这时没有的行就是被过滤了。
-// 参数前放一个位置参数 foo：预扫描在 argv 的副本上跑，argc= 回显仍是命令行原序（GNU getopt、musl 都会重排它解析的 argv）
+// D101 起多余的位置参数是 fatal，argc= 回显保持原序（预扫描在 argv 的副本上跑）由 TestConfigInvalid 的 cli_positional_echo 查
 func TestLogOptionForms(t *testing.T) {
 	t.Parallel()
 	ansi := regexp.MustCompile("\x1b\\[[0-9;]*m")
@@ -478,7 +478,7 @@ func TestLogOptionForms(t *testing.T) {
 			t.Parallel()
 			be := serveTCP(t, loopback4(t), echoHandler(""))
 			listen := loopback4(t)
-			args := append(append([]string{"foo"}, c.args...), "-l", listen, "-r", be.addr, "-t")
+			args := append(slices.Clone(c.args), "-l", listen, "-r", be.addr, "-t")
 			m := startMapper(t, listenPoints("t", portOf(listen)), args...)
 			if err := cycleConn(listen); err != nil {
 				t.Fatalf("经 tinymapper 转发连接失败：%v", err)

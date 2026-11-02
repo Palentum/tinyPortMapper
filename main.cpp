@@ -14,6 +14,7 @@
 #include <semaphore.h>
 #include <signal.h>
 #include <sched.h>
+#include <limits.h>
 #include <linux/filter.h>
 #include <thread>
 #include <mutex>
@@ -3628,6 +3629,20 @@ void print_help()
 
 	//printf("common options,these options must be same on both side\n");
 }
+//命令行数值选项的值只认十进制数字：符号、空白、单位后缀、十六进制、空串与超过 INT_MAX 都返回 -1，由调用方按越界报错（D100；
+//sscanf("%d") 会把 "512k" 读成 512、"4294968320" 回绕成 1024）
+static int parse_uint_arg(const char *s)
+{
+	if(s[0]==0) return -1;
+	int value=0;
+	for(const char *p=s;*p;p++)
+	{
+		if(*p<'0'||*p>'9') return -1;
+		if(value>(INT_MAX-(*p-'0'))/10) return -1;
+		value=value*10+(*p-'0');
+	}
+	return value;
+}
 void process_arg(int argc, char *argv[])
 {
 	int i;
@@ -3675,8 +3690,7 @@ void process_arg(int argc, char *argv[])
 		if(opt!=1) continue;
 		if(strcmp(long_options[option_index].name,"log-level")==0)
 		{
-			int tmp=-1;
-			sscanf(optarg,"%d",&tmp);
+			int tmp=parse_uint_arg(optarg);
 			if(0<=tmp&&tmp<log_end)
 			{
 				log_level=tmp;
@@ -3734,6 +3748,11 @@ void process_arg(int argc, char *argv[])
 			config_path=optarg;
 			break;
 		case 'l':
+			if(local_arg!=0)
+			{
+				mylog(log_fatal,"duplicate -l option\n");
+				myexit(-1);
+			}
 			no_l = 0;
 			local_arg=optarg;
 			used_cli_rule_option=1;
@@ -3780,8 +3799,7 @@ void process_arg(int argc, char *argv[])
 			}
 			else if(strcmp(long_options[option_index].name,"sock-buf")==0)
 			{
-				int tmp=-1;
-				sscanf(optarg,"%d",&tmp);
+				int tmp=parse_uint_arg(optarg);
 				if(10<=tmp&&tmp<=10*1024)
 				{
 					socket_buf_size=tmp*1024;
@@ -3789,14 +3807,13 @@ void process_arg(int argc, char *argv[])
 				}
 				else
 				{
-					mylog(log_fatal,"sock-buf value must be between 1 and 10240 (kbyte) \n");
+					mylog(log_fatal,"sock-buf value must be between 10 and 10240 (kbyte)\n");
 					myexit(-1);
 				}
 			}
 			else if(strcmp(long_options[option_index].name,"udp-listen-buf")==0)
 			{
-				int tmp=-1;
-				sscanf(optarg,"%d",&tmp);
+				int tmp=parse_uint_arg(optarg);
 				if(10<=tmp&&tmp<=10*1024)
 				{
 					listen_fd_buf_size=tmp*1024;
@@ -3817,8 +3834,7 @@ void process_arg(int argc, char *argv[])
 			}
 			else if(strcmp(long_options[option_index].name,"pipe-size")==0)
 			{
-				int tmp=-1;
-				sscanf(optarg,"%d",&tmp);
+				int tmp=parse_uint_arg(optarg);
 				if(64<=tmp&&tmp<=1024)
 				{
 					tcp_pipe_size=tmp*1024;
@@ -3851,7 +3867,7 @@ void process_arg(int argc, char *argv[])
 					tmp=min(tmp,worker_count_auto_max);
 				}
 				else
-					sscanf(optarg,"%d",&tmp);
+					tmp=parse_uint_arg(optarg);
 				if(1<=tmp&&tmp<=worker_count_max)
 				{
 					worker_count=tmp;
@@ -3868,10 +3884,15 @@ void process_arg(int argc, char *argv[])
 				myexit(-1);
 			}
 			break;
-		default:
-			mylog(log_fatal,"unknown option <%x>", opt);
+		default://具体原因 getopt_long 已经写到 stderr（已并到 stdout）
+			mylog(log_fatal,"invalid command line option, see -h\n");
 			myexit(-1);
 		}
+	}
+	if(optind<argc)//多余的位置参数（"-r a:1 b:2" 里的 b:2、"--" 之后的参数）以前被静默忽略（D101）
+	{
+		mylog(log_fatal,"unexpected argument '%s'\n",argv[optind]);//加引号：空参数（如 systemd 的 ${VAR} 未设置）显示为 ''
+		myexit(-1);
 	}
 
 	if(config_path!=0)
@@ -3932,9 +3953,13 @@ void process_arg(int argc, char *argv[])
 		rule.enable_tcp=cli_enable_tcp;
 		rule.enable_udp=cli_enable_udp;
 		snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",local_arg);
-		rule.local_addr.from_str(rule.listen_str);
-		rule.remote_targets.reserve(remote_args.size());
 		char err[dns_error_len];
+		if(rule.local_addr.from_str(rule.listen_str,err,sizeof(err))!=0)
+		{
+			mylog(log_fatal,"-l %s: %s\n",local_arg,err);
+			myexit(-1);
+		}
+		rule.remote_targets.reserve(remote_args.size());
 		for(size_t remote_i=0;remote_i<remote_args.size();remote_i++)
 		{
 			remote_target_config_t target;
@@ -3966,10 +3991,10 @@ int unit_test()
 
 	address_t::hash_function hash;
 	address_t test;
-	test.from_str((char*)"[2001:19f0:7001:1111:00:ff:11:22]:443");
+	test.from_str((char*)"[2001:19f0:7001:1111:00:ff:11:22]:443",0,0);
 	printf("%s\n",test.get_str());
 	printf("%d\n",hash(test));
-	test.from_str((char*)"44.55.66.77:443");
+	test.from_str((char*)"44.55.66.77:443",0,0);
 	printf("%s\n",test.get_str());
 	printf("%d\n",hash(test));
 

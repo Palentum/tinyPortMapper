@@ -320,6 +320,10 @@ namespace
 			{
 				config_fatal(path,line,field,"unexpected quote inside string");
 			}
+			if(result[i]==0)//值按 c_str() 解析，NUL 之后的内容会被静默丢掉
+			{
+				config_fatal(path,line,field,"NUL byte inside string");
+			}
 		}
 		return result;
 	}
@@ -357,6 +361,10 @@ namespace
 			string item;
 			while(pos<len&&value[pos]!='"')
 			{
+				if(value[pos]==0)
+				{
+					config_fatal(path,line,field,"NUL byte inside string");
+				}
 				item.push_back(value[pos]);
 				pos++;
 			}
@@ -392,80 +400,6 @@ namespace
 				return result;
 			}
 			config_fatal(path,line,field,"missing comma between array items");
-		}
-	}
-
-	static unsigned long parse_port(const char *path,int line,const char *field,const string &port_s)
-	{
-		if(port_s.empty())
-		{
-			config_fatal(path,line,field,"missing port");
-		}
-		for(size_t i=0;i<port_s.size();i++)
-		{
-			if(!isdigit((unsigned char)port_s[i]))
-			{
-				config_fatal(path,line,field,"port must contain only digits");
-			}
-		}
-		errno=0;
-		char *end=0;
-		unsigned long port=strtoul(port_s.c_str(),&end,10);
-		if(errno!=0 || end==0 || *end!=0 || port>65535)
-		{
-			config_fatal(path,line,field,"port must be between 0 and 65535");
-		}
-		return port;
-	}
-
-	static void validate_address_literal(const char *path,int line,const char *field,const string &value)
-	{
-		if(value.empty())
-		{
-			config_fatal(path,line,field,"empty address");
-		}
-		if(value[0]=='[')
-		{
-			size_t close=value.find("]:");
-			if(close==string::npos)
-			{
-				config_fatal(path,line,field,"ipv6 address must use [ip]:port format");
-			}
-			string ip=value.substr(1,close-1);
-			string port_s=value.substr(close+2);
-			parse_port(path,line,field,port_s);
-			if(ip.empty())
-			{
-				config_fatal(path,line,field,"empty ipv6 address");
-			}
-			in6_addr addr6;
-			if(inet_pton(AF_INET6,ip.c_str(),&addr6)!=1)
-			{
-				config_fatal(path,line,field,"invalid ipv6 address literal");
-			}
-			return;
-		}
-
-		size_t colon=value.find(':');
-		if(colon==string::npos)
-		{
-			config_fatal(path,line,field,"missing port separator ':'");
-		}
-		if(value.find(':',colon+1)!=string::npos)
-		{
-			config_fatal(path,line,field,"ipv6 address must be surrounded with []");
-		}
-		string ip=value.substr(0,colon);
-		string port_s=value.substr(colon+1);
-		parse_port(path,line,field,port_s);
-		if(ip.empty())
-		{
-			config_fatal(path,line,field,"empty ipv4 address");
-		}
-		in_addr addr4;
-		if(inet_pton(AF_INET,ip.c_str(),&addr4)!=1)
-		{
-			config_fatal(path,line,field,"invalid ipv4 address literal");
 		}
 	}
 
@@ -572,7 +506,12 @@ namespace
 			{
 				config_fatal(path,endpoint.line_extra_remotes,"extra_remotes","too many remote targets");
 			}
-			validate_address_literal(path,endpoint.line_listen,"listen",endpoint.listen);
+			char err[dns_error_len];
+			address_t local_addr;
+			if(local_addr.from_str(endpoint.listen.c_str(),err,sizeof(err))!=0)
+			{
+				config_fatal(path,endpoint.line_listen,"listen",err);
+			}
 
 			bool no_tcp=network.has_no_tcp ? network.no_tcp : false;
 			bool use_udp=network.has_use_udp ? network.use_udp : false;
@@ -587,9 +526,8 @@ namespace
 				config_fatal(path,endpoint.line,"no_tcp/use_udp","both tcp and udp are disabled for endpoint");
 			}
 			snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",endpoint.listen.c_str());
-			rule.local_addr.from_str(rule.listen_str);
+			rule.local_addr=local_addr;
 			rule.remote_targets.reserve(1+endpoint.extra_remotes.size());
-			char err[dns_error_len];
 			remote_target_config_t target;
 			if(parse_remote_config_target(endpoint.remote.c_str(),target,err,sizeof(err))!=0)
 			{
@@ -682,6 +620,12 @@ int load_config_file(const char *path, app_config_t &config)
 		{
 			config_fatal(path,line_no,key.c_str(),"key appears outside [network] or [[endpoints]]");
 		}
+	}
+	//read() 出错（如 EIO）时 libstdc++ 的 underflow 抛 ios_failure，getline 接住后只置 badbit，循环像读到文件尾一样结束：
+	//不查就会按已读到的部分启动，规则集被静默截断。errno 已不可靠，不附 strerror（D104）
+	if(in.bad())
+	{
+		config_fatal(path,line_no+1,"path","failed to read config file");
 	}
 
 	finalize_config(path,line_no,network,endpoints,config);
