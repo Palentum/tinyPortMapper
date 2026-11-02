@@ -1701,6 +1701,22 @@ static inline void nodelay_before_send(tcp_info_t &info,int len)
 	info.nodelay_wait=0;
 }
 
+//首轮 splice 读返回 EPERM/EINVAL/EOPNOTSUPP 时，区分 splice 本身不可用与这条连接被 splice 取走的待决错误（D110）：没开 IP_RECVERR 时
+//ICMP 错误和重传时的路由错误先记在 sk_err_soft，超时放弃才进 sk_err，可能正是这几个值（IPv4 源路由失败 EOPNOTSUPP、黑洞路由 EINVAL、IPsec block EPERM；
+//没有映射到 ENOSYS 的，它不经这里）。sk_err 只随 tcp_done 写入，之后状态是 CLOSE；能 splice 时报错说明一个字节都没读到：接收队列为空，
+//或队首是紧急字节（FIONREAD 也是 0）。两条都满足才算连接的错误，这时即使其实是 splice 不可用，关掉这一对也对（连接已断，或两个方向都已 EOF；
+//紧急字节之后的数据能 splice 时同样读不到）。换页失败等读不到又有数据的少见情况 FIONREAD 大于 0，仍按不可用处理。不改 errno
+static int tcp_splice_err_is_sock(int fd)
+{
+	int saved=errno;
+	struct tcp_info info;
+	socklen_t len=sizeof(info);
+	int inq=-1;
+	int ret=getsockopt(fd,IPPROTO_TCP,TCP_INFO,&info,&len)==0&&info.tcpi_state==TCP_CLOSE&&ioctl(fd,FIONREAD,&inq)==0&&inq==0;
+	errno=saved;
+	return ret;
+}
+
 //同一 fd 上切换事件一律 stop → 改 events → start，不经 ev_io_init：EV__IOFDSET 表示新 fd，libev fd_reify 的本地补丁
 //对它直接 ADD，fd 仍在 epoll 中时就成了 ADD（EEXIST）再 MOD（T13）
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
@@ -1827,9 +1843,10 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				//队首是紧急数据（对端 MSG_OOB）时非阻塞 splice 返回 EAGAIN，epoll 却一直报可读，这一次改用 recv：
 				//它跳过紧急字节（没有 SO_OOBINLINE），与拷贝路径一致。别的原因（如页分配失败）同样交给 recv
 				if(recv_len<0&&errno==EAGAIN) spliced=0;
-				else if(recv_len<0&&(errno==ENOSYS||errno==EPERM||errno==EINVAL||errno==EOPNOTSUPP))
+				else if(recv_len<0&&(errno==ENOSYS||((errno==EPERM||errno==EINVAL||errno==EOPNOTSUPP)&&!tcp_splice_err_is_sock(my_fd))))
 				{
-					//splice 本身不可用（如 seccomp 白名单里没有它）：什么都没读，整个进程改走拷贝（审查 L1）
+					//splice 本身不可用（如 seccomp 白名单里没有它）：什么都没读，整个进程改走拷贝（审查 L1）。
+					//这条连接的待决错误不算（D110）：落到下面按读出错关闭（这时再 recv 只会读到 0）
 					mylog(log_warn,"[tcp]splice failed (%s), forwarding all TCP by copy from now on\n",get_sock_error());
 					disable_splice.store(1,memory_order_relaxed);
 					spliced=0;
@@ -1853,6 +1870,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_trace,"fd=%d,recv_len=%d\n",my_fd,recv_len);
 		if(recv_len==0)
 		{
+			if(my_info.err!=0)
+			{
+				//读分支往本侧写出时出错，sk_err 已被那次写出取走，这里读到 0 不是对端的 FIN（D111）：按那个错误关闭，不向另一侧转发半关闭
+				errno=my_info.err;
+				mylog(log_info,"[tcp]send_len=-1,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
+				conn_manager_tcp.erase_closed(&tcp_pair);
+				return;
+			}
 			if(other_info.eof)
 			{
 				mylog(log_info,"[tcp]recv_len=%d,connection {%s} closed bc of EOF\n",recv_len,tcp_pair.addr.get_str());
@@ -1908,9 +1933,10 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 					conn_manager_tcp.bytes[dir]+=send_len;
 					conn_manager_tcp.splice_bytes[dir]+=send_len;
 				}
+				else if(send_len<0&&errno!=EAGAIN) other_info.err=errno;//D111，同 send
 				if(my_info.data_len!=0)
 				{
-					//没写完（含 EAGAIN；出错时留给写分支，同 send）：scratch pipe 连同数据交给本方向，下一次 splice 前再从池里取一个
+					//没写完（含 EAGAIN；出错时记在 other_info.err，同 send）：scratch pipe 连同数据交给本方向，下一次 splice 前再从池里取一个
 					my_info.pipe=w.tcp_pipe_scratch;
 					w.tcp_pipe_scratch.r=w.tcp_pipe_scratch.w=-1;
 					tcp_unshrink_sndbuf(other_info);
@@ -1950,9 +1976,15 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				my_info.begin+=send_len;
 				conn_manager_tcp.bytes[dir]+=send_len;
 			}
+			else if(send_len<0&&errno!=EAGAIN)
+			{
+				//出错（RST、超时）时这次 send 已取走目的端的 sk_err：记下来，仍按没发完处理，由目的端的回调关闭（D111）。不在这里关：目的端可读时
+				//它的回调先读一轮（一次 recv 或 D53 的几轮 splice），把 RST 之前到达的数据（如后端拒绝上传时先回的响应）转发出去，同一回调的写分支再关闭，与写出时就失败的情况相同
+				other_info.err=errno;
+			}
 			if(my_info.data_len!=0)
 			{
-				//没发完（含上游还在建连）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
+				//没发完（含上游还在建连、出错）：剩下的数据连同 scratch 整块留给本方向，不拷贝（D17）；下一次 recv 前再从池里取一块
 				my_info.buf=w.tcp_scratch;
 				w.tcp_scratch=0;
 			}
@@ -1997,6 +2029,14 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 
 		DEBUG_ASSERT(other_info.data_len!=0&&(other_info.buf!=0)!=(other_info.pipe.r>=0));
+		if(my_info.err!=0)
+		{
+			//读分支往本侧写出时已出错（D111）：sk_err 已被取走，再写只会得到 EPIPE，按记下的错误关闭
+			errno=my_info.err;
+			mylog(log_info,"[tcp]send_len=-1,connection {%s} closed bc of %s\n",tcp_pair.addr.get_str(),get_sock_error());
+			conn_manager_tcp.erase_closed(&tcp_pair);
+			return;
+		}
 		int dir=(other_info_p==&tcp_pair.remote);
 		nodelay_before_send(my_info,other_info.data_len);
 		int send_len;

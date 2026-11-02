@@ -1130,6 +1130,178 @@ func TestSpliceResetStreaming(t *testing.T) {
 	}
 }
 
+// D111（审查 F-B）：读分支往目的端写出（拷贝路径的 send、splice 路径的 splice(pipe→dst)）返回 EAGAIN 以外的错误时，这次写出已经取走了
+// 目的端 socket 的 sk_err（ECONNRESET 只报一次）。修复前它与 EAGAIN 一样处理：数据交给方向、目的端挂 EV_WRITE、停读源端；下一轮目的端的
+// 回调先走读分支（D86），recv 读到 0 当成 FIN，向源端转发半关闭（shutdown(SHUT_WR)），再下一轮写分支的 send 得到 EPIPE（并触发 SIGPIPE）
+// 才以 32:Broken pipe 关闭：源端先看到一个干净的 FIN。修复后读分支把错误记在目的端的 tcp_info_t::err，目的端读到 0 或写分支见到它时以
+// "send_len=-1,connection {…} closed bc of 104:…" 关闭、不转发半关闭；源一侧 socket 里还有没读的数据，close 发 RST，源端读到 ECONNRESET。
+//
+// 读分支的写出要撞上已复位的目的端，同一轮里源端的回调必须先于目的端：libev 按 epoll_wait 返回的顺序把 watcher 排进 pendings，
+// ev_invoke_pending 从尾部取（pendings[pri][--pendingcnt]，后进先出）；epoll 就绪链表按 fd 变为就绪的先后排（ep_poll_callback 的
+// list_add_tail，ep_send_events 从头取）。所以 tinymapper 暂停期间先让目的一侧 socket 收到 RST（sock_diag 按四元组查不到它，或查到的已是
+// 监听 socket），再让源一侧可读（接收队列非空），恢复后源端的回调先跑、写出失败，目的端在下一轮。暂停前最后一次转发由发 RST 的一端发起：
+// 上一次 epoll_wait 报过、还没重新扫描的水平触发项留在就绪链表里时，排在前面的也是目的端，不会颠倒顺序。
+//
+// 关闭时源一侧 socket 必须还有没读的数据，close 才发 RST：--sock-buf 200（holdSockBuf）让它的接收窗口在各内核上都不小于 200 KiB，
+// --pipe-size 64 让首轮 splice 至多读 64 KiB（写出失败就不再有第二轮；拷贝路径一次 recv 也是 64 KiB），恢复前等它的接收队列 ≥ 128 KiB，
+// 读一次之后队列里一定还有数据，不靠恢复后窗口更新再补发的时序。源端在暂停期间一次写完 1 MiB 只为填满窗口（回环上自动调优的发送缓冲约
+// 2.5 MiB，装得下），恢复后只有读这一个系统调用碰源端的 socket：写端若还在写，RST 到达时两个系统调用谁先进内核谁取走 sk_err，读端可能只读到 0。
+//
+//   - up：后端 RST，客户端写；客户端第一次读出错必须是 ECONNRESET（修复前 io.EOF）；
+//   - down：客户端 RST，后端写；后端第一次读出错必须是 ECONNRESET（修复前 io.EOF）；
+//   - data：后端先回 4 KiB 响应、确认它已进了 tinymapper 上游一侧的接收队列（SetLinger(0) 会丢掉后端还没发出的数据）再 RST，客户端写：
+//     客户端先收齐这 4 KiB 再读到 ECONNRESET。目的端接收队列里 RST 之前到达的数据（如后端拒绝上传时先回的 413）由目的端自己的读分支转发，
+//     读分支写出失败时当场关闭连接对会丢掉它（这一项修复前也通过）。目的端读完这 4 KiB 后，同一回调的写分支见到 err 以 104 关闭、不再写
+//     （修复前写分支 send 得到 EPIPE，记 32:Broken pipe）。
+//
+// 每项分 splice（先送两块恰好 32 KiB，各一个 skb、一次读完，第二块已是 splice、读完 splice_next 为 1：失败的是 splice(pipe→dst)）与
+// nosplice（--disable-splice：失败的是 send）。核对：日志（--log-level 5，half-closed 是 debug 行）里这个连接恰好一行关闭原因、没有
+// half-closed 行；关闭原因是 send_len=-1 … 104:（修复前是写分支的 32:Broken pipe）；连接对释放，splice 时 scratch pipe 连同数据
+// 交给了方向、释放时关掉（pipes alloc 比暂停前少 1、scratch 为 0），非 pipe fd 回到建连前，pipe fd 恰为 2×alloc。修复前的 SIGPIPE 发给
+// 写出的 worker 线程，它屏蔽了 SIGPIPE，只挂在该线程的 SigPnd 上（实测 0x1000），日志里没有 got sigpipe，不作核对
+func TestSpliceResetSendError(t *testing.T) {
+	t.Parallel()
+	needPipeQuotaExempt(t)
+	for _, dir := range []string{"up", "down", "data"} {
+		t.Run(dir, func(t *testing.T) {
+			t.Parallel()
+			for _, mode := range spliceModes {
+				t.Run(mode.name, func(t *testing.T) {
+					t.Parallel()
+					resetSendError(t, dir, mode.args == nil, mode.args)
+				})
+			}
+		})
+	}
+}
+
+func resetSendError(t *testing.T, dir string, splice bool, args []string) {
+	const tcp = syscall.IPPROTO_TCP
+	rig := newSpliceRig(t, func(listen, remote string) *mapper {
+		return startMapper(t, listenPoints("t", portOf(listen)), append(append([]string{"-l", listen, "-r", remote, "-t", "--log-level", "5", "--pipe-size", "64"}, holdSockBuf...), args...)...)
+	})
+	m := rig.m
+	base := nonPipeFDs(t, m.pid())
+	p := rig.pair(t)
+	addr := p.cli.LocalAddr().String()
+	// src 暂停期间写、恢复后读；rst 暂停期间发 RST。tmSrc、tmRst 是它们对面 tinymapper 一侧的 socket（本端、对端地址）
+	src, rst, tmSrc, tmRst, srcName := p.cli, p.srv, p.tmCli, p.tmUp, "客户端"
+	if dir == "down" {
+		src, rst, tmSrc, tmRst, srcName = p.srv, p.cli, p.tmUp, p.tmCli, "后端"
+	}
+	relay := func(from, to *net.TCPConn, msg []byte) {
+		t.Helper()
+		from.SetWriteDeadline(time.Now().Add(ioTimeout))
+		defer from.SetWriteDeadline(time.Time{})
+		to.SetReadDeadline(time.Now().Add(ioTimeout))
+		defer to.SetReadDeadline(time.Time{})
+		if _, err := from.Write(msg); err != nil {
+			t.Fatal(err)
+		}
+		got := make([]byte, len(msg))
+		if n, err := io.ReadFull(to, got); err != nil || !bytes.Equal(got, msg) {
+			t.Fatalf("经 tinymapper 转发 %d 字节：收到 %d 字节（%v），或内容不一致", len(msg), n, err)
+		}
+	}
+	relay(p.cli, p.srv, []byte("ping")) // 上游已连上
+	relay(p.srv, p.cli, []byte("pong"))
+	gen := rand.NewChaCha8(streamSeed(31, dir == "down"))
+	block := make([]byte, 32<<10)
+	for range 2 {
+		gen.Read(block)
+		relay(src, rst, block)
+	}
+	d := m.statsAfterSignal(t)
+	spliced := d.tcp[1].upSplice
+	if dir == "down" {
+		spliced = d.tcp[1].downSplice
+	}
+	if splice && (spliced == 0 || d.pool.pipeScratch != 1) {
+		t.Fatalf("两块 32 KiB 之后源方向没有 splice 字节或没有 scratch pipe：%+v，%+v", d.tcp[1], d.pool)
+	}
+	if !splice && (d.tcp[1].upSplice+d.tcp[1].downSplice != 0 || d.pool.pipeAlloc != 0) {
+		t.Fatalf("--disable-splice 却有 splice 字节或 pipe：%+v，%+v", d.tcp[1], d.pool)
+	}
+	alloc0 := d.pool.pipeAlloc
+	relay(rst, src, []byte("ok"))
+	rstInode := lookupSockBuf(t, m.pid(), tcp, "目的一侧 socket", tmRst[0], tmRst[1]).inode
+
+	m.pause(t)
+	resp := make([]byte, 4<<10)
+	if dir == "data" {
+		gen.Read(resp)
+		if _, err := rst.Write(resp); err != nil {
+			t.Fatal(err)
+		}
+		waitTMQueue(t, tmRst, len(resp))
+	}
+	rst.SetLinger(0) // close 时发 RST
+	rst.Close()
+	eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+		if b, err := sockDiag(tcp, tmRst[0], tmRst[1]); err == nil && b.inode == rstInode {
+			return fmt.Errorf("tinymapper 目的一侧 socket（%s → %s）还没收到 RST：状态 %d", tmRst[0], tmRst[1], b.state)
+		}
+		return nil
+	})
+	bulk := make([]byte, 1<<20)
+	gen.Read(bulk)
+	src.SetWriteDeadline(time.Now().Add(ioTimeout))
+	if n, err := src.Write(bulk); err != nil {
+		t.Fatalf("tinymapper 暂停期间%s写 %d 字节只写出 %d 字节：%v", srcName, len(bulk), n, err)
+	}
+	src.SetWriteDeadline(time.Time{})
+	eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+		if b, err := sockDiag(tcp, tmSrc[0], tmSrc[1]); err != nil || b.rqueue < 128<<10 {
+			return fmt.Errorf("tinymapper 源一侧 socket（%s → %s）接收队列 %d（%v），期望 ≥ 128 KiB：大于一个回调读的量", tmSrc[0], tmSrc[1], b.rqueue, err)
+		}
+		return nil
+	})
+	m.resume(t)
+
+	src.SetReadDeadline(time.Now().Add(ioTimeout))
+	if dir == "data" {
+		got := make([]byte, len(resp))
+		if n, err := io.ReadFull(src, got); err != nil || !bytes.Equal(got, resp) {
+			t.Fatalf("客户端只收到 RST 之前到达的 %d 字节响应中的 %d 字节（%v），或内容不一致：目的端接收队列里的数据被丢掉了", len(resp), n, err)
+		}
+	}
+	if n, err := src.Read(make([]byte, 64<<10)); n != 0 || !errors.Is(err, syscall.ECONNRESET) {
+		t.Errorf("%s第一次读到 %d 字节、%v，期望 ECONNRESET：目的端的 RST 被当成 FIN 转发成了半关闭", srcName, n, err)
+	}
+	d = m.waitTCPConns(t, 1, 0)
+	closes := 0
+	eventually(t, logFlushWithin, 20*time.Millisecond, func() error {
+		if closes = m.logLines("{" + addr + "} closed bc of"); closes == 0 {
+			return fmt.Errorf("日志里还没有连接 {%s} 的关闭原因", addr)
+		}
+		return nil
+	})
+	half := m.logLines("connection {" + addr + "} half-closed by")
+	reset := m.logLines("send_len=-1,connection {" + addr + "} closed bc of 104:")
+	broken := m.logLines("{" + addr + "} closed bc of 32:")
+	t.Logf("关闭原因 %d 行（send_len=-1 … 104: %d 行，32: %d 行），half-closed %d 行；pool %+v", closes, reset, broken, half, d.pool)
+	if closes != 1 {
+		t.Errorf("连接 {%s} 的关闭原因有 %d 行，期望 1 行", addr, closes)
+	}
+	if half != 0 {
+		t.Errorf("连接 {%s} 有 %d 行 half-closed：读分支写出失败之后目的端读到的 0 被当成了 FIN", addr, half)
+	}
+	if reset != 1 || broken != 0 {
+		t.Errorf("连接 {%s} 的关闭原因不是读分支写出时的 104:ECONNRESET（send_len=-1 … 104: %d 行，32: %d 行）", addr, reset, broken)
+	}
+	if splice && (d.pool.pipeAlloc != alloc0-1 || d.pool.pipeScratch != 0) {
+		t.Errorf("释放后 pipes alloc=%d scratch=%d，期望 %d 与 0：读分支的 splice 写出失败时 scratch pipe 应连同数据交给方向、释放时关掉",
+			d.pool.pipeAlloc, d.pool.pipeScratch, alloc0-1)
+	}
+	if d.pool.held != 0 || d.pool.pipeHeld != 0 {
+		t.Errorf("连接对释放后仍有持有：%+v", d.pool)
+	}
+	m.expectPipeFDs(t, d, "连接对释放之后")
+	if got := nonPipeFDs(t, m.pid()); got != base {
+		t.Errorf("连接对释放之后 tinymapper 有 %d 个非 pipe fd，建连前为 %d", got, base)
+	}
+}
+
 // 空闲超时释放持有 pipe 的连接对（TPM_SLOW，--sock-buf 200 见 holdSockBuf）：clear_inactive 走的是 erase()，不是 RST、出错时的 erase_closed()，
 // pipe 的 close 两处各有一份。
 // 一条连接两个方向都持有 pipe（两端都不读），之后没有任何事件、LRU 时间戳不再刷新，约 360 s 后被清理：持有归零，
@@ -1876,7 +2048,8 @@ func TestSpliceWriteEAGAIN(t *testing.T) {
 
 // 审查 L1：splice 本身不可用（seccomp 白名单里没有它返回 ENOSYS，或 EPERM、EINVAL、EOPNOTSUPP）时只记一行 warn "[tcp]splice failed (...)"，
 // 整个进程从此改走拷贝，失败的那次读改用 recv（什么都没读到，数据不丢）。
-//   - ENOSYS、EPERM：每次 splice 都失败；两次双向 8 MiB：数据完整，splice 计数为 0，没有读写出错的关闭，warn 恰好 1 行，splice 只被调用过 1 次；
+//   - ENOSYS、EPERM、EINVAL、EOPNOTSUPP：每次 splice 都失败；两次双向 8 MiB：数据完整，splice 计数为 0，没有读写出错的关闭，warn 恰好 1 行，
+//     splice 只被调用过 1 次。失败时 socket 已建立、有数据可读，D110 不把它当成连接的待决错误（见 TestSpliceSockError）；
 //   - dynamic：先照常 splice；再让读进 pipe 的 splice（args[0] 是 socket）返回 ENOSYS：恰好失败 1 次、1 行 warn；之后即使 splice 又能用，
 //     也不再有读进 pipe 的 splice，splice 计数不再增长（进程级、不可逆）
 func TestSpliceUnavailable(t *testing.T) {
@@ -1889,7 +2062,7 @@ func TestSpliceUnavailable(t *testing.T) {
 			t.Errorf("日志里有 %d 行读写出错的关闭", k)
 		}
 	}
-	for _, errno := range []syscall.Errno{syscall.ENOSYS, syscall.EPERM} {
+	for _, errno := range []syscall.Errno{syscall.ENOSYS, syscall.EPERM, syscall.EINVAL, syscall.EOPNOTSUPP} {
 		t.Run(errno.Error(), func(t *testing.T) {
 			t.Parallel()
 			be := serveTCP(t, loopback4(t), streamHandler)
@@ -1972,6 +2145,415 @@ func TestSpliceUnavailable(t *testing.T) {
 		}
 		noErrorCloses(t, m)
 	})
+}
+
+// tmUnhashed 返回一个检查：tinymapper 的 socket addr（本端、对端，原 inode 为 inode）已从已建立连接的哈希表摘除时返回 nil。摘除发生在
+// tcp_done 把状态置为 CLOSE 时（RST、超时放弃；FIN_WAIT2 收到 FIN 时 tcp_time_wait 先换上 timewait sock 再 tcp_done），之后按四元组查不到它：
+// 查不到、查到别的 inode（inet_lookup 会退到同一端口的监听 socket，timewait sock 的 inode 为 0），或应答里没有 SKMEMINFO（timewait sock）
+func tmUnhashed(addr [2]string, inode uint32) func() error {
+	return func() error {
+		if q, err := sockDiag(syscall.IPPROTO_TCP, addr[0], addr[1]); err == nil && q.inode == inode {
+			return fmt.Errorf("tinymapper socket %s → %s（inode %d）状态 %d，还在已建立连接的哈希表里", addr[0], addr[1], inode, q.state)
+		}
+		return nil
+	}
+}
+
+// D110：splice 读返回的是这条连接的待决错误，不是 splice 不可用。没开 IP_RECVERR 时 ICMP 错误与重传时的路由错误先记在 sk_err_soft，
+// 超时放弃时 tcp_write_err 把它搬进 sk_err 并 tcp_done（状态 CLOSE），tcp_splice_read 在接收队列为空时经 sock_error() 返回它：IPv4 源路由失败
+// 为 EOPNOTSUPP、黑洞路由为 EINVAL、IPsec block 策略为 EPERM，与 L1 判为 splice 不可用的 errno 相同。真实的超时要十几分钟，这里由 notifier 模拟：
+// 客户端以 64 KiB 一块上传 1 MiB（上行进入 splice）、再写恰好 32 KiB（一个 skb，一次读完，splice_next 必为 1），后端收齐后客户端发 RST；
+// tinymapper 客户端一侧 socket 处理 RST（状态 CLOSE，tmUnhashed）之后第一次读进 pipe 的 splice 直接返回该 errno（这次调用不执行，sk_err
+// 仍是 ECONNRESET；真实情况下它已被 splice 取走，HEAD 随后的 recv 读到 0、把断开的连接当成半关闭）。期望：
+//   - 没有 "[tcp]splice failed (" 的 warn（HEAD 把它当成 splice 不可用，整个进程改走拷贝）；
+//   - 这条连接恰好 1 行 "closed bc of <errno>:"，读写出错的关闭共 1 行，连接对释放，pipe fd 恰为 2×alloc，非 pipe fd 回到建连前；
+//   - 之后新连接上双向 8 MiB 仍有两个方向的 splice 字节，读进 pipe 的 splice 照常调用（没有被进程级禁用）。
+//
+// ENOSYS 不在其中：没有任何 ICMP 码或路由错误映射到它，tcp_cb 不经判别直接按不可用处理（TestSpliceUnavailable）
+func TestSpliceSockError(t *testing.T) {
+	t.Parallel()
+	needPipeQuotaExempt(t)
+	const warn = "[tcp]splice failed ("
+	for i, errno := range []syscall.Errno{syscall.EOPNOTSUPP, syscall.EINVAL, syscall.EPERM} {
+		t.Run(errno.Error(), func(t *testing.T) {
+			t.Parallel()
+			var nf *notifier
+			rig := newSpliceRig(t, func(listen, remote string) *mapper {
+				m, n := startMapperNotify(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", remote, "-t")
+				nf = n
+				return m
+			})
+			m := rig.m
+			pid := m.pid()
+			base := fdCount(t, pid)
+			p := rig.pair(t)
+			cliAddr := p.cli.LocalAddr().String()
+			b, err := sockDiag(syscall.IPPROTO_TCP, p.tmCli[0], p.tmCli[1])
+			if err != nil {
+				t.Fatal(err)
+			}
+			target := fdOfSocket(pid, b.inode)
+			if target < 0 {
+				t.Fatalf("找不到 tinymapper 客户端一侧 socket（inode %d）的 fd", b.inode)
+			}
+			closed := tmUnhashed(p.tmCli, b.inode)
+			// spliceIn：读进 pipe（args[0] 是 socket）的 splice 次数；armed 之后 target 上第一次在 CLOSE 状态下的读注入 errno，只注入一次
+			// （之后 target 的 fd 号会被新连接复用）。decide 在 notifier 的协程里依次调用，计数不必 CAS
+			var armed atomic.Bool
+			var spliceIn, injected atomic.Int64
+			nf.setDecide(func(call notifyCall) syscall.Errno {
+				if call.nr != syscall.SYS_SPLICE || !isSocketFD(pid, call.fd(0)) {
+					return 0
+				}
+				spliceIn.Add(1)
+				if call.fd(0) != target || !armed.Load() || injected.Load() != 0 || closed() != nil {
+					return 0
+				}
+				injected.Add(1)
+				return errno
+			})
+			var got atomic.Int64
+			drained := make(chan error, 1)
+			go func() {
+				buf := make([]byte, 256<<10)
+				for {
+					n, err := p.srv.Read(buf)
+					got.Add(int64(n))
+					if err != nil {
+						drained <- err
+						return
+					}
+				}
+			}()
+			sent := int64(0)
+			gen := rand.NewChaCha8(streamSeed(uint64(40+i), false))
+			send := func(n int) {
+				t.Helper()
+				buf := make([]byte, n)
+				gen.Read(buf)
+				p.cli.SetWriteDeadline(time.Now().Add(ioTimeout))
+				if _, err := p.cli.Write(buf); err != nil {
+					t.Fatalf("写到 %d 字节时：%v", sent, err)
+				}
+				sent += int64(n)
+				eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+					if g := got.Load(); g != sent {
+						return fmt.Errorf("后端收到 %d 字节，期望 %d", g, sent)
+					}
+					return nil
+				})
+			}
+			for range 16 {
+				send(64 << 10)
+			}
+			if s := m.statsAfterSignal(t).tcp[1]; s.upSplice == 0 {
+				t.Fatalf("1 MiB 之后上行还没有 splice 字节：%+v", s)
+			}
+			send(32 << 10)
+			armed.Store(true)
+			p.cli.SetLinger(0) // close 时发 RST
+			p.cli.Close()
+			select {
+			case err := <-drained:
+				t.Logf("后端读到：%v", err)
+			case <-time.After(ioTimeout):
+				m.expectIdleCPU(t, "RST 之后后端迟迟没有被关闭时")
+				t.Fatalf("%v 内后端没有被关闭（注入 %d 次）", ioTimeout, injected.Load())
+			}
+			d := m.waitTCPConns(t, 1, 0)
+			if n := injected.Load(); n != 1 {
+				t.Fatalf("注入了 %d 次，期望 1 次：RST 之后 tinymapper 没有在 CLOSE 状态的客户端一侧 socket 上 splice 读（最后一次读不足 16 KiB？）", n)
+			}
+			// 关闭行在 erase_closed 之前写出：等这条连接的关闭行出现，再一并核对 warn 与关闭的原因（HEAD 上这里各项一起报出）
+			eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+				if k := m.logLines("connection {" + cliAddr + "} closed bc of"); k == 0 {
+					return fmt.Errorf("日志里还没有连接 {%s} 的关闭行", cliAddr)
+				}
+				return nil
+			})
+			if k := m.logLines(warn); k != 0 {
+				t.Errorf("日志里有 %d 行 %q：这条连接的待决错误被当成了 splice 不可用（D110）", k, warn)
+			}
+			reason := fmt.Sprintf("connection {%s} closed bc of %d:", cliAddr, int(errno))
+			if k := m.logLines("recv_len=-1,", reason); k != 1 {
+				t.Errorf("日志里有 %d 行 %q，期望恰好 1 行：应按 splice 返回的错误关闭这条连接", k, reason)
+			}
+			if k := m.logLines("recv_len=-1") + m.logLines("send_len=-1"); k != 1 {
+				t.Errorf("日志里有 %d 行读写出错的关闭，期望 1 行", k)
+			}
+			m.expectPipeFDs(t, d, "连接对释放之后")
+			if got := nonPipeFDs(t, pid); got != base {
+				t.Errorf("连接对释放之后 tinymapper 有 %d 个非 pipe fd，建连前为 %d", got, base)
+			}
+			// splice 仍可用：新连接双向 8 MiB，两个方向的 splice 字节都增长，读进 pipe 的 splice 照常调用
+			s0, in0 := m.statsAfterSignal(t).tcp[1], spliceIn.Load()
+			p2 := rig.pair(t)
+			go streamHandler(p2.srv)
+			if err := transferOn(p2.cli, 8<<20, 8<<20, 256<<10, uint64(50+i)); err != nil {
+				t.Fatalf("之后的传输：%v", err)
+			}
+			p2.cli.Close()
+			s1 := m.statsAfterSignal(t).tcp[1]
+			t.Logf("之后的传输：up_splice %d → %d，down_splice %d → %d，读进 pipe 的 splice %d → %d 次",
+				s0.upSplice, s1.upSplice, s0.downSplice, s1.downSplice, in0, spliceIn.Load())
+			if s1.upSplice == s0.upSplice || s1.downSplice == s0.downSplice {
+				t.Errorf("之后的传输 up_splice %d → %d、down_splice %d → %d：splice 被整个进程禁用了", s0.upSplice, s1.upSplice, s0.downSplice, s1.downSplice)
+			}
+			if spliceIn.Load() == in0 {
+				t.Error("之后的传输没有读进 pipe 的 splice：splice 被整个进程禁用了")
+			}
+		})
+	}
+}
+
+// D110 的判别还要求接收队列为空：状态 CLOSE、仍有没读的数据时 splice 失败只能是 splice 本身不可用（能 splice 时有数据就读数据，不会报待决
+// 错误），照 L1 记 warn、整个进程改走拷贝，这次读改用 recv，数据一字不丢。只看 TCP_INFO 状态的判别会把它当成连接的错误关掉，队列里的数据随之丢弃。
+// 构造（--sock-buf 200 见 holdSockBuf：暂停期间写入的数据装得进接收窗口）：客户端 CloseWrite，tinymapper 把 FIN 转给后端，上游一侧 socket
+// 进入 FIN_WAIT2；后端以 64 KiB 一块写 1 MiB（下行进入 splice）、再写恰好 32 KiB（splice_next 为 1）；暂停 tinymapper，后端再写 192 KiB，
+// 确认进了 tinymapper 上游一侧的接收队列后关闭：FIN_WAIT2 收到 FIN，tcp_time_wait 换上 timewait sock 并 tcp_done（tmUnhashed），完整 socket
+// 状态 CLOSE、192 KiB 仍在接收队列；notifier 让它之后第一次读进 pipe 的 splice 返回 EPERM，恢复运行。期望：EPERM 恰好注入 1 次，warn
+// "[tcp]splice failed (1:" 恰好 1 行，客户端收到全部字节（SHA-256、down_bytes）后 EOF，没有读写出错的关闭，连接对因两侧 EOF 释放
+func TestSpliceUnavailableClosedQueue(t *testing.T) {
+	t.Parallel()
+	needPipeQuotaExempt(t)
+	const tcpFinWait2 = 5 // TCP_FIN_WAIT2
+	var nf *notifier
+	rig := newSpliceRig(t, func(listen, remote string) *mapper {
+		m, n := startMapperNotify(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", remote, "-t"}, holdSockBuf...)...)
+		nf = n
+		return m
+	})
+	m := rig.m
+	pid := m.pid()
+	p := rig.pair(t)
+	cliAddr := p.cli.LocalAddr().String()
+	b, err := sockDiag(syscall.IPPROTO_TCP, p.tmUp[0], p.tmUp[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := fdOfSocket(pid, b.inode)
+	if target < 0 {
+		t.Fatalf("找不到 tinymapper 上游一侧 socket（inode %d）的 fd", b.inode)
+	}
+	closed := tmUnhashed(p.tmUp, b.inode)
+	var armed atomic.Bool
+	var injected atomic.Int64
+	nf.setDecide(func(call notifyCall) syscall.Errno {
+		if call.nr != syscall.SYS_SPLICE || call.fd(0) != target || !armed.Load() || injected.Load() != 0 || closed() != nil {
+			return 0
+		}
+		injected.Add(1)
+		return syscall.EPERM
+	})
+	// 客户端先半关闭：tinymapper 读到 EOF、shutdown 上游一侧，后端读到 EOF，上游一侧 socket 等后端的 FIN
+	if err := p.cli.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	p.srv.SetReadDeadline(time.Now().Add(ioTimeout))
+	if n, err := p.srv.Read(make([]byte, 1)); err != io.EOF {
+		t.Fatalf("后端读到 %d 字节（%v），期望转发的 EOF", n, err)
+	}
+	waitTMState(t, p.tmUp, tcpFinWait2, "tinymapper 上游一侧 socket")
+	var got atomic.Int64
+	rh := sha256.New()
+	recvDone := make(chan error, 1)
+	go func() {
+		buf := make([]byte, 256<<10)
+		for {
+			n, err := p.cli.Read(buf)
+			rh.Write(buf[:n])
+			got.Add(int64(n))
+			if err != nil {
+				if err == io.EOF {
+					err = nil
+				}
+				recvDone <- err
+				return
+			}
+		}
+	}()
+	sent, h := int64(0), sha256.New()
+	gen := rand.NewChaCha8(streamSeed(60, true))
+	write := func(n int) {
+		t.Helper()
+		buf := make([]byte, n)
+		gen.Read(buf)
+		h.Write(buf)
+		p.srv.SetWriteDeadline(time.Now().Add(ioTimeout))
+		if _, err := p.srv.Write(buf); err != nil {
+			t.Fatalf("后端写到 %d 字节时：%v", sent, err)
+		}
+		sent += int64(n)
+	}
+	waitGot := func() {
+		t.Helper()
+		eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+			if g := got.Load(); g != sent {
+				return fmt.Errorf("客户端收到 %d 字节，期望 %d", g, sent)
+			}
+			return nil
+		})
+	}
+	for range 16 {
+		write(64 << 10)
+	}
+	waitGot()
+	if s := m.statsAfterSignal(t).tcp[1]; s.downSplice == 0 {
+		t.Fatalf("1 MiB 之后下行还没有 splice 字节：%+v", s)
+	}
+	write(32 << 10)
+	waitGot()
+	m.pause(t)
+	const tail = 192 << 10
+	write(tail)
+	waitTMQueue(t, p.tmUp, tail)
+	if err := p.srv.Close(); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, ioTimeout, 5*time.Millisecond, closed)
+	armed.Store(true)
+	m.resume(t)
+	p.cli.SetReadDeadline(time.Now().Add(transferTimeout(sent)))
+	select {
+	case err := <-recvDone:
+		if err != nil {
+			t.Fatalf("客户端收到 %d/%d 字节后：%v", got.Load(), sent, err)
+		}
+	case <-time.After(transferTimeout(sent)):
+		t.Fatalf("客户端收到 %d/%d 字节后迟迟没有 EOF", got.Load(), sent)
+	}
+	if got.Load() != sent || !bytes.Equal(rh.Sum(nil), h.Sum(nil)) {
+		t.Errorf("客户端收到 %d/%d 字节，SHA-256 一致：%v：CLOSE 状态、接收队列里还有 %d 字节时 splice 失败，数据不能丢", got.Load(), sent,
+			bytes.Equal(rh.Sum(nil), h.Sum(nil)), tail)
+	}
+	d := m.waitTCPConns(t, 1, 0)
+	if n := injected.Load(); n != 1 {
+		t.Errorf("注入了 %d 次，期望 1 次：恢复后 tinymapper 应在 CLOSE 状态的上游一侧 socket 上 splice 读", n)
+	}
+	if s := d.tcp[1]; s.downBytes != uint64(sent) {
+		t.Errorf("down_bytes=%d，期望 %d", s.downBytes, sent)
+	}
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if k := m.logLines("connection {" + cliAddr + "} closed bc of"); k == 0 {
+			return fmt.Errorf("日志里还没有连接 {%s} 的关闭行", cliAddr)
+		}
+		return nil
+	})
+	if k, all := m.logLines("[WARN]", "[tcp]splice failed (1:"), m.logLines("[tcp]splice failed ("); k != 1 || all != 1 {
+		t.Errorf("EPERM 的 splice 不可用 warn 有 %d 行（含 \"[tcp]splice failed (\" 的共 %d 行），期望恰好 1 行", k, all)
+	}
+	if k := m.logLines("recv_len=-1") + m.logLines("send_len=-1"); k != 0 {
+		t.Errorf("日志里有 %d 行读写出错的关闭：接收队列里还有数据时 splice 失败被当成了连接的错误", k)
+	}
+	if k := m.logLines("connection {" + cliAddr + "} closed bc of EOF"); k != 1 {
+		t.Errorf("连接 {%s} 的 EOF 关闭行有 %d 行，期望 1 行", cliAddr, k)
+	}
+	m.expectPipeFDs(t, d, "连接对释放之后")
+}
+
+// D110 的判别还要求状态是 CLOSE：对端只发了 FIN 的 socket（CLOSE_WAIT）接收队列也为空，这时 splice 失败只能是 splice 本身不可用（能 splice
+// 时读到 0，不会报错）。照 L1 记 warn、整个进程改走拷贝，这次读改用 recv 读到 0，照常向另一侧转发半关闭，反方向继续转发。只看 FIONREAD 的
+// 判别会把这对还在用的半关闭连接当成读出错关掉。构造：后端以 64 KiB 一块写 1 MiB（下行进入 splice）、再写恰好 32 KiB（splice_next 为 1），
+// 客户端收齐后暂停 tinymapper，后端 CloseWrite，等 tinymapper 上游一侧 socket 进入 CLOSE_WAIT，notifier 让它之后第一次读进 pipe 的 splice
+// 返回 EPERM，恢复运行。期望：EPERM 恰好注入 1 次，warn "[tcp]splice failed (1:" 恰好 1 行，客户端收到全部字节后读到 EOF；之后客户端写的
+// 4 KiB 后端照样收到（半关闭只关了一个方向），客户端关闭后连接对以 EOF 释放，没有读写出错的关闭
+func TestSpliceUnavailableCloseWait(t *testing.T) {
+	t.Parallel()
+	needPipeQuotaExempt(t)
+	const tcpCloseWait = 8 // TCP_CLOSE_WAIT
+	var nf *notifier
+	rig := newSpliceRig(t, func(listen, remote string) *mapper {
+		m, n := startMapperNotify(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", remote, "-t")
+		nf = n
+		return m
+	})
+	m := rig.m
+	pid := m.pid()
+	p := rig.pair(t)
+	cliAddr := p.cli.LocalAddr().String()
+	b, err := sockDiag(syscall.IPPROTO_TCP, p.tmUp[0], p.tmUp[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	target := fdOfSocket(pid, b.inode)
+	if target < 0 {
+		t.Fatalf("找不到 tinymapper 上游一侧 socket（inode %d）的 fd", b.inode)
+	}
+	var armed atomic.Bool
+	var injected atomic.Int64
+	nf.setDecide(func(call notifyCall) syscall.Errno {
+		if call.nr != syscall.SYS_SPLICE || call.fd(0) != target || !armed.Load() || injected.Load() != 0 {
+			return 0
+		}
+		injected.Add(1)
+		return syscall.EPERM
+	})
+	gen := rand.NewChaCha8(streamSeed(62, true))
+	sent, h, rh := 0, sha256.New(), sha256.New()
+	buf := make([]byte, 64<<10)
+	for _, n := range append(slices.Repeat([]int{64 << 10}, 16), 32<<10) {
+		gen.Read(buf[:n])
+		h.Write(buf[:n])
+		p.srv.SetWriteDeadline(time.Now().Add(ioTimeout))
+		if _, err := p.srv.Write(buf[:n]); err != nil {
+			t.Fatalf("后端写到 %d 字节时：%v", sent, err)
+		}
+		sent += n
+		p.cli.SetReadDeadline(time.Now().Add(ioTimeout))
+		if _, err := io.CopyN(rh, p.cli, int64(n)); err != nil {
+			t.Fatalf("客户端收到第 %d 字节之前：%v", sent, err)
+		}
+	}
+	if s := m.statsAfterSignal(t).tcp[1]; s.downSplice == 0 {
+		t.Fatalf("1 MiB 之后下行还没有 splice 字节：%+v", s)
+	}
+	m.pause(t)
+	if err := p.srv.CloseWrite(); err != nil {
+		t.Fatal(err)
+	}
+	waitTMState(t, p.tmUp, tcpCloseWait, "tinymapper 上游一侧 socket")
+	armed.Store(true)
+	m.resume(t)
+	p.cli.SetReadDeadline(time.Now().Add(ioTimeout))
+	if n, err := p.cli.Read(buf); n != 0 || err != io.EOF {
+		t.Fatalf("客户端读到 %d 字节、%v，期望转发的 EOF", n, err)
+	}
+	if !bytes.Equal(rh.Sum(nil), h.Sum(nil)) {
+		t.Error("客户端收到的 1 MiB + 32 KiB SHA-256 不一致")
+	}
+	if n := injected.Load(); n != 1 {
+		t.Fatalf("注入了 %d 次，期望 1 次：恢复后 tinymapper 应在 CLOSE_WAIT 的上游一侧 socket 上 splice 读", n)
+	}
+	// 反方向：半关闭只关了下行，客户端写的数据后端照样收到
+	msg := make([]byte, 4<<10)
+	gen.Read(msg)
+	p.cli.SetWriteDeadline(time.Now().Add(ioTimeout))
+	if _, err := p.cli.Write(msg); err != nil {
+		t.Fatal(err)
+	}
+	got := make([]byte, len(msg))
+	p.srv.SetReadDeadline(time.Now().Add(ioTimeout))
+	if n, err := io.ReadFull(p.srv, got); err != nil || !bytes.Equal(got, msg) {
+		t.Fatalf("半关闭之后客户端写的 %d 字节后端只收到 %d 字节（%v），或内容不一致：连接对被当成读出错关掉了", len(msg), n, err)
+	}
+	p.cli.Close()
+	d := m.waitTCPConns(t, 1, 0)
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if k := m.logLines("connection {" + cliAddr + "} closed bc of"); k == 0 {
+			return fmt.Errorf("日志里还没有连接 {%s} 的关闭行", cliAddr)
+		}
+		return nil
+	})
+	if k, all := m.logLines("[WARN]", "[tcp]splice failed (1:"), m.logLines("[tcp]splice failed ("); k != 1 || all != 1 {
+		t.Errorf("EPERM 的 splice 不可用 warn 有 %d 行（含 \"[tcp]splice failed (\" 的共 %d 行），期望恰好 1 行", k, all)
+	}
+	if k := m.logLines("recv_len=-1") + m.logLines("send_len=-1"); k != 0 {
+		t.Errorf("日志里有 %d 行读写出错的关闭：CLOSE_WAIT、接收队列为空时 splice 失败被当成了连接的错误", k)
+	}
+	if k := m.logLines("connection {" + cliAddr + "} closed bc of EOF"); k != 1 {
+		t.Errorf("连接 {%s} 的 EOF 关闭行有 %d 行，期望 1 行", cliAddr, k)
+	}
+	m.expectPipeFDs(t, d, "连接对释放之后")
 }
 
 // fillFDHoles 向 listen（后端 be，空闲连接只连不发）建空闲连接，直到 tinymapper 在最高的已打开 fd 以下没有空闲 fd（每条连接占最小的两个

@@ -161,6 +161,7 @@ struct tcp_info_t:not_copy_able_t
 	int connected;//已确认连接建立（accept 得到、connect 返回 0，或建连中可写且无错误）；为 0 时 watcher 同时等读写、不收发，对建连中的 socket 调 shutdown 会中止 connect
 	int nodelay_wait;//只用于上游（T15）：TCP_NODELAY 还没设时为 1（还没 send 过）或 2（已 send 过一次，下次 send 前要设）；已设或 --disable-tcp-nodelay 时为 0
 	int mss;//本侧 socket 的 TCP_MAXSEG，第一次 splice 写不完时读（D54）；0 为还没读，-1 为读失败
+	int err;//读分支往本侧写出（send、splice）返回的错误（非 EAGAIN），没有时为 0：那次写出已取走本侧的 sk_err，本侧之后读到 0 不是 FIN，写分支也不再写（D111）
 	tcp_info_t()
 	{
 		//data=(char*)malloc(max_data_len_tcp+200);
@@ -175,6 +176,7 @@ struct tcp_info_t:not_copy_able_t
 		connected=0;
 		nodelay_wait=0;
 		mss=0;
+		err=0;
 
 	}
 	~tcp_info_t()
