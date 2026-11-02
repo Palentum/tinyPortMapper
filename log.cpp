@@ -5,6 +5,9 @@ int log_level=log_info;
 
 int enable_log_position=0;
 int enable_log_color=1;
+//文件作用域：main 之前、还是单线程时初始化（main() 补 0/1/2、dup2(1,2) 不改变 fd 1 是不是终端）。写成 log0 里的静态局部变量时
+//首次初始化在先写日志的线程（可能是 worker）里，靠 __cxa_guard 互斥，glibc 2.34 以前静态链接（cross2、cross3）时 libstdc++ 可能认为没有线程、不加锁
+static const int stdout_is_tty=isatty(1);
 
 
 void log0(const char * file,const char * function,int line,int level,const char* str, ...) {
@@ -69,14 +72,8 @@ void log0(const char * file,const char * function,int line,int level,const char*
 		//printf(log_color[level]);
 	//只有终端逐行刷新（stdio 对终端本就按 \n 刷新，这里把行尾的颜色复位码和不以 \n 结尾的行也写出）；
 	//文件、管道、journald 等在缓冲写满时写出，其余由 clear_timer_cb 每 timer_interval 刷新，myexit 退出前也会刷新
-	static const int stdout_is_tty=isatty(1);
 	if(stdout_is_tty)
 		fflush(stdout);
-
-	if(log_level==log_fatal)
-	{
-		about_to_exit=1;
-	}
 }
 
 void log_bare(int level,const char* str, ...)

@@ -116,8 +116,6 @@ const u32_t conn_clear_interval=1000;
 
 const u32_t timer_interval=400;//this should be smaller than heartbeat_interval and retry interval;
 
-extern int about_to_exit;
-
 extern int socket_buf_size;
 extern int sock_buf_explicit;
 extern int udp_gro;

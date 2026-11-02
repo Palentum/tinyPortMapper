@@ -10,9 +10,6 @@
 
 
 
-int about_to_exit=0;
-
-
 int socket_buf_size=1024*1024;
 
 #include <netdb.h>

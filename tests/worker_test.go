@@ -1109,12 +1109,25 @@ use_udp = true
 
 // S6 的合并与审查 L-5：N=2，经 seccomp 通知让一个 worker 线程停在一次 sendto 里（notifier.setHold），这时连发 5 次 SIGUSR1：这一轮收不齐，
 // 1 s 内没有输出；发出 5 s 后恰好一行 warn "stats: worker(s) K did not answer SIGUSR1 within 5 s, still waiting"（K 为停住的 worker 号，
-// 按线程名 worker<K> 对照）；放开之后恰好多出 2 组统计（停住的那一轮，加上合并了其余 4 次的下一轮），再等 1 s 也不再多，两组都完整
+// 按线程名 worker<K> 对照）；放开之后恰好多出 2 组统计（停住的那一轮，加上合并了其余 4 次的下一轮），再等 1 s 也不再多，两组都完整。
+// 默认级别与 --log-level 2 各跑一遍：warn 与统计行一样不受 --log-level 过滤（D112）
 func TestWorkerStatsMerge(t *testing.T) {
 	t.Parallel()
+	for _, c := range []struct {
+		name  string
+		extra []string
+	}{{"default", nil}, {"level2", []string{"--log-level", "2"}}} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			workerStatsMerge(t, c.extra...)
+		})
+	}
+}
+
+func workerStatsMerge(t *testing.T, extra ...string) {
 	be := serveTCP(t, loopback4(t), echoHandler(""))
 	listen := loopback4(t)
-	m, nf := startMapperNotify(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--threads", "2")
+	m, nf := startMapperNotify(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", be.addr, "-t", "--threads", "2"}, extra...)...)
 	release := make(chan struct{})
 	var once sync.Once
 	free := func() { once.Do(func() { close(release) }) }

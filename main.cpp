@@ -388,7 +388,7 @@ struct tcp_pipe_pool_t
 				if(!grow_blocked)
 				{
 					grow_blocked=1;
-					int level=pipe_grow_logged.exchange(1,memory_order_relaxed)?log_debug:log_info;//mylog 会把级别参数求值两次
+					int level=pipe_grow_logged.exchange(1,memory_order_relaxed)?log_debug:log_info;
 					mylog(level,"[tcp]enlarging a new pipe to %d bytes failed (%s), new pipes keep %d bytes until the next timer tick (fs.pipe-user-pages-soft reached?)\n",tcp_pipe_size,get_sock_error(),size);
 				}
 			}
@@ -2016,7 +2016,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			//当作没写出、继续等可写（D50）；越限期间这样的 socket 每轮重试一次
 			if(errno==EAGAIN)
 			{
-				//越限期间这样的 socket 每轮重试，第一次记 info 便于从日志对上 CPU 占用，之后 debug；各 worker 共用（M2），级别先算好：mylog 会把级别参数求值两次
+				//越限期间这样的 socket 每轮重试，第一次记 info 便于从日志对上 CPU 占用，之后 debug；各 worker 共用（M2）
 				static std::atomic<int> logged(0);
 				int level=logged.exchange(1,memory_order_relaxed)?log_debug:log_info;
 				mylog(level,"[tcp]send to fd=%d returned EAGAIN although writable (TCP memory above net.ipv4.tcp_mem or a cgroup limit?), retrying\n",my_fd);
@@ -3100,7 +3100,7 @@ static void stats_reply_cb(struct ev_loop *loop, ev_async *watcher, int revents)
 	}
 }
 //主线程定时器里调用：一轮统计发出后 stats_answer_timeout 还没收齐（worker 卡在很长的回调或死循环里）就记一行 warn，指出没回的 worker，
-//继续等（审查 L-5：否则之后的 SIGUSR1 都被合并进这一轮，没有任何输出）
+//继续等（审查 L-5：否则之后的 SIGUSR1 都被合并进这一轮，没有任何输出）。warn 与统计行一样，除 --log-level 0 外都写（D112）
 static void stats_check_late()
 {
 	if(!stats_waiting||stats_late_logged||main_clock.now()-stats_sent_time<stats_answer_timeout) return;
@@ -3116,7 +3116,7 @@ static void stats_check_late()
 		if(!got&&len<(int)sizeof(ids)-8)
 			len+=snprintf(ids+len,sizeof(ids)-len," %d",workers[i]->id);
 	}
-	mylog(log_warn,"stats: worker(s)%s did not answer SIGUSR1 within %d s, still waiting\n",ids,(int)(stats_answer_timeout/1000));
+	mylog_unfiltered(log_warn,"stats: worker(s)%s did not answer SIGUSR1 within %d s, still waiting\n",ids,(int)(stats_answer_timeout/1000));
 }
 void sigusr1_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
