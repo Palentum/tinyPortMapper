@@ -90,12 +90,13 @@ func echoHandler(banner string) func(net.Conn) {
 	}
 }
 
-// udpServer 是进程内的 UDP 回显后端：回包 = prefix + 原数据，并按首次出现顺序记录源地址
+// udpServer 是进程内的 UDP 回显后端：回包 = prefix + 原数据，并按首次出现顺序记录源地址；mute 置位后照收不回（不再应答的后端）
 type udpServer struct {
 	addr  string
 	mu    sync.Mutex
 	peers []string
 	seen  map[string]bool
+	mute  atomic.Bool
 }
 
 func serveUDP(t testing.TB, addr, prefix string) *udpServer {
@@ -127,7 +128,9 @@ func serveUDP(t testing.TB, addr, prefix string) *udpServer {
 				s.peers = append(s.peers, from.String())
 			}
 			s.mu.Unlock()
-			conn.WriteToUDP(append([]byte(prefix), buf[:n]...), from)
+			if !s.mute.Load() {
+				conn.WriteToUDP(append([]byte(prefix), buf[:n]...), from)
+			}
 		}
 	}()
 	t.Cleanup(func() { conn.Close() })

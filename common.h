@@ -291,10 +291,13 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	address_t adress;
 	udp_local_t local;//通配监听时为客户端最近一个包的目的地址（D89），回退（D90）时清零
 	int fd;
+	//batch_group 与 unans 紧跟 fd（batch_group 填原来 fd 与 ev 之间 4 字节的空洞）：入向路径要碰的字段都在前 88 字节，回程路径的在前 144 字节
+	int batch_group;//入向这一批里本会话的组号（U3），批外恒为 -1
+	my_time_t unans;//上一个回包之后客户端发来的第一个包的时间，0 为没有：remote_sweep 据此判断旧地址上的会话是否还可用
 	ev_io ev;//ev.data 指向本对象（T10）
 	forward_rule_t *owner;
 	int remote_index;
-	int batch_group;//入向这一批里本会话的组号（U3），批外恒为 -1
+	u32_t gen;//建会话时 remote 的 gen：与 remote_target_t::gen 不同即连在 DNS 换掉的旧地址上
 	unsigned char gso_off[2];//U5（D45）：这个会话 [0] 入向（会话 socket）、[1] 回程（监听 socket 发往它）的 GSO 失败过，此后合并包逐个数据报发送
 	//u64_t last_active_time;
 	udp_pair_t()
@@ -302,6 +305,8 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 		memset(&ev,0,sizeof(ev));//同 tcp_info_t（T11）
 		owner=0;
 		remote_index=-1;
+		gen=0;
+		unans=0;
 		batch_group=-1;
 		gso_off[0]=gso_off[1]=0;
 		local.family=0;
@@ -316,12 +321,16 @@ struct tcp_pair_t:not_copy_able_t,lru_node_t
 	//u64_t last_active_time;
 	forward_rule_t *owner;
 	int remote_index;
+	u32_t gen;//同 udp_pair_t::gen
 	address_t addr;//客户端地址，记日志时才格式化（T7）
+	unsigned char sweep_idle;//remote_sweep 上次查到上游 socket 没有在途数据：之后没有收发就不必再查（放在 addr 之后的尾部空洞里）
 	//int not_used=0;
 	tcp_pair_t()
 	{
 		owner=0;
 		remote_index=-1;
+		gen=0;
+		sweep_idle=0;
 	}
 };
 

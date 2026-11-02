@@ -9,6 +9,7 @@ import (
 	"net"
 	"net/netip"
 	"os"
+	"regexp"
 	"slices"
 	"strings"
 	"sync"
@@ -453,8 +454,9 @@ func TestUDPManySessions(t *testing.T) {
 }
 
 // 删除后幸存会话仍可查到：两个上游做等权轮询，上游 A 为字面量 IP，上游 B 为域名（经 /etc/hosts 解析）。
-// 约 600 个会话按 A、B 交替建立（偶数号→A，奇数号→B）。最后建立的是一个 B 客户端，故 last_hit 指向一个即将被删除的会话。
-// 切换域名 B 的地址后，DNS 刷新（30 s）触发 clear_remote_index 删掉全部 B 会话：
+// 约 600 个会话按 A、B 交替建立（偶数号→A，奇数号→B）。之后 B 的旧后端不再回包，每个 B 客户端按建立顺序各发一包，
+// 最后发的是一个 B 客户端，故 last_hit 指向一个即将被删除的会话。切换域名 B 的地址后，DNS 刷新（30 s）时 remote_sweep 删掉
+// 全部 B 会话（包已等了 10 s 以上没有回包；刷新来得早于 10 s 时由 30 s 后的定时检查删）：
 //   - 那个 last_hit B 客户端再发包必须得到回复（新会话），而不是命中已归还的旧会话（nolastclear 变异在此被杀）；
 //   - 每个 A 客户端仍能经各自的旧会话到达 A：A 后端源地址集不变、A 会话不重建，sessions==numA+1、total==N+1
 //     （删除用后移，表不被打乱；noshift/shiftgt 变异会让部分 A 会话查不到→重建→计数超出，在此被杀）。
@@ -466,9 +468,9 @@ func TestUDPSessionChurn(t *testing.T) {
 	const name = "tpm-u2churn.test"
 	bport := freePort(t)
 	aAddr := hostPort("127.0.0.2", bport)
-	beA := serveUDP(t, aAddr, "A")                  // 上游 A：字面量 IP
-	serveUDP(t, hostPort("127.0.0.3", bport), "B3") // 上游 B 初始地址
-	serveUDP(t, hostPort("127.0.0.4", bport), "B4") // 上游 B 切换后的地址
+	beA := serveUDP(t, aAddr, "A")                          // 上游 A：字面量 IP
+	beB3 := serveUDP(t, hostPort("127.0.0.3", bport), "B3") // 上游 B 初始地址
+	serveUDP(t, hostPort("127.0.0.4", bport), "B4")         // 上游 B 切换后的地址
 	setLast := hostsEntry(t, "127.0.0.3", name)
 
 	listen := loopback4(t)
@@ -499,15 +501,42 @@ func TestUDPSessionChurn(t *testing.T) {
 		t.Fatalf("用例前提：最后一个客户端应为 B 客户端")
 	}
 	lastHitB := conns[n-1]
+	// B 的旧后端不再回包，B 客户端各发一包（unans）：每个包都要经会话发出去，up_pkts 恰好多 numB 个才算数（环回偶有丢包时整轮重发，
+	// 重发只是同一会话再来一包，unans 仍是第一包的时间）
+	beB3.mute.Store(true)
+	for up := m.statsAfterSignal(t).udp[1].upPkts; ; {
+		for i := 1; i < n; i += 2 {
+			if _, err := conns[i].Write(fmt.Appendf(nil, "silent-%d", i)); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var got uint64
+		eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+			if got = m.statsAfterSignal(t).udp[1].upPkts; got < up+uint64(numB) {
+				return fmt.Errorf("up_pkts 只多了 %d 个，期望 %d", got-up, numB)
+			}
+			return nil
+		})
+		if got == up+uint64(numB) {
+			break
+		}
+		t.Logf("up_pkts 多了 %d 个（期望 %d），重发一轮", got-up, numB)
+		up = got
+	}
 
-	// 切换域名 B 的地址：127.0.0.3 → 127.0.0.4，等 DNS 刷新触发 clear_remote_index
+	// 切换域名 B 的地址：127.0.0.3 → 127.0.0.4，等 remote_sweep 删掉全部 B 会话（变化时，或 30 s 后的定时检查）
 	setLast('4')
 	start := time.Now()
-	eventually(t, 50*time.Second, 500*time.Millisecond, func() error {
-		if m.logLines("changed from", fmt.Sprintf("udp=%d", numB)) != 0 {
+	closed := regexp.MustCompile(`domain ` + regexp.QuoteMeta(name) + `:\d+ (?:changed from \S+ to \S+,|old address check:) closed unresponsive tcp=(\d+) udp=(\d+),`)
+	eventually(t, 80*time.Second, 500*time.Millisecond, func() error {
+		sum := 0
+		for _, l := range changedLines(m, closed) {
+			sum += l[1]
+		}
+		if sum == numB {
 			return nil
 		}
-		return fmt.Errorf("还没看到 B 域名地址切换、删除 %d 个 B 会话的日志", numB)
+		return fmt.Errorf("B 域名地址切换后删除了 %d 个 B 会话，期望 %d", sum, numB)
 	})
 	t.Logf("切换 /etc/hosts 后 %v 内删除了 %d 个 B 会话", time.Since(start).Round(time.Second), numB)
 

@@ -1,10 +1,12 @@
 package tests
 
 import (
+	"encoding/binary"
 	"fmt"
 	"io"
 	"net"
 	"os"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -12,6 +14,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // etcHostsMu 保护 hostsEntry 的"取文件末尾 + 追加"：TestDomainRefresh 与 TestUDPSessionChurn 并行，同时追加会写到同一偏移
@@ -160,7 +163,8 @@ func hostsBlock(t testing.TB, name string, ips []string) func(ips []string) {
 	}
 }
 
-// 域名 remote 每 30 s 重新解析：地址变化后新连接改连新地址，连往旧地址的 TCP 连接和 UDP 会话被关闭
+// 域名 remote 每 30 s 重新解析：地址变化后新连接改连新地址；连在旧地址上的 TCP 连接和 UDP 会话还可用就留着（审查 #9，remote_sweep）。
+// 旧后端一直正常：变化时它们都留下（变化行 kept tcp=1 udp=1），之后照常收发、经过下一次定时检查（变化后 dns_refresh_interval）也不关
 func TestDomainRefresh(t *testing.T) {
 	t.Parallel()
 	inContainer(t)
@@ -202,33 +206,250 @@ func TestDomainRefresh(t *testing.T) {
 		return nil
 	})
 	t.Logf("修改 /etc/hosts 后 %v 内切换到新地址", time.Since(start).Round(time.Second))
-	expectClosed(t, old, ioTimeout)
-	if got := udpReplyFrom(t, udp, "after"); got != "3" {
-		t.Fatalf("地址变化后旧 UDP 客户端仍发往后端 %q", got)
+	// 每个 worker 一行；旧连接与旧会话可能在不同的 worker 上，合计各为 1
+	changed := regexp.MustCompile(`domain ` + regexp.QuoteMeta(name) + `:\d+ changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		lines := changedLines(m, changed)
+		var sum [2]int
+		for _, l := range lines {
+			sum[0] += l[0]
+			sum[1] += l[1]
+		}
+		if len(lines) != m.threads() || sum != [2]int{1, 1} {
+			return fmt.Errorf("地址变化行 %v，期望 %d 行、kept 合计 tcp=1 udp=1", lines, m.threads())
+		}
+		return nil
+	})
+	changedAt := time.Now()
+	// 旧连接与旧会话留在旧后端，此时 tinymapper 持有 UDP 监听 socket（M2：每个 worker 一个）和旧会话的 socket
+	if want := m.threads() + 1; udpSockets(m.pid()) != want {
+		t.Errorf("地址变化后 tinymapper 持有 %d 个 UDP socket，期望 %d（%d 个监听 socket 与旧会话）", udpSockets(m.pid()), want, m.threads())
 	}
-	// T10：clear_remote_index 释放旧会话时要关掉它的 socket，此时 tinymapper 只持有 UDP 监听 socket（M2：每个 worker 一个）和新会话的 socket。
-	// 并行用例（TestWorkerUDPMaxConn）同时建拆上万个 UDP socket 时一次遍历可能漏掉一个（实测少数一个），所以重试：漏掉的只会让数变少，
-	// 没关的旧会话 socket 一直多一个
+	// 跨过变化后 dns_refresh_interval 的那次定时检查（30 s，worker_tick 每 400 ms）一直收发：旧后端正常，旧连接与旧会话都不关
+	for i := 0; time.Since(changedAt) < 32*time.Second; i++ {
+		mustEcho(t, old, fmt.Sprintf("old-%d", i))
+		if got := udpReplyFrom(t, udp, fmt.Sprintf("old-%d", i)); got != "2" {
+			t.Fatalf("地址变化后 %v 旧 UDP 会话发往后端 %q，期望仍为旧后端 2", time.Since(changedAt).Round(time.Second), got)
+		}
+		time.Sleep(time.Second)
+	}
+	m.fatalIfExited(t, "地址变化后的定时检查")
+	if n := m.logLines("old address check"); n != 0 {
+		t.Errorf("旧后端正常，定时检查却关掉了连接（%d 行 old address check）", n)
+	}
+	for i := 0; i < 2; i++ {
+		c := dial(t, listen)
+		if got := readLine(t, c); got != "3" {
+			t.Fatalf("地址变化后新连接连到后端 %q", got)
+		}
+		mustEcho(t, c, "new")
+	}
+	if got := udpReplyFrom(t, udpDial(t, "", listen), "new"); got != "3" {
+		t.Fatalf("地址变化后新的 UDP 客户端发往后端 %q", got)
+	}
+	if s := m.statsAfterSignal(t).udp[1]; s.sessions != 2 || s.total != 2 {
+		t.Errorf("统计 udp sessions=%d total=%d，期望 2/2（旧会话留下，新客户端一个新会话）", s.sessions, s.total)
+	}
+}
+
+// loAlias4Mu 串行化 loAlias4 的加地址：SIOCSIFADDR 先按类别装成 /24，两个并行用例同一 /24 的地址这时会成为对方的从地址，
+// 随后改掩码删掉主地址时连同从地址一起删掉（promote_secondaries 默认关）
+var loAlias4Mu sync.Mutex
+
+// loAlias4 在 lo 上加 IPv4 地址 a/32（标签 lo:<最后一字节>），返回删掉它的函数，用例结束时也删。SIOCSIFADDR 之后 SIOCSIFNETMASK 改成 /32
+// （192.0.2.0/24 是 TEST-NET-1，别的用例不用）；IPv4 没有 SIOCDIFADDR，删除用不带 IFF_UP 的 SIOCSIFFLAGS：devinet_ioctl 对带冒号的标签
+// 据此删掉这个地址（inet_del_ifa）。删除后绑定这个地址返回 EADDRNOTAVAIL；加删要 CAP_NET_ADMIN（needNetAdmin）
+func loAlias4(t testing.TB, a [4]byte) func() {
+	t.Helper()
+	needNetAdmin(t)
+	label := fmt.Sprintf("lo:%d", a[3])
+	do := func(req uintptr, sin []byte) error {
+		s, err := syscall.Socket(syscall.AF_INET, syscall.SOCK_DGRAM|syscall.SOCK_CLOEXEC, 0)
+		if err != nil {
+			return err
+		}
+		defer syscall.Close(s)
+		var r [40]byte // struct ifreq：ifr_name[16]，联合体从偏移 16 起
+		copy(r[:15], label)
+		if sin != nil {
+			binary.NativeEndian.PutUint16(r[16:], syscall.AF_INET) // struct sockaddr_in，sin_addr 在偏移 20；SIOCSIFFLAGS 时 ifr_flags 为 0
+			copy(r[20:24], sin)
+		}
+		return ioctl(s, req, unsafe.Pointer(&r[0]))
+	}
+	func() {
+		loAlias4Mu.Lock()
+		defer loAlias4Mu.Unlock()
+		if err := do(siocSIFAddr, a[:]); err != nil {
+			t.Fatalf("SIOCSIFADDR %s %v 失败：%v", label, a, err)
+		}
+		if err := do(siocSIFNetmsk, []byte{255, 255, 255, 255}); err != nil {
+			t.Fatalf("SIOCSIFNETMASK %s 失败：%v", label, err)
+		}
+	}()
+	var once sync.Once
+	del := func() {
+		once.Do(func() {
+			if err := do(siocSIFFlags, nil); err != nil {
+				t.Errorf("删除 %s 失败：%v", label, err)
+			}
+		})
+	}
+	t.Cleanup(del)
+	return del
+}
+
+// 审查 #9：域名地址变化后，连在旧地址上的连接对与会话不可用时才关（remote_sweep）。旧后端在 lo 的别名地址上，删掉这个地址模拟后端消失：
+// tinymapper 的上游 TCP socket 的源地址也是它，删掉后待发数据发不出去、走零窗口探测定时器（tcpi_probes 每次加一，约 1.5 s 到 3）；
+// UDP 客户端的包等不到回包。客户端一直发：TCP 每 100 ms 写 100 字节，UDP 每 500 ms 一包。两种情况下客户端的 TCP 连接都被关闭，
+// UDP 客户端的下一个包建新会话到新地址；被释放的连接对与会话关掉 socket、归还对象池：
+//   - atchange：改 /etc/hosts 后马上删地址，DNS 变化时就关掉（变化行 closed unresponsive tcp=1 udp=1，UDP 的包已等了 10 s 以上）；
+//   - periodic：DNS 变化时旧后端正常（kept tcp=1 udp=1），之后才删地址，由变化后 dns_refresh_interval 的定时检查关掉（old address check 行）
+func TestDomainRefreshUnresponsive(t *testing.T) {
+	t.Parallel()
+	inContainer(t)
+	for i, mode := range []string{"atchange", "periodic"} {
+		t.Run(mode, func(t *testing.T) {
+			t.Parallel()
+			domainUnresponsive(t, mode, byte(1+4*i))
+		})
+	}
+}
+
+// domainUnresponsive：旧后端 192.0.2.<last>，新后端 192.0.2.<last+1>（hostsEntry 只改地址的最后一个字符，last 为 1–8）
+func domainUnresponsive(t *testing.T, mode string, last byte) {
+	name := "tpm-unresp-" + mode + ".test"
+	oldIP, newIP := net.IPv4(192, 0, 2, last), net.IPv4(192, 0, 2, last+1)
+	delOld := loAlias4(t, [4]byte(oldIP.To4()))
+	loAlias4(t, [4]byte(newIP.To4()))
+	bport := freePort(t)
+	serveTCP(t, hostPort(oldIP.String(), bport), echoHandler("old\n"))
+	serveUDP(t, hostPort(oldIP.String(), bport), "old")
+	serveTCP(t, hostPort(newIP.String(), bport), echoHandler("new\n"))
+	serveUDP(t, hostPort(newIP.String(), bport), "new")
+	setLast := hostsEntry(t, oldIP.String(), name)
+	listen := loopback4(t)
+	m := forward(t, "tu", listen, fmt.Sprintf("%s:%d", name, bport))
+
+	c := dial(t, listen)
+	if got := readLine(t, c); got != "old" {
+		t.Fatalf("启动时应连到旧后端 %s，实际 %q", oldIP, got)
+	}
+	u := udpDial(t, "", listen)
+	if got := udpReplyFrom(t, u, "before"); got != "old" {
+		t.Fatalf("启动时 UDP 应发往旧后端 %s，实际 %q", oldIP, got)
+	}
+	start := time.Now()
+	setLast('0' + last + 1)
+	sum := func(re *regexp.Regexp) (n int, s [2]int) {
+		for _, l := range changedLines(m, re) {
+			n++
+			s[0] += l[0]
+			s[1] += l[1]
+		}
+		return
+	}
+	prefix := `domain ` + regexp.QuoteMeta(name) + `:\d+ `
+	changed := regexp.MustCompile(prefix + `changed from ` + regexp.QuoteMeta(oldIP.String()) + `:\d+ to ` + regexp.QuoteMeta(newIP.String()) +
+		`:\d+, closed unresponsive tcp=(\d+) udp=(\d+), kept tcp=\d+ udp=\d+$`)
+	kept := regexp.MustCompile(prefix + `changed from \S+ to \S+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
+	periodic := regexp.MustCompile(prefix + `old address check: closed unresponsive tcp=(\d+) udp=(\d+), kept tcp=0 udp=0$`)
+	if mode == "periodic" {
+		eventually(t, 50*time.Second, 200*time.Millisecond, func() error {
+			if n, s := sum(kept); n != m.threads() || s != [2]int{1, 1} {
+				return fmt.Errorf("还没看到 %d 行留下旧连接与旧会话的地址变化（kept 合计 %v）", m.threads(), s)
+			}
+			return nil
+		})
+		t.Logf("修改 /etc/hosts 后 %v 看到地址变化，旧连接与旧会话都留下", time.Since(start).Round(time.Millisecond))
+		mustEcho(t, c, "still")
+		if got := udpReplyFrom(t, u, "still"); got != "old" {
+			t.Fatalf("地址变化后旧 UDP 会话发往 %q，期望仍为旧后端", got)
+		}
+	}
+	delOld()
+	deleted := time.Now()
+	if l, err := net.Listen("tcp4", hostPort(oldIP.String(), 0)); err == nil {
+		l.Close()
+		t.Fatalf("SIOCSIFFLAGS 没有删掉 %s：还能绑定", oldIP)
+	}
+
+	done := make(chan struct{})
+	defer close(done)
+	go func() {
+		for {
+			select {
+			case <-done:
+				return
+			case <-time.After(100 * time.Millisecond):
+			}
+			if _, err := c.Write(make([]byte, 100)); err != nil {
+				return
+			}
+		}
+	}()
+	tcpClosed := make(chan time.Duration, 1)
+	go func() {
+		c.SetReadDeadline(time.Now().Add(80 * time.Second))
+		n, err := c.Read(make([]byte, 4096))
+		if n > 0 || isTimeout(err) {
+			tcpClosed <- -1
+			return
+		}
+		tcpClosed <- time.Since(deleted)
+	}()
+	var udpNew time.Duration
+	eventually(t, 80*time.Second, 0, func() error {
+		got, err := udpTry(u, []byte("ping"), 500*time.Millisecond, 1)
+		if err != nil {
+			return err
+		}
+		if p := strings.TrimSuffix(string(got), "ping"); p != "new" {
+			return fmt.Errorf("UDP 回包来自 %q", p)
+		}
+		udpNew = time.Since(deleted)
+		return nil
+	})
+	var tcpAfter time.Duration
+	select {
+	case tcpAfter = <-tcpClosed:
+	case <-time.After(ioTimeout):
+		t.Fatal("UDP 已换到新地址，TCP 连接还没关")
+	}
+	if tcpAfter < 0 {
+		t.Fatal("旧 TCP 连接收到数据或 80 s 内没有关闭")
+	}
+	re := changed
+	if mode == "periodic" {
+		re = periodic
+	}
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if _, s := sum(re); s != [2]int{1, 1} {
+			return fmt.Errorf("关掉旧连接与旧会话的日志行合计 %v，期望 tcp=1 udp=1", s)
+		}
+		return nil
+	})
+	t.Logf("%s：修改 /etc/hosts 后 %v、删地址后 %v 关掉 TCP 连接，删地址后 %v UDP 换到新地址",
+		mode, (tcpAfter + deleted.Sub(start)).Round(time.Millisecond), tcpAfter.Round(time.Millisecond), udpNew.Round(time.Millisecond))
+
+	// T10：释放的旧会话要关掉 socket，此时 tinymapper 只持有 UDP 监听 socket（每个 worker 一个）和新会话的 socket
 	want := m.threads() + 1
 	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
 		if got := udpSockets(m.pid()); got != want {
-			return fmt.Errorf("地址变化后 tinymapper 持有 %d 个 UDP socket，期望 %d（%d 个监听 socket 与新会话）：被释放的旧会话没有关闭 socket", got, want, m.threads())
+			return fmt.Errorf("旧会话释放后 tinymapper 持有 %d 个 UDP socket，期望 %d：被释放的旧会话没有关闭 socket", got, want)
 		}
 		return nil
 	})
 	// 被释放的连接对与会话的 fd 号随后被新 socket 复用：再建两条 TCP 连接各往返一次，旧会话的 watcher 若没有 stop，
 	// 新 socket 上的事件也会回调到已释放的会话（ASan 报 heap-use-after-free，release 构建里数据被它取走）
 	for i := 0; i < 2; i++ {
-		c := dial(t, listen)
-		if got := readLine(t, c); got != "3" {
+		nc := dial(t, listen)
+		if got := readLine(t, nc); got != "new" {
 			t.Fatalf("地址变化后新连接连到后端 %q", got)
 		}
-		mustEcho(t, c, "reuse")
+		mustEcho(t, nc, "reuse")
 	}
-	if got := udpReplyFrom(t, udp, "again"); got != "3" {
-		t.Fatalf("地址变化后 UDP 再次发往后端 %q", got)
-	}
-	// O1：clear_remote_index 释放的旧会话与连接对都要归还对象池（statsAfterSignal 复核池不变式）；旧会话释放后同一客户端新建一个
+	// O1：释放的旧会话与连接对都要归还对象池（statsAfterSignal 复核池不变式）；同一客户端新建一个会话
 	if s := m.statsAfterSignal(t).udp[1]; s.sessions != 1 || s.total != 2 {
 		t.Errorf("统计 udp sessions=%d total=%d，期望 1/2", s.sessions, s.total)
 	}
@@ -301,7 +522,19 @@ func TestDomainRefreshLargeRRset(t *testing.T) {
 	if got := m.logLines("domain "+gone+":", "changed from "+goneIPs[0]+":", "to "+goneIPs[20]+":"); got != workers {
 		t.Fatalf("%s 的当前地址被删除后应有 %d 行 changed from，实际 %d 行：\n%s", gone, workers, got, m.logTail(10))
 	}
-	expectClosed(t, oldGone, ioTimeout)
+	// D94：旧后端仍在服务，连往它的旧连接留着（每个 worker 一行，kept 合计 tcp=1）。后端消失时关闭由 TestDomainRefreshUnresponsive 覆盖：
+	// 127/8 的地址删不掉，停掉后端会发 FIN，连接对在 tcp_cb 里就关了
+	goneChanged := regexp.MustCompile(`domain ` + regexp.QuoteMeta(gone) + `:\d+ changed from \S+ to \S+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
+	lines := changedLines(m, goneChanged)
+	var kept [2]int
+	for _, l := range lines {
+		kept[0] += l[0]
+		kept[1] += l[1]
+	}
+	if len(lines) != workers || kept != [2]int{1, 0} {
+		t.Fatalf("%s 的地址变化行 %v，期望 %d 行、kept 合计 tcp=1 udp=0：\n%s", gone, lines, workers, m.logTail(10))
+	}
+	mustEcho(t, oldGone, "still")
 	if got := readLine(t, dial(t, lGone)); got != goneIPs[20] {
 		t.Fatalf("%s 的新连接应连到 %s，实际 %q", gone, goneIPs[20], got)
 	}

@@ -64,9 +64,12 @@ and `hostname:port`; hostnames are resolved at startup and refreshed every
 30 seconds. `extra_remotes` is a Realm-style inline string array. `balance`
 supports `roundrobin` and `iphash`; the weight count must equal the total number
 of `remote` plus `extra_remotes` targets. When an active resolved address
-disappears from DNS results, only connections that selected that target are
-closed and new connections use the new address. JSON config, recursive directory
-loading, Realm transports, and proxy protocol settings are not supported.
+disappears from DNS results, new connections use the new address; connections
+that selected the old address are kept while they still work and closed once
+they stop responding (TCP: 3 unanswered retransmissions or probes; UDP: no reply
+for 10 seconds), checked at the change and every 30 seconds. JSON config,
+recursive directory loading, Realm transports, and proxy protocol settings are
+not supported.
 
 ##### NOTE
 ```

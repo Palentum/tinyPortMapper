@@ -717,8 +717,9 @@ func TestWorkerTCPMaxConn(t *testing.T) {
 
 // S7（M4）+ S5（M3）：UDP 的 max_conn_num 按所有 worker 合计，释放会话时名额还回去。N=2，remote 为 /etc/hosts 里的域名
 // （TPM_IN_CONTAINER）。客户端绑固定的源地址与端口（127.0.2.1、127.0.2.2 各 10000 个，端口 1024 起，原因见 TestUDPMaxConn），
-// 顺序建满 20000 个会话，第 20001 个客户端被忽略（一行 max_conv_num 的日志、没有回包），两个 worker 都有会话；改 /etc/hosts 让地址变化，
-// 每个 worker 各清掉自己的会话（两行 changed from，udp= 之和 20000），会话数归零；20000 个客户端再各发一包：都由新地址的后端回应
+// 顺序建满 20000 个会话，第 20001 个客户端被忽略（一行 max_conv_num 的日志、没有回包），两个 worker 都有会话；旧后端不再回包，
+// 20000 个客户端各发一包，再改 /etc/hosts 让地址变化，每个 worker 各关掉自己的会话（remote_sweep：两行 changed from，或刷新早于 10 s 时
+// 30 s 后的 old address check 行，closed udp= 之和 20000），会话数归零；20000 个客户端再各发一包：都由新地址的后端回应
 // （会话重建，名额全部还回来了才建得满），第 20001 个仍被忽略
 func TestWorkerUDPMaxConn(t *testing.T) {
 	t.Parallel()
@@ -732,9 +733,8 @@ func TestWorkerUDPMaxConn(t *testing.T) {
 		return &net.UDPAddr{IP: net.IPv4(127, 0, 2, byte(1+i/perIP)), Port: clientPortBase + i%perIP}
 	}
 	bport := freePort(t)
-	for _, id := range []string{"2", "3"} {
-		serveUDP(t, hostPort("127.0.0."+id, bport), id)
-	}
+	be2 := serveUDP(t, hostPort("127.0.0.2", bport), "2")
+	serveUDP(t, hostPort("127.0.0.3", bport), "3")
 	setLast := hostsEntry(t, "127.0.0.2", name)
 	listen := loopback4(t)
 	m := startMapper(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", fmt.Sprintf("%s:%d", name, bport), "-u", "--threads", "2")
@@ -801,15 +801,41 @@ func TestWorkerUDPMaxConn(t *testing.T) {
 			t.Errorf("有 worker 一个会话都没有（worker 行 %+v）：上限没有跨 worker 测到", d.workers)
 		}
 	}
+	// 旧后端不再回包，每个会话各发一包（unans）：up_pkts 恰好多 maxConn 个才算每个会话都发出去了，环回丢包时整轮重发
+	be2.mute.Store(true)
+	for up := d.udp[1].upPkts; ; {
+		for i := range maxConn {
+			if _, err := conns[i].Write([]byte("silent")); err != nil {
+				t.Fatal(err)
+			}
+		}
+		var got uint64
+		eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+			if got = m.statsAfterSignal(t).udp[1].upPkts; got < up+maxConn {
+				return fmt.Errorf("up_pkts 只多了 %d 个，期望 %d", got-up, maxConn)
+			}
+			return nil
+		})
+		if got == up+maxConn {
+			break
+		}
+		t.Logf("up_pkts 多了 %d 个（期望 %d），重发一轮", got-up, maxConn)
+		up = got
+	}
 	setLast('3')
-	changed := regexp.MustCompile(`changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, reloaded target connections tcp=(\d+) udp=(\d+)$`)
-	eventually(t, 50*time.Second, 200*time.Millisecond, func() error {
-		lines := changedLines(m, changed)
-		if len(lines) != 2 {
+	changed := regexp.MustCompile(`changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, closed unresponsive tcp=(\d+) udp=(\d+), kept`)
+	closed := regexp.MustCompile(`(?:changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+,|old address check:) closed unresponsive tcp=(\d+) udp=(\d+),`)
+	eventually(t, 80*time.Second, 200*time.Millisecond, func() error {
+		if lines := changedLines(m, changed); len(lines) != 2 {
 			return fmt.Errorf("日志里有 %d 行地址变化，期望 2 行（每个 worker 一行）", len(lines))
 		}
-		if sum := lines[0][1] + lines[1][1]; sum != maxConn {
-			return fmt.Errorf("两行地址变化清掉的会话合计 %d（%v），期望 %d", sum, lines, maxConn)
+		lines := changedLines(m, closed)
+		sum := 0
+		for _, l := range lines {
+			sum += l[1]
+		}
+		if sum != maxConn {
+			return fmt.Errorf("关掉的会话合计 %d（%v），期望 %d", sum, lines, maxConn)
 		}
 		return nil
 	})
@@ -841,8 +867,9 @@ func changedLines(m *mapper, re *regexp.Regexp) [][2]int {
 }
 
 // S5（M3）：域名 remote 的地址变化广播给每个 worker。N=2，TCP+UDP 规则，16 条 TCP 连接与 16 个 UDP 会话（两个 worker 都有）。改
-// /etc/hosts 后恰有 2 行 changed from（每个 worker 一行），各行的 tcp=、udp= 与地址变化前那个 worker 的 tcp_conns、udp_sessions 一一对应
-// （worker 只清自己的）；旧的 TCP 连接都被关闭；旧 UDP 客户端的下一包发往新地址；之后 32 条新连接都连到新地址，两个 worker 都建了新连接
+// /etc/hosts 后恰有 2 行 changed from（每个 worker 一行），旧后端正常，各行 closed 为 0、kept 的 tcp=、udp= 与地址变化前那个 worker 的
+// tcp_conns、udp_sessions 一一对应（worker 只查自己的，remote_sweep）；旧的 TCP 连接与旧 UDP 客户端都仍连旧后端；
+// 之后 32 条新连接都连到新地址，两个 worker 都建了新连接
 func TestWorkerDNSBroadcast(t *testing.T) {
 	t.Parallel()
 	inContainer(t)
@@ -880,7 +907,7 @@ func TestWorkerDNSBroadcast(t *testing.T) {
 		want = append(want, [2]int{w.tcpConns, w.udpSessions})
 	}
 	setLast('3')
-	changed := regexp.MustCompile(`rule 1 remote 0 domain ` + regexp.QuoteMeta(name) + `:\d+ changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, reloaded target connections tcp=(\d+) udp=(\d+)$`)
+	changed := regexp.MustCompile(`rule 1 remote 0 domain ` + regexp.QuoteMeta(name) + `:\d+ changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
 	var lines [][2]int
 	eventually(t, 50*time.Second, 200*time.Millisecond, func() error {
 		if lines = changedLines(m, changed); len(lines) < n {
@@ -888,8 +915,8 @@ func TestWorkerDNSBroadcast(t *testing.T) {
 		}
 		return nil
 	})
-	for _, c := range old {
-		expectClosed(t, c, ioTimeout)
+	for i, c := range old {
+		mustEcho(t, c, fmt.Sprintf("old-%d", i))
 	}
 	time.Sleep(time.Second) // 再等两个定时器周期：同一次变化不能广播两次
 	if lines = changedLines(m, changed); len(lines) != n {
@@ -901,11 +928,11 @@ func TestWorkerDNSBroadcast(t *testing.T) {
 	sortPairs(lines)
 	sortPairs(want)
 	if !slices.Equal(lines, want) {
-		t.Errorf("地址变化行清掉的 (tcp, udp) 为 %v，期望与变化前各 worker 的 (tcp_conns, udp_sessions) %v 一致", lines, want)
+		t.Errorf("地址变化行留下的 (tcp, udp) 为 %v，期望与变化前各 worker 的 (tcp_conns, udp_sessions) %v 一致", lines, want)
 	}
 	for i, c := range us {
-		if got := udpReplyFrom(t, c, "after"); got != "3" {
-			t.Fatalf("地址变化后旧 UDP 客户端 %d 发往后端 %q", i, got)
+		if got := udpReplyFrom(t, c, "after"); got != "2" {
+			t.Fatalf("地址变化后旧 UDP 客户端 %d 发往后端 %q，期望仍为旧后端 2", i, got)
 		}
 	}
 	mid := m.statsAfterSignal(t)
@@ -922,8 +949,8 @@ func TestWorkerDNSBroadcast(t *testing.T) {
 			t.Errorf("worker %d 在地址变化后没有建新连接（之前 %+v，之后 %+v）", w, mid.workers, after.workers)
 		}
 	}
-	if s := after.udp[1]; s.sessions != k || s.total != 2*k {
-		t.Errorf("统计 udp sessions=%d total=%d，期望 %d/%d", s.sessions, s.total, k, 2*k)
+	if s := after.udp[1]; s.sessions != k || s.total != k {
+		t.Errorf("统计 udp sessions=%d total=%d，期望 %d/%d（旧会话都留下）", s.sessions, s.total, k, k)
 	}
 }
 

@@ -45,6 +45,10 @@ static app_config_t app_config;
 
 int listen_fd_buf_size=2*1024*1024;//UDP 监听 socket 的 SO_SNDBUF/SO_RCVBUF，--udp-listen-buf
 static const u32_t dns_refresh_interval=30000;
+//DNS 换掉的旧地址上的 UDP 会话：客户端发来的包这么久没等到一个回包就算不可用（remote_sweep）
+static const my_time_t udp_unans_timeout=10000;
+//同上，TCP：上游 socket 连续超时重传（含 SYN）或零窗口探测没有应答到这么多次就算不可用
+static const int tcp_unans_probes=3;
 static const int max_accept_per_round=8;
 //内核把 listen backlog 截断为所在网络命名空间的 net.core.somaxconn（5.4 起默认 4096，以前 128）。不用 SOMAXCONN：musl 与 glibc 2.31 以前都定义为 128；不超过 65535：4.1 以前 sk_max_ack_backlog 是 u16
 static const int listen_backlog=65535;
@@ -93,19 +97,19 @@ struct lru_collector_t:not_copy_able_t
 		key->prev->next=key->next;
 		key->next->prev=key->prev;
 	}
-	int update(key_t key)
+	my_time_t update(key_t key)//返回本轮缓存的时间，调用方不必再取一次
 	{
 		DEBUG_ASSERT(key->next!=0);
 
 		my_time_t value=clock->now();
 		DEBUG_ASSERT(value >=head.next->ts);
 		//距上次挪动不到 lru_move_interval 就不挪：链表仍按 ts 有序，ts 最多比实际最后活动早这么多，超时最多提前这么多（T8）
-		if(value-key->ts<lru_move_interval) return 0;
+		if(value-key->ts<lru_move_interval) return value;
 		key->ts=value;
 		unlink(key);
 		link_front(key);
 
-		return 0;
+		return value;
 	}
 	int new_key(key_t key)
 	{
@@ -911,23 +915,6 @@ struct conn_manager_udp_t
 
 	int erase(udp_pair_t *pair);//定义在 worker_t 之后
 
-	int clear_remote_index(int remote_index)
-	{
-		int cnt=0;
-		//沿 LRU 遍历全部会话：先取下一个，再释放当前的
-		for(lru_node_t *node=lru.head.next;node!=&lru.head;)
-		{
-			udp_pair_t *pair=static_cast<udp_pair_t *>(node);
-			node=node->next;
-			if(pair->remote_index==remote_index)
-			{
-				erase(pair);
-				cnt++;
-			}
-		}
-		return cnt;
-	}
-
 	int clear_inactive()
 	{
 		if(lru.clock->now()-last_clear_time>conn_clear_interval)
@@ -989,22 +976,6 @@ struct conn_manager_tcp_t
 	}
 	int erase(tcp_pair_t *pair);//定义在 worker_t 之后
 	int erase_closed(tcp_pair_t *pair);
-	int clear_remote_index(int remote_index)
-	{
-		int cnt=0;
-		//沿 LRU 遍历全部连接对：先取下一个，再释放当前的
-		for(lru_node_t *node=lru.head.next;node!=&lru.head;)
-		{
-			tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
-			node=node->next;
-			if(pair->remote_index==remote_index)
-			{
-				erase_closed(pair);
-				cnt++;
-			}
-		}
-		return cnt;
-	}
 
 	int clear_inactive()
 	{
@@ -1054,12 +1025,18 @@ struct remote_target_t
 	char remote_str[max_remote_len];
 	char host[max_domain_len];
 	u32_t port;
+	u32_t gen;//本 worker 收到的地址变化次数（worker_dns_update 加一）：连接对与会话建立时记下，不同即连在旧地址上
+	my_time_t sweep_at;//旧地址上还留着可用的连接对或会话时，worker_tick 到这个时间再查一次（remote_sweep）；0 为没有
+	my_time_t swept_at;//上一次 remote_sweep 的时间
 	remote_target_t()
 	{
 		is_domain=0;
 		remote_str[0]=0;
 		host[0]=0;
 		port=0;
+		gen=0;
+		sweep_at=0;
+		swept_at=0;
 	}
 };
 
@@ -1417,7 +1394,62 @@ static void dns_apply_result(dns_refresh_result_t &result)
 		worker_post(*workers[i],m);
 }
 
-//worker 收到 DNS 更新（S5）：换自己规则副本里的地址，只清本 worker 里连到这个 remote 的连接与会话，记一行（N 个 worker 各一行）
+//关掉 remote r 连在旧地址上（gen 不是当前的）、已不可用的连接对与会话：DNS 换地址只让新连接改连新地址，旧连接还能用就留着。
+//TCP 看上游 socket 的 TCP_INFO：连续超时重传或零窗口探测没有应答达到 tcp_unans_probes 次（收到推进 snd_una 的 ACK 时重传数清零，
+//收到任何 ACK 时探测数清零；没有路由、待发数据发不出去时也走零窗口探测的定时器，计入探测数），或 getsockopt 失败；
+//UDP 看 unans：客户端的包等了 udp_unans_timeout 还没有回包。
+//TCP 连接对上次查到没有在途数据（sweep_idle）、之后也没有收发的不再 getsockopt：内核没有可重传的东西，不会由可用变为不可用。
+//ts 最多比实际最后活动早 lru_move_interval，所以 ts+lru_move_interval 不晚于上一次检查才算没有收发。子集应答的域名地址一直在变，
+//旧地址上的连接一直都有，不跳过的话每次都要逐条 getsockopt（20k 条 40–107 ms，D94）。
+//沿 LRU 遍历（先取下一个，再释放当前的）；closed、kept 的 [0] 为 TCP、[1] 为 UDP，kept 只数旧地址上还可用的。
+//还有留下的就在 dns_refresh_interval 后由 worker_tick 再查一次
+static void remote_sweep(forward_rule_t &rule,int r,int closed[2],int kept[2])
+{
+	remote_target_t &target=rule.remote_targets[r];
+	my_time_t now=rule.worker->clock.now();
+	closed[0]=closed[1]=kept[0]=kept[1]=0;
+	conn_manager_tcp_t &tcp=rule.tcp_manager;
+	for(lru_node_t *node=tcp.lru.head.next;node!=&tcp.lru.head;)
+	{
+		tcp_pair_t *pair=static_cast<tcp_pair_t *>(node);
+		node=node->next;
+		if(pair->remote_index!=r||pair->gen==target.gen) continue;
+		if(pair->sweep_idle&&pair->ts+lru_move_interval<=target.swept_at)
+		{
+			kept[0]++;
+			continue;
+		}
+		struct tcp_info info;
+		socklen_t len=sizeof(info);
+		if(getsockopt(pair->remote.fd,IPPROTO_TCP,TCP_INFO,&info,&len)==0&&info.tcpi_retransmits<tcp_unans_probes&&info.tcpi_probes<tcp_unans_probes)
+		{
+			pair->sweep_idle=info.tcpi_unacked==0&&info.tcpi_backoff==0&&info.tcpi_retransmits==0&&info.tcpi_probes==0;
+			kept[0]++;
+			continue;
+		}
+		tcp.erase_closed(pair);
+		closed[0]++;
+	}
+	conn_manager_udp_t &udp=rule.udp_manager;
+	for(lru_node_t *node=udp.lru.head.next;node!=&udp.lru.head;)
+	{
+		udp_pair_t *pair=static_cast<udp_pair_t *>(node);
+		node=node->next;
+		if(pair->remote_index!=r||pair->gen==target.gen) continue;
+		if(pair->unans==0||now-pair->unans<udp_unans_timeout)
+		{
+			kept[1]++;
+			continue;
+		}
+		udp.erase(pair);
+		closed[1]++;
+	}
+	target.swept_at=now;
+	target.sweep_at=kept[0]+kept[1]>0?now+dns_refresh_interval:0;
+}
+
+//worker 收到 DNS 更新（S5）：换自己规则副本里的地址，新连接从此连新地址；本 worker 里连在旧地址上的只关掉已不可用的（remote_sweep），
+//记一行（N 个 worker 各一行）
 static void worker_dns_update(worker_t &w,const worker_msg_t &m)
 {
 	for(auto rule_it=w.rules.begin();rule_it!=w.rules.end();++rule_it)
@@ -1434,9 +1466,10 @@ static void worker_dns_update(worker_t &w,const worker_msg_t &m)
 		target.addr.to_str(old_addr);
 		next_addr.to_str(new_addr);
 		target.addr=next_addr;
-		int tcp_closed=rule.tcp_manager.clear_remote_index(m.remote_index);
-		int udp_closed=rule.udp_manager.clear_remote_index(m.remote_index);
-		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, reloaded target connections tcp=%d udp=%d\n",rule.index,m.remote_index,target.host,target.port,old_addr,new_addr,tcp_closed,udp_closed);
+		target.gen++;
+		int closed[2],kept[2];
+		remote_sweep(rule,m.remote_index,closed,kept);
+		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",rule.index,m.remote_index,target.host,target.port,old_addr,new_addr,closed[0],closed[1],kept[0],kept[1]);
 		return;
 	}
 }
@@ -2062,6 +2095,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 
 	tcp_pair.owner=rule;
 	tcp_pair.remote_index=remote_index;
+	tcp_pair.gen=rule->remote_targets[remote_index].gen;
 	tcp_pair.addr=tmp_addr;
 
 	mylog(log_info,"[tcp]new_connection from {%s},fd1=%d,fd2=%d,tcp connections=%d\n",tcp_pair.addr.get_str(),new_fd,new_remote_fd,conn_manager_tcp.lru.size());
@@ -2114,13 +2148,24 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 }
 
-//一个 worker 每个定时器周期要做的事（M1）：清空闲连接、重启被停掉的监听 watcher、pipe 池标志复位与重扩。由 worker 自己 loop 上的定时器调用（L7）
+//一个 worker 每个定时器周期要做的事（M1）：清空闲连接、再查 DNS 旧地址上留下的连接（remote_sweep）、重启被停掉的监听 watcher、
+//pipe 池标志复位与重扩。由 worker 自己 loop 上的定时器调用（L7）
 static void worker_tick(worker_t &w)
 {
+	my_time_t now=w.clock.now();
 	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 	{
 		it->tcp_manager.clear_inactive();
 		it->udp_manager.clear_inactive();
+		for(size_t r=0;r<it->remote_targets.size();r++)
+		{
+			remote_target_t &target=it->remote_targets[r];
+			if(target.sweep_at==0||now<target.sweep_at) continue;
+			int closed[2],kept[2];
+			remote_sweep(*it,(int)r,closed,kept);
+			if(closed[0]+closed[1]>0)
+				mylog(log_info,"rule %d remote %d domain %s:%u old address check: closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",it->index,(int)r,target.host,target.port,closed[0],closed[1],kept[0],kept[1]);
+		}
 		if(it->enable_tcp&&!ev_is_active(&it->tcp_accept_watcher))
 		{
 			ev_io_start(w.loop,&it->tcp_accept_watcher);
@@ -2226,6 +2271,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 	b.rn+=n;
 	conn_manager_udp.lru.update(&udp_pair);
+	udp_pair.unans=0;//收到回包：上游还在应答（remote_sweep）
 	//udp_pair.last_active_time=get_current_time();
 	if(b.rn==udp_batch_max) udp_flush_return(b);
 }
@@ -2282,6 +2328,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	conn_manager_udp.total++;
 	udp_pair.owner=rule;
 	udp_pair.remote_index=remote_index;
+	udp_pair.gen=rule->remote_targets[remote_index].gen;
 
 	udp_pair.fd=new_udp_fd;
 	udp_pair.ev.data=&udp_pair;
@@ -2736,7 +2783,8 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 	{
 		udp_pair_t &udp_pair=*b.group_pair[g];
 		udp_pair.batch_group=-1;
-		conn_manager_udp.lru.update(&udp_pair);
+		my_time_t now=conn_manager_udp.lru.update(&udp_pair);
+		if(udp_pair.unans==0) udp_pair.unans=now;//上一个回包之后的第一个包（remote_sweep）
 		int cnt=b.group_cnt[g];
 		udp_send_ctx_t c={conn_manager_udp,udp_pair.fd,0,&udp_pair.gso_off[0],0,&udp_pair,b};
 		udp_send_group(c,b.out+b.group_pos[g]-cnt,cnt);
