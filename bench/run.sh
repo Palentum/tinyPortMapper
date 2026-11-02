@@ -16,7 +16,8 @@
 #            +nosplice 为加 --disable-splice 启动（B2）；+nonroot（任何转发器，如 realm-1c+nonroot）以专用 uid FWD_UID（4242）启动，
 #            fs.pipe-user-pages-soft 按它计（见 lib.sh 的 start_fwd）；+t<N>（tinymapper）加 --threads N 启动（P4 多 worker），
 #            N ≥ 2 时同 realm-2c 绑 FWD_CPUS2（0,1），CPU 统计按这组 CPU（如 tinymapper@<后缀>+t2、tinymapper-musl+t2+nonroot）；
-#            +aff（tinymapper）加 --cpu-affinity 启动（M5，可与 +t<N> 组合，如 tinymapper@<后缀>+t2+aff）
+#            +aff（tinymapper）加 --cpu-affinity 启动（M5，可与 +t<N> 组合，如 tinymapper@<后缀>+t2+aff）；
+#            +any / +any6（tinymapper）监听 0.0.0.0:FPORT / [::]:FPORT（双栈），客户端仍按 FWD_IP 访问（通配监听的回包源地址，D87–D91）
 #   TESTS    测试项，默认全部 8 项；REPS 轮数（3）；DUR 每项秒数（10）
 #            tcp_rr_<N> / tcp_crr_<N> 的 N 是并发连接数（默认列表里是 64、1000 / 32，其他 N 同样可用，如 tcp_rr_128、tcp_crr_128）
 #            另有不在默认列表里的 UDP 负载（TESTS / SC_TESTS 里显式指定）：

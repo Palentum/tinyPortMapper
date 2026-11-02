@@ -274,9 +274,21 @@ struct lru_node_t//侵入式 LRU 节点：连接对象继承它，直接挂进�
 	}
 };
 
+//客户端发往的本地地址（D87）：通配地址的 UDP 监听按它给回包挂 pktinfo。family 为 0 时不挂，源地址由内核按路由选
+struct udp_local_t
+{
+	sa_family_t family;//0、AF_INET（含双栈监听收到的 v4-mapped 目的）或 AF_INET6
+	union
+	{
+		in_addr v4;
+		in6_addr v6;
+	};
+};
+
 struct udp_pair_t:not_copy_able_t,lru_node_t
 {
 	address_t adress;
+	udp_local_t local;//通配监听时为客户端最近一个包的目的地址（D89），回退（D90）时清零
 	int fd;
 	ev_io ev;//ev.data 指向本对象（T10）
 	forward_rule_t *owner;
@@ -291,6 +303,7 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 		remote_index=-1;
 		batch_group=-1;
 		gso_off[0]=gso_off[1]=0;
+		local.family=0;
 	}
 	//int not_used=0;
 };

@@ -489,13 +489,31 @@ static const int udp_slot_len=2048;
 #endif
 //U5：一次 GSO 发送最多这么多段。UDP_MAX_SEGMENTS 在 4.18–6.8 是 64、6.9 起 128（部分 LTS 已回移），按最小值；GRO 本身最多聚合 64 段
 static const int udp_gso_max_segs=64;
-//收包的 cmsg（UDP_GRO，int）与发包的 cmsg（UDP_SEGMENT，u16）共用这个大小；union 保证 cmsghdr 的对齐。
+//发包的 cmsg（UDP_SEGMENT，u16）；union 保证 cmsghdr 的对齐。
 //64 位 musl 的 cmsghdr 在 cmsg_len 旁有填充，内核读的是 size_t：只按字段名写，缓冲在 worker_new() 清零的页里，填充恒为 0
 union udp_ctrl_t
 {
 	cmsghdr hdr;
 	char buf[CMSG_SPACE(sizeof(int))];
 };
+//收包的 cmsg：内核依次写 UDP_GRO（int）、IPV6_PKTINFO、IP_PKTINFO（D87），按三者都在的大小，任何组合都不会 MSG_CTRUNC
+union udp_recv_ctrl_t
+{
+	cmsghdr hdr;
+	char buf[CMSG_SPACE(sizeof(int))+CMSG_SPACE(sizeof(in6_pktinfo))+CMSG_SPACE(sizeof(in_pktinfo))];
+};
+//回程发送条目的 cmsg（D87）：[UDP_SEGMENT][IP_PKTINFO 或 IPV6_PKTINFO]，pktinfo 从 CMSG_SPACE(u16) 处开始（内核在那里找下一个 cmsg，
+//udp_ret_pi），只带其中一个时 msg_control 指向那一段。pktinfo 的 msg_controllen 按 CMSG_LEN 计（IPv6 为 36）：内核栈上的控制缓冲是
+//sizeof(cmsghdr)+20，超出就每条消息 kmalloc 一次
+union udp_ret_ctrl_t
+{
+	cmsghdr hdr;
+	char buf[CMSG_SPACE(sizeof(uint16_t))+CMSG_SPACE(sizeof(in6_pktinfo))];
+};
+static inline cmsghdr *udp_ret_pi(udp_ret_ctrl_t &c)
+{
+	return (cmsghdr *)(c.buf+CMSG_SPACE(sizeof(uint16_t)));
+}
 //UDP 监听 socket 的入向批（U1、U3，D34）。每条消息两段 iov：2 KB 的槽（64 个连续排列，MTU 级的包只碰这里）加本消息自己的溢出区，
 //合计 max_data_len_udp；每个 worker 一份（M1，原为 BSS），在 worker_new() 用 mmap 分配的页里：溢出区只有大于 2 KB 的包才碰到它的页，
 //常驻内存随大包增长，最多约 4 MiB
@@ -518,34 +536,41 @@ struct udp_batch_t
 	//跨会话发出；批满时立即发出。入向收包之前（udp_accept_cb）也先发出，所以入向用这些槽时回程批总是空的，别处要用槽同样先发出
 	mmsghdr rin[udp_batch_max];//会话 socket 的 recvmmsg 用：msg_name 为 0（来源就是上游），iov 与 in[i] 共用 in_iov[i]
 	address_t raddr[udp_batch_max];//收包时拷下的客户端地址：会话在发出之前被释放、对象被池交给别的客户端也不受影响
+	udp_local_t rlocal[udp_batch_max];//同 raddr，收包时拷下的会话本地地址（D87），family 为 0 时回包不挂 pktinfo
 	forward_rule_t *rrule[udp_batch_max];//回包所属的规则（监听 socket 与计数），0 表示丢弃或已放进本次发出的组
 	mmsghdr rout[udp_batch_max];//对监听 socket 的 sendmmsg 用，一次放一个规则的组；填充同 out，必须保持 0
 	iovec rout_iov[udp_batch_max][2];
 	int rn;
-	//U5（--udp-gro）：ctrl[i] 收槽 i 的 cmsg，in[i] 与 rin[i] 共用（槽 i 同一时刻只属于一方）；gso[i] 是收包时从中取出的段长，
-	//槽 i 里不是 GRO 合并包时为 0。out_ctrl/rout_ctrl 给发送条目挂 UDP_SEGMENT；seg 把一个合并包切开重发（udp_send_split），
-	//填充同 out，必须保持 0。udp_gro 为 0 时都不用
-	udp_ctrl_t ctrl[udp_batch_max];
+	//U5（--udp-gro）、D87（通配监听的 PKTINFO）：ctrl[i] 收槽 i 的 cmsg，in[i] 与 rin[i] 共用（槽 i 同一时刻只属于一方），in_ctrl 为 1 时
+	//in[] 挂着它；gso[i] 是收包时从中取出的段长，槽 i 里不是 GRO 合并包时为 0。out_ctrl/rout_ctrl 给发送条目挂 UDP_SEGMENT，rout_ctrl
+	//还挂回程的 pktinfo；seg 把一个合并包切开重发（udp_send_split），填充同 out，必须保持 0。udp_gro 为 0 且没有通配监听时都不用
+	udp_recv_ctrl_t ctrl[udp_batch_max];
+	int in_ctrl;
 	int gso[udp_batch_max];
 	unsigned char roff[udp_batch_max];//回包所属会话收包时的 gso_off[1]（D45），按槽
 	udp_ctrl_t out_ctrl[udp_batch_max];
-	udp_ctrl_t rout_ctrl[udp_batch_max];
+	udp_ret_ctrl_t rout_ctrl[udp_batch_max];
 	unsigned char rout_off[udp_batch_max];//rout 第 i 条的 roff，udp_send_group 关掉 GSO 时也改它
 	mmsghdr seg[udp_batch_max];
 	iovec seg_iov[udp_batch_max][2];
-	udp_ctrl_t seg_ctrl[udp_batch_max];
-	static void init_segment(udp_ctrl_t &c)
+	udp_ret_ctrl_t seg_ctrl[udp_batch_max];
+	static void init_segment(cmsghdr &h)
 	{
-		c.hdr.cmsg_level=SOL_UDP;
-		c.hdr.cmsg_type=UDP_SEGMENT;
-		c.hdr.cmsg_len=CMSG_LEN(sizeof(uint16_t));//内核要求恰好是这个长度，否则 EINVAL
+		h.cmsg_level=SOL_UDP;
+		h.cmsg_type=UDP_SEGMENT;
+		h.cmsg_len=CMSG_LEN(sizeof(uint16_t));//内核要求恰好是这个长度，否则 EINVAL
 	}
-	void attach_ctrl()//所属 worker 的监听 socket 开了 UDP_GRO 之后调用（udp_gro_listen，可重复）
+	//所属 worker 的监听 socket 开了 UDP_GRO（udp_gro_listen，rin_too 为 1：会话 socket 也开）或 PKTINFO（udp_pktinfo_listen）之后调用，可重复
+	void attach_ctrl(int rin_too)
 	{
+		in_ctrl=1;
 		for(int i=0;i<udp_batch_max;i++)
 		{
-			in[i].msg_hdr.msg_control=rin[i].msg_hdr.msg_control=&ctrl[i];
-			in[i].msg_hdr.msg_controllen=rin[i].msg_hdr.msg_controllen=sizeof(ctrl[i]);
+			in[i].msg_hdr.msg_control=&ctrl[i];
+			in[i].msg_hdr.msg_controllen=sizeof(ctrl[i]);
+			if(!rin_too) continue;
+			rin[i].msg_hdr.msg_control=&ctrl[i];
+			rin[i].msg_hdr.msg_controllen=sizeof(ctrl[i]);
 		}
 	}
 	udp_batch_t()
@@ -565,11 +590,12 @@ struct udp_batch_t
 			rin[i].msg_hdr.msg_iovlen=2;
 			rout[i].msg_hdr.msg_iov=rout_iov[i];
 			seg[i].msg_hdr.msg_iov=seg_iov[i];
-			init_segment(out_ctrl[i]);
-			init_segment(rout_ctrl[i]);
-			init_segment(seg_ctrl[i]);
+			init_segment(out_ctrl[i].hdr);
+			init_segment(rout_ctrl[i].hdr);
+			init_segment(seg_ctrl[i].hdr);
 		}
 		rn=0;
+		in_ctrl=0;
 	}
 };
 //发送用的 iov：第 i 个包的前 2 KB 在 b.slot[i]，其余在 b.overflow[i]
@@ -594,11 +620,28 @@ static inline int udp_segs(size_t len,int gso)
 {
 	return gso==0?1:(int)((len+gso-1)/gso);
 }
-//U5：收到的条目带 UDP_GRO cmsg 时返回其中的 gso_size，否则 0；控制数据被截断（MSG_CTRUNC）时返回 -1，调用方丢掉这个包：
-//段长可能就在被截掉的部分里，当成普通数据报会把合并包作为一个大数据报发出（审查 L4；内核先写 SO_TIMESTAMP 等 cmsg 再写 UDP_GRO，
-//将来给这些 socket 加别的 cmsg 时要加大 udp_ctrl_t）。同时把内核改写的 msg_controllen 恢复成缓冲大小，下一次收包之前必须做。
+//D87：收到的 IPV6_PKTINFO 目的地址 a 记成会话本地地址。v4-mapped 按 IPv4 记（回包挂 IP_PKTINFO），组播与受限广播不记（不能作源；
+//子网广播认不出来，交给 D90 的回退）；链路本地地址只在客户端也带 scope_id 时记，回包的出口由客户端地址的 scope_id 决定
+static inline void udp_local_from6(const in6_addr &a,const address_t::storage_t &from,udp_local_t &l)
+{
+	if(IN6_IS_ADDR_V4MAPPED(&a))
+	{
+		memcpy(&l.v4,&a.s6_addr[12],sizeof(l.v4));
+		u32_t h=ntohl(l.v4.s_addr);
+		if((h>>28)!=0xe&&h!=0xffffffffu) l.family=AF_INET;
+		return;
+	}
+	if(IN6_IS_ADDR_MULTICAST(&a)) return;
+	if(IN6_IS_ADDR_LINKLOCAL(&a)&&(from.ipv6.sin6_family!=AF_INET6||from.ipv6.sin6_scope_id==0)) return;
+	l.v6=a;
+	l.family=AF_INET6;
+}
+//U5、D87：收到的条目带 UDP_GRO cmsg 时返回其中的 gso_size，否则 0；控制数据被截断（MSG_CTRUNC）时返回 -1，调用方丢掉这个包：
+//段长可能就在被截掉的部分里，当成普通数据报会把合并包作为一个大数据报发出（审查 L4；内核先写 SO_TIMESTAMP 等 cmsg 再写 UDP_GRO、
+//PKTINFO，将来给这些 socket 加别的 cmsg 时要加大 udp_recv_ctrl_t）。local 不为 0 时取出这个包的目的地址（没有 PKTINFO 时 family
+//保持 0），from 是发送方地址。同时把内核改写的 msg_controllen 恢复成缓冲大小，下一次收包之前必须做。
 //gso_size 是 int（按 u16 读在大端 MIPS 上得到 0）
-static inline int udp_recv_gso(msghdr &h)
+static inline int udp_recv_ctrl(msghdr &h,udp_local_t *local,const address_t::storage_t &from)
 {
 	int g=0;
 	if(h.msg_flags&MSG_CTRUNC)
@@ -608,27 +651,90 @@ static inline int udp_recv_gso(msghdr &h)
 		for(cmsghdr *c=CMSG_FIRSTHDR(&h);c!=0;c=CMSG_NXTHDR(&h,c))
 		{
 			if(c->cmsg_level==SOL_UDP&&c->cmsg_type==UDP_GRO)
-			{
 				memcpy(&g,CMSG_DATA(c),sizeof(g));
-				break;
+			else if(local!=0&&c->cmsg_level==SOL_IP&&c->cmsg_type==IP_PKTINFO)
+			{
+				//ipi_spec_dst：单播时等于目的地址，广播/组播时是收包网卡的地址；选项开启之前就排队的包为 0，退回目的地址
+				in_pktinfo pi;
+				memcpy(&pi,CMSG_DATA(c),sizeof(pi));
+				local->v4=pi.ipi_spec_dst.s_addr!=0?pi.ipi_spec_dst:pi.ipi_addr;
+				local->family=AF_INET;
+			}
+			else if(local!=0&&c->cmsg_level==SOL_IPV6&&c->cmsg_type==IPV6_PKTINFO)
+			{
+				in6_pktinfo pi;
+				memcpy(&pi,CMSG_DATA(c),sizeof(pi));
+				udp_local_from6(pi.ipi6_addr,from,*local);
 			}
 		}
 	}
-	h.msg_controllen=sizeof(udp_ctrl_t);
+	h.msg_controllen=sizeof(udp_recv_ctrl_t);
 	return g;
 }
-//U5：发送条目 m 发第 i 个槽里 len 字节的包，槽里是 GRO 合并包且多于 1 段时挂 UDP_SEGMENT（段长同收到的），否则不挂：
+//U5：第 i 个槽里 len 字节的包是 GRO 合并包且多于 1 段时返回段长（发送时挂 UDP_SEGMENT），否则 0：
 //没有 TX 校验和 offload 的出口在 6.11 以前连单段的 GSO 也报 EIO（探针实测）
-static inline void udp_batch_set_gso(udp_batch_t &b,mmsghdr &m,udp_ctrl_t &c,int i,int len)
+static inline int udp_batch_gso(udp_batch_t &b,int i,int len)
 {
 	int g=b.gso[i];
-	if(g!=0&&len>g)
+	DEBUG_ASSERT(g<=0xffff);
+	return g!=0&&len>g?g:0;
+}
+//U5：发送条目 m 发第 i 个槽里 len 字节的包，按 udp_batch_gso 挂 UDP_SEGMENT（段长同收到的）或不挂
+static inline void udp_batch_set_gso(udp_batch_t &b,mmsghdr &m,udp_ctrl_t &c,int i,int len)
+{
+	int g=udp_batch_gso(b,i,len);
+	if(g!=0)
 	{
-		DEBUG_ASSERT(g<=0xffff);
 		uint16_t v=(uint16_t)g;
 		memcpy(CMSG_DATA(&c.hdr),&v,sizeof(v));
 		m.msg_hdr.msg_control=&c;
 		m.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t));
+	}
+	else
+	{
+		m.msg_hdr.msg_control=0;
+		m.msg_hdr.msg_controllen=0;
+	}
+}
+//D87：在 h 处写本地地址 l 的 pktinfo，返回它占的 msg_controllen（CMSG_LEN）。IPv4 与 v4-mapped 客户端都用 SOL_IP 的 IP_PKTINFO
+//（3.10 起都生效；v4-mapped 的 IPV6_PKTINFO 3.15 以前被忽略）。ifindex 填 0，出口由路由（及客户端地址的 scope_id）决定
+static inline socklen_t udp_set_pktinfo(cmsghdr &h,const udp_local_t &l)
+{
+	if(l.family==AF_INET)
+	{
+		in_pktinfo pi;
+		memset(&pi,0,sizeof(pi));
+		pi.ipi_spec_dst=l.v4;
+		h.cmsg_level=SOL_IP;
+		h.cmsg_type=IP_PKTINFO;
+		h.cmsg_len=CMSG_LEN(sizeof(pi));
+		memcpy(CMSG_DATA(&h),&pi,sizeof(pi));
+		return CMSG_LEN(sizeof(pi));
+	}
+	in6_pktinfo pi;
+	memset(&pi,0,sizeof(pi));
+	pi.ipi6_addr=l.v6;
+	h.cmsg_level=SOL_IPV6;
+	h.cmsg_type=IPV6_PKTINFO;
+	h.cmsg_len=CMSG_LEN(sizeof(pi));
+	memcpy(CMSG_DATA(&h),&pi,sizeof(pi));
+	return CMSG_LEN(sizeof(pi));
+}
+//D87：回程发送条目 m 的控制数据：段长 gso 不为 0 时挂 UDP_SEGMENT，本地地址 l 有值时挂 pktinfo，两者都没有时不挂
+static inline void udp_ret_set_ctrl(mmsghdr &m,udp_ret_ctrl_t &c,int gso,const udp_local_t &l)
+{
+	socklen_t len=l.family!=0?udp_set_pktinfo(*udp_ret_pi(c),l):0;
+	if(gso!=0)
+	{
+		uint16_t v=(uint16_t)gso;
+		memcpy(CMSG_DATA(&c.hdr),&v,sizeof(v));
+		m.msg_hdr.msg_control=&c;
+		m.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t))+len;
+	}
+	else if(len!=0)
+	{
+		m.msg_hdr.msg_control=udp_ret_pi(c);
+		m.msg_hdr.msg_controllen=len;
 	}
 	else
 	{
@@ -775,6 +881,7 @@ struct conn_manager_udp_t
 	//U5（D42、D45）：gro 以 GRO 合并包形式收到的数据报数，gso_fallback 某个会话在这个方向的 GSO 发送失败（EIO/EINVAL/EMSGSIZE）、改为逐包发送的次数
 	u64_t gro[2],gso_fallback[2];
 	std::atomic<int> *gso_logged;//U5：本规则这个方向的 GSO 回退已写过一行 info，之后的写 debug（审查 L3）；所有 worker 共用（rule_shared_t，M2），下标同 gro
+	std::atomic<int> *pktinfo_logged;//D90：同 gso_logged，回程 pktinfo 的回退
 
 	conn_manager_udp_t()
 	{
@@ -790,6 +897,7 @@ struct conn_manager_udp_t
 		memset(gro,0,sizeof(gro));
 		memset(gso_fallback,0,sizeof(gso_fallback));
 		gso_logged=0;
+		pktinfo_logged=0;
 	}
 	//没找到时返回 0，hash 为 addr 的哈希，供随后的 insert 用；命中 last_hit 时不算哈希
 	udp_pair_t *find(const address_t &addr,u32_t &hash)
@@ -970,6 +1078,7 @@ struct forward_rule_t:not_copy_able_t
 	worker_t *worker;//所属 worker（M1）：本对象是这条规则在它那里的运行时，连接对与会话经 owner 找到它
 	int local_listen_fd_tcp;
 	int local_listen_fd_udp;
+	int udp_pktinfo;//D87：UDP 监听在通配地址上且开了 PKTINFO（每个 worker 的监听分别设，udp_pktinfo_listen）：回包挂客户端发往的本地地址
 	ev_io tcp_accept_watcher;
 	ev_io udp_accept_watcher;
 	conn_manager_tcp_t tcp_manager;
@@ -984,6 +1093,7 @@ struct forward_rule_t:not_copy_able_t
 		worker=0;
 		local_listen_fd_tcp=-1;
 		local_listen_fd_udp=-1;
+		udp_pktinfo=0;
 	}
 };
 
@@ -995,8 +1105,9 @@ struct rule_shared_t
 	std::atomic<int> tcp,udp;
 	std::atomic<unsigned> rr_next;
 	std::atomic<int> gso_logged[2];
+	std::atomic<int> pktinfo_logged;//D90：回程的 pktinfo 回退已写过一行 info
 	vector<unsigned char> rr_seq;
-	rule_shared_t():tcp(0),udp(0),rr_next(0)
+	rule_shared_t():tcp(0),udp(0),rr_next(0),pktinfo_logged(0)
 	{
 		gso_logged[0].store(0);
 		gso_logged[1].store(0);
@@ -2099,7 +2210,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	for(int i=b.rn;i<b.rn+n;i++)
 	{
 		mylog(log_trace, "[udp]received data from udp fd %d, len=%d\n", udp_fd,(int)b.rin[i].msg_len);
-		if(udp_gro) b.gso[i]=udp_recv_gso(b.rin[i].msg_hdr);
+		if(udp_gro) b.gso[i]=udp_recv_ctrl(b.rin[i].msg_hdr,0,b.addr[i]);
 		if(b.rin[i].msg_hdr.msg_flags&MSG_TRUNC)
 		{
 			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",udp_pair.adress.get_str(),max_data_len_udp);
@@ -2118,6 +2229,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			b.roff[i]=udp_pair.gso_off[1];
 		}
 		b.raddr[i]=udp_pair.adress;
+		b.rlocal[i]=udp_pair.local;
 		b.rrule[i]=udp_pair.owner;
 	}
 	b.rn+=n;
@@ -2192,13 +2304,24 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	conn_manager_udp.last_hit=&udp_pair;
 	return &udp_pair;
 }
-//U5：发送条目 m 带 UDP_SEGMENT 时返回段长，否则 0
+//U5：发送条目 m 带 UDP_SEGMENT 时返回段长，否则 0。UDP_SEGMENT 总是第一个 cmsg；回程条目可能只带 pktinfo（D87）
 static inline int udp_msg_gso(const mmsghdr &m)
 {
 	if(m.msg_hdr.msg_controllen==0) return 0;
+	const cmsghdr *c=(const cmsghdr *)m.msg_hdr.msg_control;
+	if(c->cmsg_level!=SOL_UDP) return 0;
 	uint16_t g;
-	memcpy(&g,CMSG_DATA((cmsghdr *)m.msg_hdr.msg_control),sizeof(g));
+	memcpy(&g,CMSG_DATA(c),sizeof(g));
 	return g;
+}
+//D87：回程条目 m 带的 pktinfo cmsg，没有时为 0（布局见 udp_ret_ctrl_t）
+static inline const cmsghdr *udp_msg_pktinfo(const mmsghdr &m)
+{
+	if(m.msg_hdr.msg_controllen==0) return 0;
+	const cmsghdr *c=(const cmsghdr *)m.msg_hdr.msg_control;
+	if(c->cmsg_level!=SOL_UDP) return c;
+	if(m.msg_hdr.msg_controllen>CMSG_SPACE(sizeof(uint16_t))) return (const cmsghdr *)((const char *)c+CMSG_SPACE(sizeof(uint16_t)));
+	return 0;
 }
 static inline size_t udp_msg_len(const mmsghdr &m)
 {
@@ -2210,8 +2333,9 @@ static inline size_t udp_msg_len(const mmsghdr &m)
 //条目 m 里的数据报数（O1 的 pkts/drop 按数据报计，U5）
 static inline int udp_msg_segs(const mmsghdr &m)
 {
-	if(m.msg_hdr.msg_controllen==0) return 1;
-	return udp_segs(udp_msg_len(m),udp_msg_gso(m));
+	int g=udp_msg_gso(m);
+	if(g==0) return 1;
+	return udp_segs(udp_msg_len(m),g);
 }
 static int udp_msgs_segs(const mmsghdr *msgs,int from,int to)
 {
@@ -2286,6 +2410,55 @@ static void __attribute__((noinline,cold)) udp_gso_turn_off(udp_send_ctx_t &c,mm
 	mylog(level,"[udp]GSO send %s {%s} on %s fd %d failed (%s), sending its GRO packets datagram by datagram from now on\n",
 		c.dir==0?"from":"to",client->get_str(),c.dir==0?"session":"listen",c.fd,get_sock_error());
 }
+//D90：回程带 pktinfo 的条目发送失败、源地址不可用：地址已删除，目的是子网广播地址，IPv6 AnyIP（lo 上的 local 路由）作源，
+//IPv4 为 EINVAL（5.4 以前）或 ENETUNREACH，IPv6 为 EINVAL；ifindex 无效时 ENODEV
+static inline int udp_pktinfo_errno(int err)
+{
+	return err==EINVAL||err==ENETUNREACH||err==ENODEV||err==EADDRNOTAVAIL;
+}
+//D90：回程第 i 条带 pktinfo、发送报 udp_pktinfo_errno：本组 [i,cnt) 里发往同一客户端的条目都去掉 pktinfo（保留 UDP_SEGMENT），
+//会话忘掉记下的本地地址（会话已释放就只改本次发出的条目），直到客户端再发来包；调用方原地重发，源地址由内核选。
+//带 UDP_SEGMENT 的条目报 EINVAL 时也先按这里处理，重发仍失败才算 GSO 的错误：碰上旧内核的段数上限或段长超过路径 MTU 时，
+//这个客户端的源地址要等它下一个包才恢复，但会话的 GSO 不会因为源地址的问题被误关。info 每条规则只写第一次，之后 debug（同审查 L3）
+static void __attribute__((noinline,cold)) udp_pktinfo_off(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt)
+{
+	DEBUG_ASSERT(c.dir==1);
+	int err=errno;
+	char local[INET6_ADDRSTRLEN]="?";
+	const cmsghdr *pi=udp_msg_pktinfo(msgs[i]);
+	if(pi->cmsg_level==SOL_IP)
+	{
+		in_pktinfo v;
+		memcpy(&v,CMSG_DATA(pi),sizeof(v));
+		inet_ntop(AF_INET,&v.ipi_spec_dst,local,sizeof(local));
+	}
+	else
+	{
+		in6_pktinfo v;
+		memcpy(&v,CMSG_DATA(pi),sizeof(v));
+		inet_ntop(AF_INET6,&v.ipi6_addr,local,sizeof(local));
+	}
+	address_t *client=(address_t *)msgs[i].msg_hdr.msg_name;
+	for(int k=i;k<cnt;k++)
+	{
+		mmsghdr &m=msgs[k];
+		if(!udp_key_eq(*(address_t *)m.msg_hdr.msg_name,*client)||udp_msg_pktinfo(m)==0) continue;
+		if(udp_msg_gso(m)!=0)
+			m.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t));
+		else
+		{
+			m.msg_hdr.msg_control=0;
+			m.msg_hdr.msg_controllen=0;
+		}
+	}
+	u32_t hash;
+	udp_pair_t *pair=c.mgr.find(*client,hash);
+	if(pair!=0) pair->local.family=0;
+	int level=c.mgr.pktinfo_logged->exchange(1,memory_order_relaxed)?log_debug:log_info;
+	errno=err;
+	mylog(level,"[udp]sending to {%s} from %s on listen fd %d failed (%s), letting the kernel choose the source address until the client sends again\n",
+		client->get_str(),local,c.fd,get_sock_error());
+}
 //U5：msg 的 iov（槽与溢出区）里 [off,off+len) 这一段写进 dst，返回用了几个 iovec（至多 2）
 static int udp_iov_range(const msghdr &src,size_t off,size_t len,iovec *dst)
 {
@@ -2321,20 +2494,33 @@ static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &lef
 	while(off<len)
 	{
 		const size_t piece=(size_t)gso*(c.off[c.stride*i]?1:udp_gso_cap(gso));
+		const cmsghdr *pi=udp_msg_pktinfo(m);//D87：回程的每块带同一个 pktinfo；udp_pktinfo_off 去掉之后为 0
 		int n=0;
 		for(size_t o=off;o<len&&n<udp_batch_max;o+=piece,n++)
 		{
 			mmsghdr &s=b.seg[n];
+			udp_ret_ctrl_t &sc=b.seg_ctrl[n];
 			size_t l=min(piece,len-o);
 			s.msg_hdr.msg_name=m.msg_hdr.msg_name;
 			s.msg_hdr.msg_namelen=m.msg_hdr.msg_namelen;
 			s.msg_hdr.msg_iovlen=udp_iov_range(m.msg_hdr,o,l,b.seg_iov[n]);
+			socklen_t pl=0;
+			if(pi!=0)
+			{
+				pl=pi->cmsg_len;
+				memcpy(udp_ret_pi(sc),pi,pl);
+			}
 			if(l>(size_t)gso)
 			{
 				uint16_t v=(uint16_t)gso;
-				memcpy(CMSG_DATA(&b.seg_ctrl[n].hdr),&v,sizeof(v));
-				s.msg_hdr.msg_control=&b.seg_ctrl[n];
-				s.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t));
+				memcpy(CMSG_DATA(&sc.hdr),&v,sizeof(v));
+				s.msg_hdr.msg_control=&sc;
+				s.msg_hdr.msg_controllen=CMSG_SPACE(sizeof(uint16_t))+pl;
+			}
+			else if(pl!=0)
+			{
+				s.msg_hdr.msg_control=udp_ret_pi(sc);
+				s.msg_hdr.msg_controllen=pl;
 			}
 			else
 			{
@@ -2358,7 +2544,12 @@ static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &lef
 			left=udp_segs(len-off,gso);
 			return -1;
 		}
-		if(b.seg[0].msg_hdr.msg_controllen!=0&&udp_gso_errno(errno))
+		if(udp_pktinfo_errno(errno)&&udp_msg_pktinfo(b.seg[0])!=0)
+		{
+			udp_pktinfo_off(c,msgs,i,cnt);
+			continue;
+		}
+		if(udp_msg_gso(b.seg[0])!=0&&udp_gso_errno(errno))
 		{
 			if(!udp_gso_old_limit(errno,gso,udp_msg_segs(b.seg[0])))
 				udp_gso_turn_off(c,msgs,i,cnt);
@@ -2374,8 +2565,9 @@ static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &lef
 //sendmmsg 不能直接发的条目（U5）：GRO 合并包，而它的会话这个方向已关 GSO，或段数超过上限
 static inline int udp_gso_split_needed(const mmsghdr &m,unsigned char gso_off)
 {
-	if(m.msg_hdr.msg_controllen==0) return 0;
-	return gso_off||udp_msg_segs(m)>udp_gso_cap(udp_msg_gso(m));
+	int g=udp_msg_gso(m);
+	if(g==0) return 0;
+	return gso_off||udp_segs(udp_msg_len(m),g)>udp_gso_cap(g);
 }
 //一组 cnt 个包，dir 为 0 时是一个会话本批的入向包（U3，发往会话 socket），为 1 时是一个规则的回包（U4，发往监听 socket，
 //各包带客户端地址）：sendmmsg 只发出一部分时从断点接着发（内核不报断点处的错误，重发一次才知道它是否仍失败）。
@@ -2411,14 +2603,19 @@ static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 				for(int i=sent;i<sent+ret;i++)
 				{
 					c.mgr.bytes[c.dir]+=msgs[i].msg_len;
-					if(msgs[i].msg_hdr.msg_controllen!=0)
+					if(udp_msg_gso(msgs[i])!=0)
 						c.mgr.pkts[c.dir]+=udp_msg_segs(msgs[i])-1;
 				}
 				sent+=ret;
 				continue;
 			}
 			if(errno==EAGAIN||errno==EWOULDBLOCK) goto eagain;
-			if(msgs[sent].msg_hdr.msg_controllen!=0)
+			if(udp_pktinfo_errno(errno)&&udp_msg_pktinfo(msgs[sent])!=0)//D90：去掉 pktinfo 原地重发
+			{
+				udp_pktinfo_off(c,msgs,sent,cnt);
+				continue;
+			}
+			if(udp_msg_gso(msgs[sent])!=0)
 			{
 				if(udp_gso_errno(errno)&&!udp_gso_old_limit(errno,udp_msg_gso(msgs[sent]),udp_msg_segs(msgs[sent])))
 					udp_gso_turn_off(c,msgs,sent,cnt);
@@ -2458,11 +2655,9 @@ static void udp_flush_return(udp_batch_t &b)
 			m.msg_hdr.msg_name=&b.raddr[j].inner;
 			m.msg_hdr.msg_namelen=b.raddr[j].get_len();
 			udp_batch_set_iov(b,m,b.rout_iov[cnt],j,b.rin[j].msg_len);
-			if(udp_gro)
-			{
-				udp_batch_set_gso(b,m,b.rout_ctrl[cnt],j,b.rin[j].msg_len);
-				b.rout_off[cnt]=b.roff[j];
-			}
+			//rlocal 只在通配监听的规则里有值（D87）；rout 各条跨次 flush 复用，所以每次都写
+			udp_ret_set_ctrl(m,b.rout_ctrl[cnt],udp_gro?udp_batch_gso(b,j,b.rin[j].msg_len):0,b.rlocal[j]);
+			if(udp_gro) b.rout_off[cnt]=b.roff[j];
 			cnt++;
 		}
 		udp_send_ctx_t c={rule->udp_manager,rule->local_listen_fd_udp,1,b.rout_off,1,0,b};
@@ -2493,7 +2688,10 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 		h.msg_namelen=sizeof(b.addr[i]);//内核按实际地址长度改写了它，下一次 recvmmsg 之前恢复
 		b.pair[i]=0;
 		int gso=0;
-		if(udp_gro) gso=b.gso[i]=udp_recv_gso(h);
+		udp_local_t local;
+		local.family=0;
+		if(b.in_ctrl) gso=udp_recv_ctrl(h,rule->udp_pktinfo?&local:0,b.addr[i]);
+		if(udp_gro) b.gso[i]=gso;
 
 		//每包都走这里：地址只在记日志时格式化（T7）
 		mylog(log_trace, "[udp]received data from udp_listen_fd from {%s}, len=%d\n",tmp_addr.get_str(),data_len);
@@ -2517,6 +2715,7 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 			pair=udp_new_session(loop,rule,tmp_addr,hash);
 			if(pair==0) continue;
 		}
+		if(rule->udp_pktinfo) pair->local=local;//D89：以客户端最近一个包的目的地址为准
 		if(pair->batch_group<0)
 		{
 			pair->batch_group=groups;
@@ -2903,7 +3102,7 @@ static void udp_gro_listen(forward_rule_t &rule,int &warned)
 	if(udp_gro_set(rule.local_listen_fd_udp)==0)
 	{
 		gro_socks++;
-		rule.worker->udp_batch.attach_ctrl();
+		rule.worker->udp_batch.attach_ctrl(1);
 		return;
 	}
 	if(!warned)//每条规则只记一行（各 worker 的监听 socket 一样，M2）
@@ -2911,6 +3110,41 @@ static void udp_gro_listen(forward_rule_t &rule,int &warned)
 			rule.index,get_sock_error(),gro_socks==0?", UDP_GRO stays off":"");
 	warned=1;
 	if(gro_socks==0) udp_gro=0;
+}
+//D87、D88：通配地址的 UDP 监听开收包的 PKTINFO，回包以客户端发往的地址为源（udp_ret_set_ctrl）。[::] 开 IPV6_RECVPKTINFO：
+//IPv4 客户端的目的以 v4-mapped 地址给出（3.14 起；3.10–3.13 上没有，这些客户端的回包照旧由内核选源）；只收 IPv4 的 0.0.0.0 与
+//[::ffff:0.0.0.0] 开 IP_PKTINFO（3.10 起，v6 socket 上也行，带 ipi_spec_dst）。具体地址的监听不用：内核本来就以绑定的地址为源。
+//失败时这条规则在这个 worker 照旧由内核选源，每条规则只记一行（warned 由调用方按规则给）
+static void udp_pktinfo_listen(forward_rule_t &rule,int &warned)
+{
+	const address_t::storage_t &a=rule.local_addr.inner;
+	int level=IPPROTO_IP,opt=IP_PKTINFO;
+	const char *name="IP_PKTINFO";
+	if(a.ipv4.sin_family==AF_INET)
+	{
+		if(a.ipv4.sin_addr.s_addr!=htonl(INADDR_ANY)) return;
+	}
+	else if(IN6_IS_ADDR_UNSPECIFIED(&a.ipv6.sin6_addr))
+	{
+		level=IPPROTO_IPV6;
+		opt=IPV6_RECVPKTINFO;
+		name="IPV6_RECVPKTINFO";
+	}
+	else
+	{
+		static const unsigned char v4any[16]={0,0,0,0,0,0,0,0,0,0,0xff,0xff,0,0,0,0};
+		if(memcmp(&a.ipv6.sin6_addr,v4any,sizeof(v4any))!=0) return;
+	}
+	int one=1;
+	if(setsockopt(rule.local_listen_fd_udp,level,opt,&one,sizeof(one))==0)
+	{
+		rule.udp_pktinfo=1;
+		rule.worker->udp_batch.attach_ctrl(0);
+		return;
+	}
+	if(!warned)
+		mylog(log_warn,"rule %d [udp] setsockopt %s failed (%s): replies go out from the address the kernel chooses\n",rule.index,name,get_sock_error());
+	warned=1;
 }
 
 //第 i 条规则在 worker w 里的运行时（rules 按规则序号排列）
@@ -2957,6 +3191,7 @@ static void worker_add_rule(worker_t *w,size_t i)
 	rule.tcp_manager.conns=&rule_shared[i].tcp;
 	rule.udp_manager.conns=&rule_shared[i].udp;
 	rule.udp_manager.gso_logged=rule_shared[i].gso_logged;
+	rule.udp_manager.pktinfo_logged=&rule_shared[i].pktinfo_logged;
 	forward_rule_config_t &rule_config=app_config.rules[i];
 	rule.index=(int)i+1;
 	rule.local_addr=rule_config.local_addr;
@@ -3119,7 +3354,7 @@ static void start_forward_rule(size_t i)
 	if(rule0.enable_udp)
 	{
 		listen_probe(rule0,SOCK_DGRAM,"udp",listen_addr);
-		int gro_warned=0;
+		int gro_warned=0,pktinfo_warned=0;
 		for(size_t k=0;k<workers.size();k++)
 		{
 			worker_t &w=*workers[k];
@@ -3151,6 +3386,7 @@ static void start_forward_rule(size_t i)
 						rule.index,rcv,snd,2*listen_fd_buf_size,listen_fd_buf_size);
 			}
 			if(udp_gro) udp_gro_listen(rule,gro_warned);
+			udp_pktinfo_listen(rule,pktinfo_warned);
 
 			if(::bind(rule.local_listen_fd_udp, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 			{

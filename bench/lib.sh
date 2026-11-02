@@ -154,7 +154,7 @@ iperf_udp() {
   echo "-u -b 0 -l $len -P $par$r"
 }
 
-# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>][+t<N>][+aff] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
+# 转发器名：direct（不经转发器）| tinymapper[-musl][@后缀][+gro][+nocap][+nosplice][+nonroot][+pipe<KiB>][+t<N>][+aff][+any|+any6] | rinetd | realm-1c[+pipe<KiB>] | realm-2c[+pipe<KiB>]
 # tinymapper@<后缀> 对应 $BIN/tinymapper-glibc-<后缀>，即 `REF=<后缀> docker/build.sh` 的产物；+ 开头的标记顺序任意，可组合：
 # +gro：同一二进制加 --udp-gro 启动（U5），同一批里对照开/关；
 # +nosplice：同一二进制加 --disable-splice 启动（B2），同一批里对照 splice 开/关；
@@ -168,6 +168,8 @@ iperf_udp() {
 # 不带时不传 --threads（二进制的默认值），绑 FWD_CPUS
 # +aff（tinymapper）：加 --cpu-affinity 启动（M5：worker k 绑 taskset 掩码里的第 k 个 CPU，N ≥ 2 时 reuseport 组按 softirq 所在 CPU 分流），
 # 可与 +t<N> 等组合，如 tinymapper@<后缀>+t2+aff
+# +any / +any6（tinymapper）：监听通配地址，客户端仍按 FWD_IP 访问（通配监听的回包源地址，D87–D91）。+any 为与 FWD_IP 同族的通配
+# （0.0.0.0:FPORT，FWD_IP 是 IPv6 时 [::]:FPORT）；+any6 为 [::]:FPORT（不设 IPV6_V6ONLY 即双栈），FWD_IP 是 IPv4 时测双栈监听上的 IPv4 客户端
 tm_file() {
   local n=${1%%+*} v s=""
   v=${n%%@*}
@@ -189,6 +191,10 @@ start_fwd() {
     tinymapper*)
       cpus=$FWD_CPUS; [ -z "$thr" ] || [ "$thr" -lt 2 ] || cpus=$FWD_CPUS2
       FWD_SET=$cpus; c="taskset -c $cpus $u"
+      case "$fwd+" in
+        *+any6+*) l="[::]:$FPORT" ;;
+        *+any+*) case $FWD_IP in *:*) l="[::]:$FPORT" ;; *) l="0.0.0.0:$FPORT" ;; esac ;;
+      esac
       [ -n "$u" ] || case "${TM_NOCAP:-}:$fwd+" in 1:*|*+nocap+*) c="$c setpriv --inh-caps=-net_admin --bounding-set=-net_admin" ;; esac
       c="$c $BIN/$(tm_file "$fwd") -l$l -r$r -t -u --log-level $TM_LOG_LEVEL"
       case "$fwd+" in *+gro+*) c="$c --udp-gro" ;; esac
