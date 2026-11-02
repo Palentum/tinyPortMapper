@@ -573,6 +573,91 @@ func TestTCPConnectingDataStream(t *testing.T) {
 	}
 }
 
+// 稳态下同一 fd 又可读又有待写数据（审查 #2，D86）：客户端持续上传、后端不读，上行在 tinymapper 里持有数据，上游一侧同时等读写；
+// 之后上游持续推流、每写一块非阻塞读一次。持有的上行数据不能因上游每轮都可读而一直发不出去。
+// 暂停 tinymapper 期间后端先排空自己的接收队列，恢复后它读到的上行数据只能来自 tinymapper 持有的那部分
+func TestTCPHeldWhileStreaming(t *testing.T) {
+	t.Parallel()
+	for _, mode := range []struct {
+		name string
+		args []string
+	}{{"copy", []string{"--disable-splice"}}, {"splice", nil}} {
+		t.Run(mode.name, func(t *testing.T) {
+			t.Parallel()
+			// 实测（2a1fa35，每次 8 轮）：只走读分支时要等某次发往客户端的 send 偶然只发出一部分，copy 26/32 轮、splice 10/32 轮
+			// 多写超过 256 KiB（最多 136 MiB）；读写同轮处理时 80/80 轮恰好多写 64 KiB（暂停时没写完的那一块）
+			for i := range 8 {
+				heldWhileStreaming(t, i, mode.args)
+			}
+		})
+	}
+}
+
+func heldWhileStreaming(t *testing.T, round int, args []string) {
+	ln, err := net.Listen("tcp", loopback4(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer ln.Close()
+	listen := loopback4(t)
+	m := startMapper(t, listenPoints("t", portOf(listen)), append([]string{"-l", listen, "-r", ln.Addr().String(), "-t"}, args...)...)
+	defer m.stop(t, false)
+	c := dial(t, listen)
+	defer c.Close()
+	ln.(*net.TCPListener).SetDeadline(time.Now().Add(ioTimeout))
+	conn, err := ln.Accept()
+	if err != nil {
+		t.Fatalf("第 %d 轮：上游未收到转发的连接：%v", round, err)
+	}
+	be := conn.(*net.TCPConn)
+	defer be.Close()
+	go func() {
+		buf := make([]byte, 1<<20)
+		for {
+			if _, err := c.Write(buf); err != nil {
+				return
+			}
+		}
+	}()
+	time.Sleep(300 * time.Millisecond) // 上游发送缓冲与后端接收缓冲已满，tinymapper 持有上行数据、停读客户端
+	m.cmd.Process.Signal(syscall.SIGSTOP)
+	defer m.cmd.Process.Signal(syscall.SIGCONT)
+	rbuf := make([]byte, 1<<20)
+	for { // 排空：tinymapper 已暂停，没有新的上行数据
+		be.SetReadDeadline(time.Now().Add(200 * time.Millisecond))
+		if _, err := be.Read(rbuf); err != nil {
+			break
+		}
+	}
+	be.SetDeadline(time.Now().Add(3 * ioTimeout))
+	var written atomic.Int64
+	upAt := make(chan int64, 1) // 后端读到新的上行数据时已写出的字节数
+	go func() {
+		if w, err := streamUntil(be, &written, func(data []byte, eof bool) bool { return eof || len(data) > 0 }); err == nil {
+			upAt <- w
+		}
+	}()
+	time.Sleep(200 * time.Millisecond) // 上游数据积压在 tinymapper 的上游接收缓冲中
+	before := written.Load()
+	go func() { // 客户端持续读，不制造背压
+		buf := make([]byte, 1<<20)
+		for {
+			if _, err := c.Read(buf); err != nil {
+				return
+			}
+		}
+	}()
+	m.cmd.Process.Signal(syscall.SIGCONT)
+	select {
+	case w := <-upAt:
+		if extra := w - before; extra > 256<<10 {
+			t.Fatalf("第 %d 轮：恢复后上游又写出 %d 字节才收到上行数据：持有的上行数据被持续可读的上游拖延", round, extra)
+		}
+	case <-time.After(ioTimeout):
+		t.Fatalf("第 %d 轮：恢复后 %v 内上游没收到上行数据（期间又写出 %d 字节）", round, ioTimeout, written.Load()-before)
+	}
+}
+
 // 上游发 RST：客户端连接应被及时关闭
 func TestTCPUpstreamReset(t *testing.T) {
 	t.Parallel()

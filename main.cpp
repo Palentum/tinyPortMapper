@@ -1520,6 +1520,11 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		conn_manager_tcp.erase_closed(&tcp_pair);
 		return;
 	}
+	if((revents&(EV_READ|EV_WRITE))==0)
+	{
+		mylog(log_fatal,"[tcp]got unexpected event,events[idx].events=%x\n",(u32_t)revents);
+		myexit(-1);
+	}
 
 	tcp_info_t *my_info_p,*other_info_p;
 	if(watcher==&tcp_pair.local.ev)
@@ -1568,16 +1573,17 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_WRITE;
 			ev_io_start(loop, &my_info.ev);
+			revents&=~EV_WRITE;
 			if( (revents & EV_READ) ==0) return;
 		}
 		else if(other_info.data_len!=0&&(revents & EV_WRITE)!=0)
 		{
-			//先发留下的数据：上游连上后持续可读时，下面的 if/else if 每轮都只走读分支。可读是水平触发，下一轮还会报
+			//先发留下的数据、本轮不读：C7 实测这样后端只多写暂停时没写完的那一块。可读是水平触发，下一轮还会报
 			revents&=~EV_READ;
 		}
 	}
 
-	//推迟的 shutdown：上游建连期间客户端已 EOF，连上后从上面落到这里；建连之后只有它会在没有待发数据时挂 EV_WRITE。先于读处理，否则本侧每轮都可读时下面的 if/else if 永远轮不到写
+	//推迟的 shutdown：上游建连期间客户端已 EOF，连上后从上面落到这里；建连之后只有它会在没有待发数据时挂 EV_WRITE。放在读写分支之前：写分支只处理有待发数据的情况
 	if( (revents & EV_WRITE) !=0 && (my_info.ev.events&EV_WRITE) !=0 && other_info.data_len==0 )
 	{
 		DEBUG_ASSERT(other_info.eof);
@@ -1779,7 +1785,9 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 
 	}
-	else if( (revents & EV_WRITE) !=0)
+	//读完接着写（审查 #2，D86）：同一 fd 又可读又有待写数据时两边都处理。只走读分支的话，另一方向持有的数据要等这一侧某一轮不可读才发得出去，
+	//那个方向的源端也一直停读。读分支提前返回的路径（半关闭、过时事件）上本侧已不再等读，下一轮只报写，最多推迟一轮
+	if( (revents & EV_WRITE) !=0)
 	{
 		mylog(log_trace,"[tcp]events[idx].events & EPOLLOUT !=0\n");
 
@@ -1864,11 +1872,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		{
 			//keep waitting for EPOLLOUT;
 		}
-	}
-	else
-	{
-		mylog(log_fatal,"[tcp]got unexpected event,events[idx].events=%x\n",(u32_t)revents);
-		myexit(-1);
 	}
 }
 //接受一个连接；返回 0 表示本轮到此为止（backlog 已空、accept 失败，或上游 connect 立即失败）
