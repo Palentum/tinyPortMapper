@@ -71,7 +71,7 @@ void log0(const char * file,const char * function,int line,int level,const char*
 	//if(enable_log_color)
 		//printf(log_color[level]);
 	//只有终端逐行刷新（stdio 对终端本就按 \n 刷新，这里把行尾的颜色复位码和不以 \n 结尾的行也写出）；
-	//文件、管道、journald 等在缓冲写满时写出，其余由 clear_timer_cb 每 timer_interval 刷新，myexit 退出前也会刷新
+	//文件、管道、journald 等在缓冲写满时写出，其余由主线程的 main_timer_cb 每 timer_interval 刷新，myexit 退出前也会刷新
 	if(stdout_is_tty)
 		fflush(stdout);
 }

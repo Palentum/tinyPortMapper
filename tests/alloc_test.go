@@ -189,7 +189,7 @@ func TestAllocTCPObjPool(t *testing.T) {
 	if !rejected {
 		t.Fatalf("重新建连 %d 条都没被拒：对象 slab 没有分配失败\n%s", objSlabWarm+200, m.logTail(20))
 	}
-	// 等拒绝日志刷出：log_warn 在 stdout 非 tty 时被缓冲，每 timer_interval(400ms) 由 clear_timer_cb flush
+	// 等拒绝日志刷出：log_warn 在 stdout 非 tty 时被缓冲，每 timer_interval(400ms) 由主线程的 main_timer_cb flush
 	eventually(t, logFlushWithin+ioTimeout, 50*time.Millisecond, func() error {
 		assertAlive(t, m)
 		if m.logLines(tcpObjWarn, objFailTag) == 0 {

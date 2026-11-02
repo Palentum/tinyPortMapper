@@ -19,7 +19,7 @@ import (
 )
 
 // T6：log0 只在 stdout 是终端时逐行 fflush。stdout 是文件或管道时日志攒在 stdio 缓冲里（glibc 按文件的 st_blksize 分配，
-// 容器里为 4096 B；musl 固定为 BUFSIZ 1024 B），缓冲写满时写出，其余由 clear_timer_cb（每 timer_interval 400 ms 一次，
+// 容器里为 4096 B；musl 固定为 BUFSIZ 1024 B），缓冲写满时写出，其余由主线程的 main_timer_cb（每 timer_interval 400 ms 一次，
 // 事件循环开始时先触发一次）末尾的 fflush 写出；myexit 在 _exit 前也 fflush。
 const (
 	// 突发阶段的连接数：每个连接 3 行，约 285 B
@@ -62,7 +62,7 @@ func waitConnLogs(t testing.TB, m *mapper, n int) {
 	eventually(t, logFlushWithin, 10*time.Millisecond, func() error {
 		if got := connLogCounts(m); got[0] != n || got[1] != n || got[2] != n {
 			return fmt.Errorf("日志中 new_connection、closed bc of EOF、closed connection 分别有 %v 行，期望各 %d 行：已记下的日志"+
-				"没有及时写进文件（stdout 不是终端时应由 clear_timer_cb 每 400 ms 刷新一次，是终端时逐行刷新）", got, n)
+				"没有及时写进文件（stdout 不是终端时应由主线程的 main_timer_cb 每 400 ms 刷新一次，是终端时逐行刷新）", got, n)
 		}
 		return nil
 	})
@@ -106,7 +106,7 @@ func logBurst(t testing.TB, m *mapper, listen string) (writes, bytes int, elapse
 //     迟到的触发再加 1；基线读数少计的一次再加 1（见 logBurst）。逐行刷新时每行至少一次 write，增量 ≥ 3·burstConns−1（299），
 //     约为上界的 10 倍
 //   - 可见性：进程不退出，每批日志都要在 logFlushWithin 内全部写进文件。最后再建一个连接：此前的日志已全部可见即缓冲为空，
-//     这 3 行（约 285 B）小于任一 libc 的缓冲，只能由定时器写出，去掉 clear_timer_cb 里的 fflush 后必然看不到
+//     这 3 行（约 285 B）小于任一 libc 的缓冲，只能由定时器写出，去掉 main_timer_cb 里的 fflush 后必然看不到
 func TestLogBufferedFile(t *testing.T) {
 	t.Parallel()
 	be := serveTCP(t, loopback4(t), echoHandler(""))

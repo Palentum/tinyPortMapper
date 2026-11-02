@@ -2311,7 +2311,7 @@ void clear_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 {
 	worker_tick(*(worker_t *)timer->data);
 }
-//主线程的定时器（每 timer_interval）：DNS 调度，刷新日志
+//主线程的定时器（每 timer_interval）：DNS 调度、统计超时检查、刷新日志
 static void stats_check_late();
 static void main_timer_cb(struct ev_loop *loop, struct ev_timer* timer, int revents)
 {
@@ -3379,9 +3379,12 @@ static void worker_add_rule(worker_t *w,size_t i)
 	}
 }
 
-//建监听组之前先用一个只带 SO_REUSEADDR、不带 SO_REUSEPORT 的 socket bind 一次再关掉（S2）：地址已被占用（另一个实例，本配置里重叠的地址
-//如 [::]:p 与 0.0.0.0:p，或同 uid 只设了 SO_REUSEPORT 的别的程序）时照旧报 bind 失败退出，否则同 uid 的 reuseport socket 会被静默加入同一组、
-//分走流量。只设 SO_REUSEADDR 的 UDP socket 照旧可以共用端口（审查 L-1：与 M2 之前相同）；探测时设了 SO_REUSEADDR，TIME_WAIT 不影响
+//建监听组之前先用一个只带 SO_REUSEADDR、不带 SO_REUSEPORT 的 socket bind 一次再关掉（S2）。TCP：地址已被占用（另一个实例，本配置里重叠的
+//地址如 [::]:p 与 0.0.0.0:p，或同 uid 只设了 SO_REUSEPORT 的别的程序）时照旧报 bind 失败退出，否则同 uid 的 reuseport socket 会被静默加入
+//同一组、分走连接。UDP：只有占用者没带 SO_REUSEADDR（什么都没设，或只设了 SO_REUSEPORT）时失败，带了的照旧能 bind（审查 L-1：与 M2 之前
+//相同），另一个实例、重叠的规则都算（重叠的按族分：IPv4 客户端进 0.0.0.0，IPv6 进 [::]）。能 bind 不等于分担：同一地址上的数据报只交给
+//一个实例（IPv4 是后 bind 的；IPv6 的 reuseport socket 排在链尾，先起的 N=1 实例保留），只有两个实例同 uid 且都是 N>1 时，后起实例的
+//socket 加入前一个的组、按哈希分走客户端，前一个已有的客户端也随之重排。探测时设了 SO_REUSEADDR，TIME_WAIT 不影响
 static void listen_probe(forward_rule_t &rule,int type,const char *protocol,const char *listen_addr)
 {
 	int yes=1;
@@ -3595,7 +3598,8 @@ static void check_forward_loops()
 }
 
 //建第 i 条规则的监听（M2，S2）：每个 worker 一个 socket；N>1 时都设 SO_REUSEPORT，内核按四元组哈希（--cpu-affinity 时 TCP 先按 CPU，M5）把新连接与 UDP 流分给它们。由主线程在启动
-//worker 线程之前全部建好、bind 完，组成员在进程生命周期内固定：成员一变，UDP 四元组到 socket 的映射就整体重排。
+//worker 线程之前全部建好、bind 完，组成员在进程生命周期内固定（同 uid 的另一个 N>1 实例加入 UDP 组时除外，见 listen_probe）：成员一变，
+//UDP 四元组到 socket 的映射就整体重排。
 //N=1 时与 M2 之前一样只设 SO_REUSEADDR（D67）：一个监听用不着分流，reuseport 却让发往监听的每个 SYN 与数据报在 softirq 里多一次选择
 //（loopback 实测 1400 B 单流正向客户端发包 −3%、转发器每数据报 CPU +2.5%）
 static void start_forward_rule(size_t i)
@@ -3866,7 +3870,8 @@ void print_help()
 	printf("                                          and is capped by net.core.rmem_max/wmem_max; UDP sessions: default 1024\n");
 	printf("    --udp-listen-buf      <number>        buf size for UDP listen sockets, >=10 and <=10240, unit: kbyte, default 2048\n");
 	printf("                                          UDP buffers are capped by net.core.rmem_max/wmem_max unless running with CAP_NET_ADMIN\n");
-	printf("                                          (UDP sessions: only a --sock-buf value is set past the cap)\n");
+	printf("                                          (UDP sessions: set past the cap only for a --sock-buf value, or with --udp-gro\n");
+	printf("                                          for the send buffer, which then takes this size if larger)\n");
 	printf("    --disable-tcp-nodelay                 do not set TCP_NODELAY on forwarded TCP connections (set on both sides by default)\n");
 	printf("    --disable-splice                      forward TCP by recv/send copies only; by default a direction whose last read\n");
 	printf("                                          was at least 16 KiB moves the next one with splice through a pipe\n");
