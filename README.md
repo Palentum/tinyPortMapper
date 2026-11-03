@@ -4,7 +4,7 @@ A Lightweight High-Performance Port Mapping/Forwarding Utility using epoll, Supp
 # Supported Platforms
 Linux only (including desktop/server Linux, Android phone/tablet, OpenWRT router, or Raspberry PI). Windows, macOS, FreeBSD and Cygwin builds are not supported. Binaries of `amd64` `x86` `mips_be` `mips_le` `arm` are provided.
 
-Build with `make all` on Linux. It links statically, except against glibc older than 2.34 (for example Debian 11, Ubuntu 20.04 or RHEL 8), where it links dynamically: on Debian and Ubuntu, hostname remotes do not work in a static binary built against such a glibc. On a non-Linux development machine, `docker/build.sh` builds the same binaries inside Linux containers.
+Build with `make all` on Linux. It links statically, except against glibc older than 2.34 (for example Debian 11, Ubuntu 20.04 or RHEL 8), where it links dynamically: on Debian and Ubuntu, hostname remotes do not work in a static binary built against such a glibc. A static glibc build resolves hostnames only through `/etc/hosts` and DNS, like the musl builds, whatever the `hosts` line of `/etc/nsswitch.conf` lists: the host's NSS modules (mDNS for `.local`, `myhostname`, systemd-resolved's `resolve`, `sss`) cannot be loaded safely into a static binary and, depending on the host's glibc version and the module, crash it at startup or in the hostname refresh thread, so names that only those modules know need a dynamically linked build. On a non-Linux development machine, `docker/build.sh` builds the same binaries inside Linux containers.
 
 # Getting Started
 
@@ -93,6 +93,7 @@ not supported.
 
 # you can also use ipv4-mapped ipv6 address
 # this is especially useful if you want to play with ipv6 and you dont have a real ipv6 address
+# (::ffff:a.b.c.d addresses work whatever net.ipv6.bindv6only is; a [::] listener also takes IPv4 clients only with bindv6only=0)
 ./tinymapper_amd64 -l[::]:4433 -r[::ffff:10.222.2.1]:443 -t -u
 ./tinymapper_amd64 -l[::ffff:0.0.0.0]:4433 -r[::ffff:10.222.2.1]:443 -t -u
 ```
@@ -103,7 +104,8 @@ run out, which stops the other rules too, so such a configuration is refused at
 startup: a rule's remote equal to its own or another rule's listen address
 (`-l127.0.0.1:443 -r127.0.0.1:443`, or two rules pointing at each other), or a
 loopback, `0.0.0.0` or local interface address on the port of a TCP wildcard
-listener (`0.0.0.0`, or `[::]`, which also takes IPv4). A chain through another
+listener (`0.0.0.0`, or `[::]`, which also takes IPv4 unless
+`net.ipv6.bindv6only` is 1). A chain through another
 rule to an outside host is fine. For UDP behind a wildcard listener only a
 warning is logged, because another socket bound to that exact address with
 `SO_REUSEADDR` (such as systemd-resolved on 127.0.0.53:53) receives the

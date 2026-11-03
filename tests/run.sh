@@ -9,13 +9,14 @@
 #   REF=<git ref>          测试该提交的构建（build/tinymapper-<variant>-<ref>），与 docker/build.sh 一致
 #   TPM_NO_BUILD=1         跳过 docker/build.sh，直接使用 build/ 中已有的二进制
 #   TPM_SLOW=1             同时运行慢速用例（TCP/UDP 空闲超时，约 7 分钟）
-#   TPM_DOCKER_NAME=<名字> 容器名取 <名字>-<变体>（并行的成员据此只停自己的容器）
+#   TPM_DOCKER_NAME=<名字> 容器名取 <名字>-<变体>，bindv6only=1 的容器取 <名字>-<变体>-v6only（并行的成员据此只停自己的容器）
 #   TPM_THREADS=N          M2：没有自带 --threads 的 tinymapper 启动都加上 --threads N（1–64 或 auto），在多 worker 下跑全套件
 #   TPM_AFFINITY=1         M5：没有自带 --cpu-affinity 的 tinymapper 启动都加上 --cpu-affinity；测试进程的线程绑到 worker 用不到的 CPU 上
 #                          （见 tests/harness_test.go），一般与 TPM_THREADS=2 一起用
 #
 # 流程：docker/build.sh 编译 tinymapper → 宿主机交叉编译测试二进制 → 每个变体一个
-# `docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun` 容器，只读挂载 build/。任一变体失败则以非零状态退出。
+# `docker run --rm --network none --cap-add NET_ADMIN --cap-add SYS_RESOURCE --device /dev/net/tun` 容器，只读挂载 build/；之后再起一个
+# `--sysctl net.ipv6.bindv6only=1` 的容器只跑 TestBindV6Only（D121；给了 -test.run 时只在其中出现 BindV6Only 时才起）。任一变体失败则以非零状态退出。
 set -eu
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 REF=${REF:-}
@@ -79,6 +80,22 @@ for v in $VARIANTS; do
 		status=1
 	fi
 	summary+=("${v}${TPM_THREADS:+（TPM_THREADS=${TPM_THREADS}）}${TPM_AFFINITY:+（TPM_AFFINITY=${TPM_AFFINITY}）}: ${result}（$(($(date +%s) - start)) s，build/${bin}）")
+	# D121：net.ipv6.bindv6only 是 netns 级 sysctl，上面的容器里改不了（/proc/sys 只读、没有 CAP_SYS_ADMIN）。另起一个 bindv6only=1 的容器
+	# 只跑 TestBindV6Only（在上面的容器里它跳过；放在 "$@" 之后的 -test.run 盖过调用者的：这个容器没有 NET_ADMIN、tun 与大 nofile，
+	# 别的用例在这里会失败）。调用者给了 -test.run 时只在其中出现 BindV6Only 时才起：用 REF 对 D121 之前的提交单跑某个用例做对照时，
+	# 不会多出一个必然失败的容器
+	case "$*" in *-test.run*) case "$*" in *BindV6Only*) ;; *) continue ;; esac ;; esac
+	start=$(date +%s)
+	if docker run --rm ${TPM_DOCKER_NAME:+--name "$TPM_DOCKER_NAME-$v-v6only"} --network none --sysctl net.ipv6.bindv6only=1 \
+		-v "$ROOT/build:/build:ro" -w /tmp \
+		-e TINYMAPPER_BIN="/build/$bin" -e TPM_VARIANT="$libc" -e TPM_IN_CONTAINER=1 -e TPM_THREADS -e TPM_AFFINITY \
+		"$img" "/build/$TESTBIN" -test.timeout=5m "$@" -test.run '^TestBindV6Only$'; then
+		result=PASS
+	else
+		result=FAIL
+		status=1
+	fi
+	summary+=("${v}（bindv6only=1）: ${result}（$(($(date +%s) - start)) s）")
 done
 printf '%s\n' "${summary[@]}"
 exit $status

@@ -14,7 +14,8 @@ NAME=tinymapper
 
 
 #发布构建（all 与发布目标）不定义 NDEBUG：libev 的断言在发布版里保留，漏 ev_io_stop 时中止而不是活锁（X1，D28）；-O3/LTO/PGO 评估后不采纳（D29）
-FLAGS= -std=c++11   -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-missing-field-initializers ${OPT} -pthread
+#OPT 放在每条编译命令的最后，-O0/-O3/-Os 等能覆盖配方自带的 -O2（D119）
+FLAGS= -std=c++11   -Wall -Wextra -Wno-unused-variable -Wno-unused-parameter -Wno-missing-field-initializers -pthread
 TARGETS=amd64 arm mips24kc_be x86  mips24kc_le
 
 #glibc 2.34 以前 all 改为动态链接（D95）：Debian/Ubuntu 上静态链接时 libstdc++ 经弱符号调用的 pthread_cond_*、pthread_detach 不会被链进来，有域名 remote
@@ -29,46 +30,46 @@ export STAGING_DIR=/tmp/    #just for supress warning of staging_dir not define
 all:git_version
 	rm -f ${NAME}
 	$(if ${old_glibc},@echo "glibc < 2.34: linking ${NAME} dynamically (a static build against it can crash with hostname remotes)")
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb $(if ${old_glibc},,-static) -O2
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb $(if ${old_glibc},,-static) -O2 ${OPT}
 
 #targes for general cross compile
 #cross2、cross3 静态链接 arm-2014.05 的 glibc（2.34 以前），有域名 remote 时不能用（D95），这时用 cross
 
 cross:git_version
-	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -O2
+	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -O2 ${OPT}
 
 cross2:git_version
-	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -lgcc_eh -O2
+	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -lgcc_eh -O2 ${OPT}
 
 cross3:git_version
-	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -O2
+	${cc_cross}   -o ${NAME}_cross    -I. ${SOURCES} ${FLAGS} -lrt -static -O2 ${OPT}
 
 #targets only for debug purpose
 fast: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb -DENABLE_DEBUG_ASSERT
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -ggdb -DENABLE_DEBUG_ASSERT ${OPT}
 debug: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -D MY_DEBUG  -ggdb -DENABLE_DEBUG_ASSERT
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -D MY_DEBUG  -ggdb -DENABLE_DEBUG_ASSERT ${OPT}
 debug2: git_version
 	rm -f ${NAME}
-	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -ggdb -DENABLE_DEBUG_ASSERT
+	${cc_local}   -o ${NAME}          -I. ${SOURCES} ${FLAGS} -lrt -Wformat-nonliteral -ggdb -DENABLE_DEBUG_ASSERT ${OPT}
 
 #targets only for 'make release'
 
 mips24kc_be: git_version
-	${cc_mips24kc_be}  -o ${NAME}_$@   -I. ${SOURCES} ${FLAGS} -lrt -lgcc_eh -static -O2
+	${cc_mips24kc_be}  -o ${NAME}_$@   -I. ${SOURCES} ${FLAGS} -lrt -lgcc_eh -static -O2 ${OPT}
 
 mips24kc_le: git_version
-	${cc_mips24kc_le}  -o ${NAME}_$@   -I. ${SOURCES} ${FLAGS} -lrt -lgcc_eh -static -O2
+	${cc_mips24kc_le}  -o ${NAME}_$@   -I. ${SOURCES} ${FLAGS} -lrt -lgcc_eh -static -O2 ${OPT}
 
 amd64:git_version
-	${cc_amd64}   -o ${NAME}_$@    -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb
+	${cc_amd64}   -o ${NAME}_$@    -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb ${OPT}
 
 x86:git_version          #to build this you need 'g++-multilib' installed 
-	${cc_x86}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb
+	${cc_x86}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb ${OPT}
 arm:git_version
-	${cc_arm}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh
+	${cc_arm}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh ${OPT}
 
 
 release: ${TARGETS}

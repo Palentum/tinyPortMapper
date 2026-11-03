@@ -17,6 +17,11 @@
 #include <sched.h>
 #include <limits.h>
 #include <linux/filter.h>
+#if defined(__GLIBC__)&&!defined(__UCLIBC__)
+#include <nss.h>
+#include <sys/auxv.h>
+#include <link.h>
+#endif
 #include <thread>
 #include <system_error>
 #include <mutex>
@@ -2213,6 +2218,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		close(new_fd);
 		return 1;
 	}
+	set_v4mapped_dualstack(new_remote_fd,remote_addr);//D121
 	if(sock_buf_explicit)
 		set_buf_size(new_remote_fd,socket_buf_size);
 
@@ -3442,6 +3448,7 @@ static void listen_probe(forward_rule_t &rule,int type,const char *protocol,cons
 		mylog(log_fatal,"rule %d [%s] create listen socket failed on %s, %s\n",rule.index,protocol,listen_addr,get_sock_error());
 		myexit(1);
 	}
+	set_v4mapped_dualstack(probe,rule.local_addr);//与监听 socket 一致（D121）
 	setsockopt(probe, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 	if(::bind(probe, (struct sockaddr*) &rule.local_addr.inner, rule.local_addr.get_len()) !=0)
 	{
@@ -3671,6 +3678,7 @@ static void start_forward_rule(size_t i)
 				myexit(1);
 			}
 
+			set_v4mapped_dualstack(rule.local_listen_fd_tcp,rule.local_addr);//D121
 			setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 			if(worker_count>1&&setsockopt(rule.local_listen_fd_tcp, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))!=0)
 			{
@@ -3718,6 +3726,7 @@ static void start_forward_rule(size_t i)
 				myexit(1);
 			}
 
+			set_v4mapped_dualstack(rule.local_listen_fd_udp,rule.local_addr);//D121
 			setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
 			if(worker_count>1&&setsockopt(rule.local_listen_fd_udp, SOL_SOCKET, SO_REUSEPORT, &yes, sizeof(yes))!=0)
 			{
@@ -4321,6 +4330,19 @@ int unit_test()
 
 int main(int argc, char *argv[])
 {
+#if defined(__GLIBC__)&&!defined(__UCLIBC__)
+	//D120：glibc ≥2.34 的静态构建（主程序没有 PT_INTERP；经 ld.so 显式启动的动态构建 AT_BASE 也是 0，不能按它判断）解析域名只用 libc.a 内置的
+	//files、dns，同 musl。按 /etc/nsswitch.conf 的 hosts 行 dlopen 宿主机的 libnss_*.so（myhostname、mdns4_minimal、resolve…）会带进宿主机的
+	//libc.so.6 与 ld.so：实测宿主 2.31 启动即 abort，2.34/2.35 SIGSEGV、多线程查询堆损坏；同版本时那份 libc 在 DNS 线程里没有初始化 ctype。
+	//代价是这些来源不可用，nsswitch.conf 改了也不再重读。更早的静态构建（cross2/cross3）files、dns 本身仍要 dlopen，见 D95
+	{
+		const ElfW(Phdr) *ph=(const ElfW(Phdr) *)getauxval(AT_PHDR);
+		int dynamic=0;
+		for(unsigned long i=0;ph!=0&&i<getauxval(AT_PHNUM);i++)
+			if(ph[i].p_type==PT_INTERP) dynamic=1;
+		if(!dynamic) __nss_configure_lookup("hosts","files dns");
+	}
+#endif
 	//启动时关着的 0/1/2 先用 /dev/null 补上，再把 stderr 并到 stdout，之后 libev 的 epoll fd、eventfd 与各 socket 都从 3 起分配。
 	//不补时它们会落到这几个号上，被 dup2(1,2) 覆盖或被当成 stdout：2>&- 时首次 epoll_wait 中止，>&- 2>&- 时信号、DNS 结果、统计都送不到主线程
 	for(int fd=0;fd<=2;fd++)

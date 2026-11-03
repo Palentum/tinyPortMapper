@@ -615,6 +615,7 @@ static int addr_routable(address_t addr)
 {
 	int fd=socket(addr.get_type(),SOCK_DGRAM|SOCK_CLOEXEC,IPPROTO_UDP);
 	if(fd<0) return errno==EMFILE||errno==ENFILE||errno==ENOBUFS||errno==ENOMEM;
+	set_v4mapped_dualstack(fd,addr);//与上游 socket 一致（D121）：bindv6only=1 时 v4 映射地址也判为可达
 	int ret=connect(fd,(struct sockaddr*)&addr.inner,addr.get_len());
 	int err=errno;
 	close(fd);
@@ -851,10 +852,11 @@ int address_t::new_connected_udp_fd()
 	new_udp_fd = socket(get_type(), SOCK_DGRAM|SOCK_NONBLOCK|SOCK_CLOEXEC, IPPROTO_UDP);
 	if (new_udp_fd < 0) {
 		int err=errno;//调用方按 EMFILE/ENFILE 决定是否先关掉空闲 pipe（D52）
-		mylog(log_warn, "create udp_fd error\n");
+		mylog(log_warn, "create udp_fd error,%s\n",get_sock_error());
 		errno=err;
 		return -1;
 	}
+	set_v4mapped_dualstack(new_udp_fd,*this);//D121
 	//会话 socket 只在给了 --sock-buf 时才用 *BUFFORCE（D38 修订）：默认的 1 MiB 仍按 rmem_max/wmem_max 截断，
 	//否则会话越多、持续过载时排队的内存与时延越大（反向 32 流满载 -13%，128 MB 路由器的 udp_mem[0] 约 11 MiB）。
 	//--udp-gro 且监听缓冲更大时，发送缓冲取监听缓冲的大小、有权限时越过截断（D44）：一次入向回调可能读出监听队列里积压的

@@ -29,3 +29,8 @@ session/
 # --- Build outputs / benchmark results ---
 build/
 bench/results/
+# makefile outputs in the repo root
+/tinymapper
+/tinymapper_*
+/git_version.h
+/version.txt

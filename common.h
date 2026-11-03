@@ -259,6 +259,17 @@ struct address_t  //TODO scope id
 
     int new_connected_udp_fd();
 };
+//D121：AF_INET6 socket 的 IPV6_V6ONLY 默认取 net.ipv6.bindv6only，为 1 时 bind 到 v4 映射地址返回 EINVAL、connect 到它返回 ENETUNREACH。
+//addr 是 v4 映射地址时只能走 IPv4：在 bind/connect 之前把刚建的 fd 设成双栈（绑定或自动绑定之后再设返回 EINVAL）；失败不另外处理，
+//随后的 bind/connect 照旧报错。其他地址不多一次系统调用（D32）；[::] 监听照旧跟随 sysctl：为 1 时同端口的 0.0.0.0 与 [::] 两条规则要能同时 bind
+inline void set_v4mapped_dualstack(int fd,const address_t &addr)
+{
+	if(addr.inner.ipv6.sin6_family==AF_INET6&&IN6_IS_ADDR_V4MAPPED(&addr.inner.ipv6.sin6_addr))
+	{
+		int no=0;
+		setsockopt(fd,IPPROTO_IPV6,IPV6_V6ONLY,&no,sizeof(no));
+	}
+}
 //find 非空时，found[k] 表示 find[k]（k < find_count）是否在完整解析结果里（不只是存下的前 max_addrs 条）
 int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int max_addrs,int &addr_count,char *err,int err_len,const address_t *find=0,int *found=0,int find_count=1);
 address_t pick_remote_addr(const address_t *addrs,int addr_count,const address_t *current);

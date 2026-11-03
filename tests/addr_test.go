@@ -1,12 +1,16 @@
 package tests
 
 import (
+	"bytes"
+	"debug/elf"
 	"encoding/binary"
+	"errors"
 	"fmt"
 	"io"
 	"net"
 	"net/netip"
 	"os"
+	"path/filepath"
 	"regexp"
 	"slices"
 	"strconv"
@@ -64,6 +68,140 @@ func TestAddressFamilies(t *testing.T) {
 				t.Fatalf("UDP 回包前缀 = %q", got)
 			}
 		})
+	}
+}
+
+// D121：net.ipv6.bindv6only=1 时新建的 AF_INET6 socket 默认 IPV6_V6ONLY=1，bind 到 v4 映射地址返回 EINVAL、connect 到它返回 ENETUNREACH
+// （修复前 v4 映射地址的监听启动即退出，发往 v4 映射 remote 的 TCP 连接与 UDP 会话都建不成，D99 的可达性探测把它判为不可达）。
+// tinymapper 给 v4 映射地址的 socket 在 bind/connect 之前清掉 IPV6_V6ONLY；[::] 监听照旧跟随 sysctl，只收 IPv6。
+// 这个 sysctl 是 netns 级的，测试容器里 /proc/sys 只读、也没有 CAP_SYS_ADMIN，改不了：tests/run.sh 每个变体另起一个
+// --sysctl net.ipv6.bindv6only=1 的容器只跑本用例，主套件里（bindv6only=0）跳过。bindv6only=0 下的 v4 映射地址由
+// TestAddressFamilies/v4mapped_remote 与 TestUDPPktinfoSource/v4mapped-any 覆盖
+func TestBindV6Only(t *testing.T) {
+	if b, _ := os.ReadFile("/proc/sys/net/ipv6/bindv6only"); strings.TrimSpace(string(b)) != "1" {
+		t.Skip("需要 net.ipv6.bindv6only=1，由 tests/run.sh 另起容器运行")
+	}
+	t.Parallel()
+	for _, c := range []struct {
+		name, listen, remote string
+		client, target       string   // UDP 客户端从 client 发往 target，回包须来自 target；TCP 客户端连 target
+		hosts                []string // 非空时 remote 是 /etc/hosts 里有这些地址的域名
+	}{
+		// 上游 TCP、UDP socket connect 到 v4 映射地址
+		{"mapped_remote", "::1", "::ffff:127.0.0.1", "::1", "::1", nil},
+		// 监听 bind 到 v4 映射地址（listen_probe 与 TCP、UDP 监听 socket）
+		{"mapped_listen", "::ffff:127.0.0.1", "127.0.0.1", "127.0.0.1", "127.0.0.1", nil},
+		// [::ffff:0.0.0.0]：UDP 回包照旧以客户端发往的地址为源（IP_PKTINFO，D87），发往非首选的 127.0.0.2
+		{"mapped_any_listen", "::ffff:0.0.0.0", "::ffff:127.0.0.1", "127.0.0.1", "127.0.0.2", nil},
+		// 域名：libc 排序时的探测同样失败，不可达的 2001:db8::1 排在前面；D99 的探测须把 v4 映射地址判为可达并选它
+		{"hostname_remote", "::1", "", "::1", "::1", []string{"2001:db8::1", "::ffff:127.0.0.1"}},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			t.Parallel()
+			bport := freePort(t)
+			serveTCP(t, hostPort("127.0.0.1", bport), echoHandler(c.name+"\n"))
+			recordUDP(t, hostPort("127.0.0.1", bport))
+			remote := hostPort(c.remote, bport)
+			if c.hosts != nil {
+				inContainer(t)
+				name := fmt.Sprintf("bindv6only-%d.test", bport)
+				for _, ip := range c.hosts {
+					hostsEntry(t, ip, name)
+				}
+				remote = fmt.Sprintf("%s:%d", name, bport)
+			}
+			lport := freePort(t)
+			m := forward(t, "tu", hostPort(c.listen, lport), remote)
+			tc := dial(t, hostPort(c.target, lport))
+			if got := readLine(t, tc); got != c.name {
+				t.Fatalf("TCP banner = %q", got)
+			}
+			mustEcho(t, tc, "tcp-payload")
+			target := netip.AddrPortFrom(netip.MustParseAddr(c.target), uint16(lport))
+			if from, err := echoVia(srcClient(t, c.client), target, []byte("udp-payload")); err != nil {
+				t.Errorf("UDP 客户端（%s → %s）收不到回显：%v", c.client, target, err)
+			} else if from != target {
+				t.Errorf("UDP 回包来自 %s，期望来自客户端发往的 %s", from, target)
+			}
+			if c.hosts != nil {
+				if want := "is not routable from this host, using " + hostPort("::ffff:127.0.0.1", bport); m.logLines(want) != 1 {
+					t.Errorf("日志里没有一行 %q", want)
+				}
+			}
+			expectNoWarn(t, m)
+		})
+	}
+	// [::] 监听照旧跟随 sysctl：IPv4 客户端被拒（不强制双栈：同端口另有 0.0.0.0 规则的配置靠它）
+	t.Run("any_listen_v6only", func(t *testing.T) {
+		t.Parallel()
+		bport := freePort(t)
+		serveTCP(t, hostPort("127.0.0.1", bport), echoHandler("any\n"))
+		lport := freePort(t)
+		forward(t, "t", hostPort("::", lport), hostPort("127.0.0.1", bport))
+		if got := readLine(t, dial(t, hostPort("::1", lport))); got != "any" {
+			t.Fatalf("IPv6 客户端的 TCP banner = %q", got)
+		}
+		c, err := net.DialTimeout("tcp", hostPort("127.0.0.1", lport), ioTimeout)
+		if err == nil {
+			c.Close()
+			t.Fatal("IPv4 客户端连上了 [::] 监听，期望 bindv6only=1 时被拒")
+		}
+		if !errors.Is(err, syscall.ECONNREFUSED) {
+			t.Fatalf("IPv4 客户端连 [::] 监听：%v，期望 ECONNREFUSED", err)
+		}
+	})
+}
+
+// D120：静态 glibc 构建解析域名只用 libc.a 内置的 files、dns，不按 /etc/nsswitch.conf 的 hosts 行 dlopen 宿主机的 libnss_*.so：
+// 它们会带进宿主机的 libc.so.6 与 ld.so，按宿主机 glibc 版本与模块不同，启动时或 DNS 刷新线程里崩溃。hosts 行改成 compat files dns：镜像里有 libnss_compat.so.2
+// 但它没有 hosts 函数，修复前它与 libc.so.6 被映射进 tinymapper，名字再由 files 查到。改写 /etc/nsswitch.conf，不并行
+func TestStaticGlibcNSSBuiltin(t *testing.T) {
+	inContainer(t)
+	if os.Getenv("TPM_VARIANT") != "glibc" {
+		t.Skip("musl 自己读 /etc/hosts、发 DNS，不经 NSS")
+	}
+	f, err := elf.Open(mapperBin)
+	if err != nil {
+		t.Fatal(err)
+	}
+	dynamic := slices.ContainsFunc(f.Progs, func(p *elf.Prog) bool { return p.Type == elf.PT_INTERP })
+	f.Close()
+	if dynamic {
+		t.Skip("动态链接的构建照常按 nsswitch.conf 解析")
+	}
+	old, err := os.ReadFile("/etc/nsswitch.conf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	conf := regexp.MustCompile(`(?m)^hosts:.*$`).ReplaceAll(old, []byte("hosts: compat files dns"))
+	if bytes.Equal(conf, old) {
+		t.Fatalf("/etc/nsswitch.conf 里没有 hosts: 行：\n%s", old)
+	}
+	if m, _ := filepath.Glob("/usr/lib/*/libnss_compat.so.2"); len(m) == 0 {
+		t.Fatal("镜像里没有 libnss_compat.so.2，修复前的构建也映射不到它，用例区分不了")
+	}
+	if err := os.WriteFile("/etc/nsswitch.conf", conf, 0644); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.WriteFile("/etc/nsswitch.conf", old, 0644) })
+
+	bport := freePort(t)
+	serveTCP(t, hostPort("127.0.0.1", bport), echoHandler("nss\n"))
+	name := fmt.Sprintf("nss-%d.test", bport)
+	hostsEntry(t, "127.0.0.1", name)
+	lport := freePort(t)
+	m := forward(t, "t", hostPort("127.0.0.1", lport), fmt.Sprintf("%s:%d", name, bport))
+	if got := readLine(t, dial(t, hostPort("127.0.0.1", lport))); got != "nss" {
+		t.Fatalf("TCP banner = %q", got)
+	}
+	maps, err := os.ReadFile(fmt.Sprintf("/proc/%d/maps", m.cmd.Process.Pid))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, so := range []string{"libnss_", "libc.so.6", "ld-linux"} {
+		if strings.Contains(string(maps), so) {
+			t.Errorf("tinymapper 映射了 %s：静态 glibc 构建按 nsswitch.conf 载入了宿主机的 NSS 模块", so)
+		}
 	}
 }
 
