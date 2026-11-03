@@ -55,6 +55,9 @@ func TestMain(m *testing.M) {
 	if s := os.Getenv(nprocLimitEnv); s != "" {
 		execNprocLimit(s)
 	}
+	if os.Getenv(blockSignalsEnv) != "" {
+		execBlockSignals()
+	}
 	mapperBin = os.Getenv("TINYMAPPER_BIN")
 	if mapperBin == "" || runtime.GOOS != "linux" {
 		fmt.Fprintln(os.Stderr, "需要在 Linux 上运行并设置 TINYMAPPER_BIN；在开发机上请用 tests/run.sh")
@@ -610,6 +613,54 @@ func execNprocLimit(s string) {
 	}
 	fmt.Fprintf(os.Stderr, "以 RLIMIT_NPROC=%s 执行 %q 失败：%v\n", s, os.Args[1:], err)
 	os.Exit(127)
+}
+
+// D127：startMapperBlockedSignals 以环境变量 blockSignalsEnv 重新执行测试二进制自身，TestMain 见到它就由 execBlockSignals 在当前线程上屏蔽
+// SIGTERM、SIGINT、SIGUSR1 后 exec tinymapper（os.Args[1:]），模拟屏蔽了它们的父进程：屏蔽字跨 execve 保留，处置恢复默认（Go 装的处理函数
+// 不跨 exec）。屏蔽字只作用于调用线程，所以锁定线程后在同一线程上屏蔽、exec；rt_sigprocmask 走 RawSyscall，Go 运行时不会再改这个线程的屏蔽字
+const blockSignalsEnv = "TPM_BLOCK_SIGNALS"
+
+// blockedSignals 是 execBlockSignals 屏蔽的信号（tinymapper 主线程上 libev 接住的三个，SIGPIPE 不在内）
+var blockedSignals = []syscall.Signal{syscall.SIGTERM, syscall.SIGINT, syscall.SIGUSR1}
+
+func execBlockSignals() {
+	const sigBlock = 0 // SIG_BLOCK
+	var set uint64     // 内核的 sigset_t（8 字节），第 k−1 位是信号 k
+	for _, s := range blockedSignals {
+		set |= 1 << (uint(s) - 1)
+	}
+	err := errors.New("缺少要执行的程序")
+	if len(os.Args) >= 2 {
+		runtime.LockOSThread()
+		if _, _, e := syscall.RawSyscall6(syscall.SYS_RT_SIGPROCMASK, sigBlock, uintptr(unsafe.Pointer(&set)), 0, unsafe.Sizeof(set), 0, 0); e != 0 {
+			err = e
+		} else {
+			// 屏蔽字跨 exec 保留，前提是 syscall.Exec 不改调用线程的屏蔽字（Go 1.25/1.26 的 runtime_BeforeExec 只加 execLock）；
+			// 在 5042da4 上 TestInheritedSignalMask 失败（收不到统计）可以证明屏蔽确实带进了 tinymapper
+			err = syscall.Exec(os.Args[1], os.Args[1:], os.Environ())
+		}
+	}
+	fmt.Fprintf(os.Stderr, "屏蔽 SIGTERM、SIGINT、SIGUSR1 后执行 %q 失败：%v\n", os.Args[1:], err)
+	os.Exit(127)
+}
+
+// startMapperBlockedSignals 同 startMapper，但 tinymapper 从启动起就屏蔽着 blockedSignals（见 blockSignalsEnv）
+func startMapperBlockedSignals(t testing.TB, wait []listenPoint, args ...string) *mapper {
+	t.Helper()
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	logPath := filepath.Join(t.TempDir(), "tinymapper.log")
+	f, err := os.Create(logPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer f.Close()
+	cmd := exec.Command(self, append([]string{mapperBin}, mapperArgv(args...)...)...)
+	cmd.Env = append(os.Environ(), blockSignalsEnv+"=1")
+	cmd.Stdout, cmd.Stderr = f, f
+	return runMapper(t, cmd, logPath, wait)
 }
 
 // startMapperNoNetAdmin 同 startMapper，但 tinymapper 没有 CAP_NET_ADMIN；wait 中的监听就绪时已 exec 成 tinymapper，随即核对它的 CapEff

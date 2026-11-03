@@ -575,7 +575,7 @@ func TestUDPSessionChurn(t *testing.T) {
 }
 
 // max_conn_num：填满单规则到上限（20000 会话，用到最大的 32768 槽表），再来的新客户端被忽略（日志 but ignored,bc of
-// max_conv_num reached），既有会话仍能转发，统计 sessions=20000。
+// max_conn_num reached），既有会话仍能转发，统计 sessions=20000。
 //
 // 临时端口：tinymapper 的 20000 个上游 socket 都在 connect 时从临时端口范围（net.ipv4.ip_local_port_range 32768–60999，
 // 约 28k）自动绑定源端口。客户端也自动绑定时（即便分到别的 127.0.x.y 源 IP），实测 tinymapper 建到第 18738 个（客户端分 3 个
@@ -642,7 +642,7 @@ func TestUDPMaxConn(t *testing.T) {
 	}
 	eventually(t, logFlushWithin+ioTimeout, 50*time.Millisecond, func() error {
 		m.fatalIfExited(t, "填满 max_conn_num 后")
-		if m.logLines("but ignored,bc of max_conv_num reached") == 0 {
+		if m.logLines("[WARN]", "but ignored,bc of max_conn_num reached") == 0 {
 			return fmt.Errorf("还没看到 max_conn_num 的忽略日志")
 		}
 		return nil
@@ -710,7 +710,7 @@ func TestUDPMaxConn(t *testing.T) {
 		}
 	}
 	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
-		if n := m.logLines("but ignored,bc of max_conv_num reached"); n != 1+len(rejected) {
+		if n := m.logLines("[WARN]", "but ignored,bc of max_conn_num reached"); n != 1+len(rejected) {
 			return fmt.Errorf("日志中有 %d 行因 max_conn_num 忽略新客户端，期望 %d", n, 1+len(rejected))
 		}
 		return nil

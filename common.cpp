@@ -114,25 +114,6 @@ u32_t get_true_random_number_nz() //nz for non-zero
 	}
 	return ret;
 }*/
-/*
-u64_t ntoh64(u64_t a)
-{
-	if(__BYTE_ORDER == __LITTLE_ENDIAN)
-	{
-		return __bswap_64( a);
-	}
-	else return a;
-
-}
-u64_t hton64(u64_t a)
-{
-	if(__BYTE_ORDER == __LITTLE_ENDIAN)
-	{
-		return __bswap_64( a);
-	}
-	else return a;
-
-}*/
 
 int set_buf_size(int fd,int socket_buf_size)
 {
@@ -166,7 +147,7 @@ static void set_udp_buf_dir(int fd,int snd,int size,int force)
 	}
 	if(setsockopt(fd, SOL_SOCKET, snd?SO_SNDBUF:SO_RCVBUF, &size, sizeof(size))<0)
 	{
-		mylog(log_fatal,"%s fail  socket_buf_size=%d  errno=%s\n",snd?"SO_SNDBUF":"SO_RCVBUF",size,get_sock_error());
+		mylog(log_fatal,"%s fail  size=%d  errno=%s\n",snd?"SO_SNDBUF":"SO_RCVBUF",size,get_sock_error());
 		myexit(1);
 	}
 }
@@ -187,13 +168,6 @@ void myexit(int a)
 	_exit(a);
 }
 /*
-void  signal_handler(int sig)
-{
-	about_to_exit=1;
-    // myexit(0);
-}*/
-
-/*
 void get_true_random_chars(char * s,int len)
 {
 	int size=read(random_fd.get_fd(),s,len);
@@ -202,18 +176,6 @@ void get_true_random_chars(char * s,int len)
 		printf("get random number failed\n");
 		exit(-1);
 	}
-}*/
-
-/*
-int random_between(u32_t a,u32_t b)
-{
-	if(a>b)
-	{
-		mylog(log_fatal,"min >max?? %d %d\n",a ,b);
-		myexit(1);
-	}
-	if(a==b)return a;
-	else return a+get_true_random_number()%(b+1-a);
 }*/
 
 
@@ -255,38 +217,6 @@ int create_fifo(char * file)
 	return fifo_fd;
 }*/
 
-
-/*
-int set_timer(int epollfd,int &timer_fd)
-{
-	int ret;
-	epoll_event ev;
-
-	itimerspec its;
-	memset(&its,0,sizeof(its));
-
-	if((timer_fd=timerfd_create(CLOCK_MONOTONIC,TFD_NONBLOCK)) < 0)
-	{
-		mylog(log_fatal,"timer_fd create error\n");
-		myexit(1);
-	}
-	its.it_interval.tv_sec=(timer_interval/1000);
-	its.it_interval.tv_nsec=(timer_interval%1000)*1000ll*1000ll;
-	its.it_value.tv_nsec=1; //imidiately
-	timerfd_settime(timer_fd,0,&its,0);
-	setnonblocking(timer_fd);
-
-
-	ev.events = EPOLLIN;
-	ev.data.u64 = timer_fd;
-
-	ret=epoll_ctl(epollfd, EPOLL_CTL_ADD, timer_fd, &ev);
-	if (ret < 0) {
-		mylog(log_fatal,"epoll_ctl return %d\n", ret);
-		myexit(-1);
-	}
-	return 0;
-}*/
 
 static void set_err(char *err,int err_len,const char *fmt,...)
 {
@@ -442,10 +372,15 @@ int resolve_domain_addresses(const char *host,u32_t port,address_t *addrs,int ma
 	hints.ai_socktype=SOCK_STREAM;
 
 	addrinfo *res=0;
+	errno=0;//下面按 errno 认 fd 用完，不能是之前的调用留下的
 	int ret=getaddrinfo(host,service,&hints,&res);
 	if(ret!=0)
 	{
-		set_err(err,err_len,"%s",gai_strerror(ret));
+		//fd 用完时 musl 返回 EAI_SYSTEM、glibc 返回 EAI_NONAME，原因都只在 errno 里（EMFILE/ENFILE）；EAI_SYSTEM 的其他原因也在 errno。其余错误的 errno 没有意义，不附
+		if(ret==EAI_SYSTEM||errno==EMFILE||errno==ENFILE)
+			set_err(err,err_len,"%s, %s",gai_strerror(ret),get_sock_error());
+		else
+			set_err(err,err_len,"%s",gai_strerror(ret));
 		return -1;
 	}
 

@@ -66,7 +66,7 @@ mips24kc_le: git_version
 amd64:git_version
 	${cc_amd64}   -o ${NAME}_$@    -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb ${OPT}
 
-x86:git_version          #to build this you need 'g++-multilib' installed 
+x86:git_version
 	${cc_x86}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh -ggdb ${OPT}
 arm:git_version
 	${cc_arm}   -o ${NAME}_$@      -I. ${SOURCES} ${FLAGS} -lrt -static -O2 -lgcc_eh ${OPT}
@@ -91,5 +91,6 @@ clean:
 	rm -f ${NAME} ${NAME}_cross
 	rm -f git_version.h
 
+#完整哈希，有未提交改动时带 -dirty（-h 截到 10 位后补回）；源码目录没有 .git（如解压的源码包，哪怕解压在别的仓库里）或没有 git 时为 unknown（D126）
 git_version:
-	    echo "const char *gitversion = \"$(shell git rev-parse HEAD)\";" > git_version.h
+	    echo "const char *gitversion = \"$(shell [ -e .git ] && git describe --always --dirty --abbrev=40 --match=NONE 2>/dev/null || echo unknown)\";" > git_version.h

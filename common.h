@@ -115,7 +115,7 @@ const int conn_clear_min=1;
 
 const u32_t conn_clear_interval=1000;
 
-const u32_t timer_interval=400;//this should be smaller than heartbeat_interval and retry interval;
+const u32_t timer_interval=400;//worker_tick 与 main_timer_cb（DNS 调度、统计超时检查、日志刷新）的周期，README 与 AGENTS.md 里的 400 ms 都是它；空闲清理只在 tick 上按 conn_clear_interval 判断，实际约 1.2 s 一次
 
 extern int socket_buf_size;
 extern int sock_buf_explicit;
@@ -130,15 +130,8 @@ struct not_copy_able_t
 	{
 
 	}
-	not_copy_able_t(const not_copy_able_t &other)
-	{
-		assert(0==1);
-	}
-	const not_copy_able_t & operator=(const not_copy_able_t &other)
-	{
-		assert(0==1);
-		return other;
-	}
+	not_copy_able_t(const not_copy_able_t &)=delete;
+	not_copy_able_t & operator=(const not_copy_able_t &)=delete;
 };
 
 struct tcp_pipe_t//pipe2 得到的一对 fd（B2）；r 为 -1 表示没有
@@ -168,6 +161,7 @@ struct tcp_info_t:not_copy_able_t
 		//data=(char*)malloc(max_data_len_tcp+200);
 
 		memset(&ev,0,sizeof(ev));//对 ev_io_stop 等价于 ev_init：slab 新切出的内存未初始化，ev_io_init 之前走到释放路径时 ev_io_stop 要读 active/pending（T11）
+		fd=-1;//同 pipe.r：池里取出的对象不带上一个连接已关闭的 fd 号
 		buf=0;
 		pipe.r=pipe.w=-1;
 		begin=0;
@@ -227,7 +221,7 @@ struct address_t  //TODO scope id
 
 	int from_sockaddr(sockaddr *,socklen_t);
 
-	char* get_str();//静态缓冲：一次 mylog 调用里最多用一次，且只在事件循环线程调用
+	char* get_str();//静态缓冲，每个线程一份（M2）：同一线程的一次 mylog 调用里最多用一次，否则 to_str() 进局部缓冲
 	void to_str(char *);//s 至少 max_addr_len 字节；不能改 errno：与 get_sock_error() 同在一次 mylog 时可能先求值
 
 	inline u32_t get_type()
@@ -312,10 +306,10 @@ struct udp_pair_t:not_copy_able_t,lru_node_t
 	int remote_index;
 	u32_t gen;//建会话时 remote 的 gen：与 remote_target_t::gen 不同即连在 DNS 换掉的旧地址上
 	unsigned char gso_off[2];//U5（D45）：这个会话 [0] 入向（会话 socket）、[1] 回程（监听 socket 发往它）的 GSO 失败过，此后合并包逐个数据报发送
-	//u64_t last_active_time;
 	udp_pair_t()
 	{
 		memset(&ev,0,sizeof(ev));//同 tcp_info_t（T11）
+		fd=-1;
 		owner=0;
 		remote_index=-1;
 		gen=0;
@@ -331,7 +325,6 @@ struct tcp_pair_t:not_copy_able_t,lru_node_t
 {
 	tcp_info_t local;
 	tcp_info_t remote;
-	//u64_t last_active_time;
 	forward_rule_t *owner;
 	int remote_index;
 	u32_t gen;//同 udp_pair_t::gen
@@ -363,23 +356,8 @@ struct loop_clock_t
 };
 
 void myexit(int a);
-void init_random_number_fd();
-u64_t get_fake_random_number_64();
-u32_t get_fake_random_number();
-u32_t get_fake_random_number_nz();
-u64_t ntoh64(u64_t a);
-u64_t hton64(u64_t a);
-bool larger_than_u16(uint16_t a,uint16_t b);
-bool larger_than_u32(u32_t a,u32_t b);
 
 int set_buf_size(int fd,int socket_buf_size);
 int set_udp_buf_size(int fd,int size);
-
-void  signal_handler(int sig);
-
-void get_fake_random_chars(char * s,int len);
-int random_between(u32_t a,u32_t b);
-
-int set_timer(int epollfd,int &timer_fd);
 
 //#endif /* COMMON_H_ */

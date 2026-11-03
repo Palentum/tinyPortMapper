@@ -96,6 +96,23 @@ func (m *mapper) expectPipeFDs(t testing.TB, d statsDump, state string) {
 	}
 }
 
+// waitPipesClosed 用于 splice 运行期不可用（审查 L1）之后：各 worker 的 worker_tick 关掉池里空闲的 pipe 与 scratch pipe，方向持有的排空
+// 还回来后下一个周期关（D128），之后不再建 pipe。等到统计里 pipes alloc 为 0（连接对已释放时最多一个 400 ms 周期），返回那一次的统计，
+// 再交给 expectPipeFDs 核对没有 pipe fd 留下。拿更早的统计核对 fd 不可靠：两次读之间的一个周期可能刚关掉 pipe
+func (m *mapper) waitPipesClosed(t testing.TB) statsDump {
+	t.Helper()
+	var d statsDump
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		d = m.statsAfterSignal(t)
+		if p := d.pool; p.pipeAlloc != 0 {
+			return fmt.Errorf("splice 不可用之后 pipes alloc=%d（held %d、free %d、scratch %d），期望 worker_tick 把它们都关掉（D128）",
+				p.pipeAlloc, p.pipeHeld, p.pipeFree, p.pipeScratch)
+		}
+		return nil
+	})
+	return d
+}
+
 // expectPipeFlags 要求 tinymapper 的每个 pipe fd 都带 O_NONBLOCK|O_CLOEXEC（规格：pipe2(O_NONBLOCK|O_CLOEXEC)），返回检查的个数
 func expectPipeFlags(t testing.TB, pid int) int {
 	t.Helper()
@@ -2051,7 +2068,10 @@ func TestSpliceWriteEAGAIN(t *testing.T) {
 //   - ENOSYS、EPERM、EINVAL、EOPNOTSUPP：每次 splice 都失败；两次双向 8 MiB：数据完整，splice 计数为 0，没有读写出错的关闭，warn 恰好 1 行，
 //     splice 只被调用过 1 次。失败时 socket 已建立、有数据可读，D110 不把它当成连接的待决错误（见 TestSpliceSockError）；
 //   - dynamic：先照常 splice；再让读进 pipe 的 splice（args[0] 是 socket）返回 ENOSYS：恰好失败 1 次、1 行 warn；之后即使 splice 又能用，
-//     也不再有读进 pipe 的 splice，splice 计数不再增长（进程级、不可逆）
+//     也不再有读进 pipe 的 splice，splice 计数不再增长（进程级、不可逆）。
+//
+// 两种情况最后都等 pipes alloc 归零、没有 pipe fd（D128，waitPipesClosed：以前失败之前建的 scratch pipe 与池里空闲的 pipe 一直留着，
+// alloc 停在 1 或 8）。几个 worker 同时失败只记一行 warn 见 TestSpliceUnavailableWorkers
 func TestSpliceUnavailable(t *testing.T) {
 	t.Parallel()
 	needPipeQuotaExempt(t)
@@ -2094,6 +2114,7 @@ func TestSpliceUnavailable(t *testing.T) {
 				t.Errorf("splice 被调用 %d 次，期望 1 次：第一次失败后应当整个进程改走拷贝", calls.Load())
 			}
 			noErrorCloses(t, m)
+			m.expectPipeFDs(t, m.waitPipesClosed(t), "splice 不可用之后")
 		})
 	}
 	t.Run("dynamic", func(t *testing.T) {
@@ -2144,7 +2165,84 @@ func TestSpliceUnavailable(t *testing.T) {
 			t.Errorf("%q 的 warn 有 %d 行，期望恰好 1 行", warn, k)
 		}
 		noErrorCloses(t, m)
+		m.expectPipeFDs(t, m.waitPipesClosed(t), "splice 不可用之后")
 	})
+}
+
+// D128：几个 worker 同时碰到 splice 不可用时只有把 disable_splice 从 0 换成 1 的那个记 warn（以前先记日志再置位，各记一行）。--threads 4，
+// notifier 压住每一次读进 pipe 的 splice（args[0] 是 socket，notifier.setHold），16 条连接并发双向 1 MiB，等到至少两个 worker 线程同时停在
+// 这样的 splice 里（都已读到 disable_splice 为 0）再一起放开，都以 ENOSYS 失败。期望：warn 恰好 1 行，数据完整（transfer 比对 SHA-256），
+// 没有 splice 字节、没有读写出错的关闭；连接释放后各 worker 的 scratch pipe 都关掉（waitPipesClosed）
+func TestSpliceUnavailableWorkers(t *testing.T) {
+	t.Parallel()
+	needPipeQuotaExempt(t)
+	const n, conns = 4, 16
+	affinityTooMany(t, n)
+	affinityOverlap(t, n) // 连接要分到至少两个 worker
+	const warn = "[tcp]splice failed ("
+	be := serveTCP(t, loopback4(t), streamHandler)
+	listen := loopback4(t)
+	m, nf := startMapperNotify(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", be.addr, "-t", "--threads", strconv.Itoa(n))
+	pid := m.pid()
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	spliceIn := func(c notifyCall) bool { return c.nr == syscall.SYS_SPLICE && isSocketFD(pid, c.fd(0)) }
+	var mu sync.Mutex
+	held := map[int]bool{} // 停在读进 pipe 的 splice 里的线程（notifyCall.pid 是 TID）
+	nf.setHold(func(c notifyCall) <-chan struct{} {
+		if !spliceIn(c) {
+			return nil
+		}
+		mu.Lock()
+		held[c.pid] = true
+		mu.Unlock()
+		return release
+	})
+	var failed atomic.Int64
+	nf.setDecide(func(c notifyCall) syscall.Errno { // 放开的调用各在自己的 goroutine 里问它：只用原子计数
+		if spliceIn(c) {
+			failed.Add(1)
+			return syscall.ENOSYS
+		}
+		return 0
+	})
+	errs := make(chan error, conns)
+	for i := range conns {
+		go func() { errs <- transfer(listen, 1<<20, 1<<20, 64<<10, uint64(70+i)) }()
+	}
+	heldWorkers := func() int {
+		mu.Lock()
+		defer mu.Unlock()
+		return len(held)
+	}
+	eventually(t, ioTimeout, 5*time.Millisecond, func() error {
+		m.fatalIfExited(t, "等 worker 停在 splice 里时")
+		if k := heldWorkers(); k < 2 {
+			return fmt.Errorf("停在读进 pipe 的 splice 里的 worker 线程有 %d 个，期望至少 2 个", k)
+		}
+		return nil
+	})
+	k := heldWorkers()
+	free()
+	for range conns {
+		if err := <-errs; err != nil {
+			t.Fatalf("放开之后的传输：%v", err)
+		}
+	}
+	s := m.statsAfterSignal(t).tcp[1] // 统计之后 fflush，各 worker 之前写的日志行都已写出
+	t.Logf("同时停在 splice 里的 worker 线程 %d 个，ENOSYS 共 %d 次；%+v", k, failed.Load(), s)
+	if want := uint64(conns * (1<<20 + streamHeaderLen)); s.upBytes != want || s.upSplice != 0 || s.downSplice != 0 {
+		t.Errorf("up_bytes=%d（期望 %d）up_splice=%d down_splice=%d：读进 pipe 的 splice 都失败了，应当全部走拷贝", s.upBytes, want, s.upSplice, s.downSplice)
+	}
+	if w, all := m.logLines("[WARN]", warn), m.logLines(warn); w != 1 || all != 1 {
+		t.Errorf("%q 的 warn 有 %d 行（含它的共 %d 行），期望恰好 1 行：%d 个 worker 同时失败，只有置位 disable_splice 的那个记", warn, w, all, k)
+	}
+	if e := m.logLines("recv_len=-1") + m.logLines("send_len=-1"); e != 0 {
+		t.Errorf("日志里有 %d 行读写出错的关闭", e)
+	}
+	m.expectPipeFDs(t, m.waitPipesClosed(t), "splice 不可用、连接释放之后")
 }
 
 // tmUnhashed 返回一个检查：tinymapper 的 socket addr（本端、对端，原 inode 为 inode）已从已建立连接的哈希表摘除时返回 nil。摘除发生在
@@ -2312,7 +2410,8 @@ func TestSpliceSockError(t *testing.T) {
 // 进入 FIN_WAIT2；后端以 64 KiB 一块写 1 MiB（下行进入 splice）、再写恰好 32 KiB（splice_next 为 1）；暂停 tinymapper，后端再写 192 KiB，
 // 确认进了 tinymapper 上游一侧的接收队列后关闭：FIN_WAIT2 收到 FIN，tcp_time_wait 换上 timewait sock 并 tcp_done（tmUnhashed），完整 socket
 // 状态 CLOSE、192 KiB 仍在接收队列；notifier 让它之后第一次读进 pipe 的 splice 返回 EPERM，恢复运行。期望：EPERM 恰好注入 1 次，warn
-// "[tcp]splice failed (1:" 恰好 1 行，客户端收到全部字节（SHA-256、down_bytes）后 EOF，没有读写出错的关闭，连接对因两侧 EOF 释放
+// "[tcp]splice failed (1:" 恰好 1 行，客户端收到全部字节（SHA-256、down_bytes）后 EOF，没有读写出错的关闭，连接对因两侧 EOF 释放，
+// 之后 pipes alloc 归零、没有 pipe fd（D128，waitPipesClosed）
 func TestSpliceUnavailableClosedQueue(t *testing.T) {
 	t.Parallel()
 	needPipeQuotaExempt(t)
@@ -2448,7 +2547,7 @@ func TestSpliceUnavailableClosedQueue(t *testing.T) {
 	if k := m.logLines("connection {" + cliAddr + "} closed bc of EOF"); k != 1 {
 		t.Errorf("连接 {%s} 的 EOF 关闭行有 %d 行，期望 1 行", cliAddr, k)
 	}
-	m.expectPipeFDs(t, d, "连接对释放之后")
+	m.expectPipeFDs(t, m.waitPipesClosed(t), "连接对释放之后")
 }
 
 // D110 的判别还要求状态是 CLOSE：对端只发了 FIN 的 socket（CLOSE_WAIT）接收队列也为空，这时 splice 失败只能是 splice 本身不可用（能 splice
@@ -2456,7 +2555,8 @@ func TestSpliceUnavailableClosedQueue(t *testing.T) {
 // 判别会把这对还在用的半关闭连接当成读出错关掉。构造：后端以 64 KiB 一块写 1 MiB（下行进入 splice）、再写恰好 32 KiB（splice_next 为 1），
 // 客户端收齐后暂停 tinymapper，后端 CloseWrite，等 tinymapper 上游一侧 socket 进入 CLOSE_WAIT，notifier 让它之后第一次读进 pipe 的 splice
 // 返回 EPERM，恢复运行。期望：EPERM 恰好注入 1 次，warn "[tcp]splice failed (1:" 恰好 1 行，客户端收到全部字节后读到 EOF；之后客户端写的
-// 4 KiB 后端照样收到（半关闭只关了一个方向），客户端关闭后连接对以 EOF 释放，没有读写出错的关闭
+// 4 KiB 后端照样收到（半关闭只关了一个方向），客户端关闭后连接对以 EOF 释放，没有读写出错的关闭，之后 pipes alloc 归零、没有 pipe fd
+// （D128，waitPipesClosed）
 func TestSpliceUnavailableCloseWait(t *testing.T) {
 	t.Parallel()
 	needPipeQuotaExempt(t)
@@ -2537,7 +2637,7 @@ func TestSpliceUnavailableCloseWait(t *testing.T) {
 		t.Fatalf("半关闭之后客户端写的 %d 字节后端只收到 %d 字节（%v），或内容不一致：连接对被当成读出错关掉了", len(msg), n, err)
 	}
 	p.cli.Close()
-	d := m.waitTCPConns(t, 1, 0)
+	m.waitTCPConns(t, 1, 0)
 	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
 		if k := m.logLines("connection {" + cliAddr + "} closed bc of"); k == 0 {
 			return fmt.Errorf("日志里还没有连接 {%s} 的关闭行", cliAddr)
@@ -2553,7 +2653,7 @@ func TestSpliceUnavailableCloseWait(t *testing.T) {
 	if k := m.logLines("connection {" + cliAddr + "} closed bc of EOF"); k != 1 {
 		t.Errorf("连接 {%s} 的 EOF 关闭行有 %d 行，期望 1 行", cliAddr, k)
 	}
-	m.expectPipeFDs(t, d, "连接对释放之后")
+	m.expectPipeFDs(t, m.waitPipesClosed(t), "连接对释放之后")
 }
 
 // fillFDHoles 向 listen（后端 be，空闲连接只连不发）建空闲连接，直到 tinymapper 在最高的已打开 fd 以下没有空闲 fd（每条连接占最小的两个
@@ -3746,6 +3846,7 @@ func TestSplicePipeSize(t *testing.T) {
 // tinymapper 打开 /proc/sys/fs/pipe-max-size 时经 SECCOMP_IOCTL_NOTIF_ADDFD 换成测试写的文件；之后的 F_SETPIPE_SZ 照常执行（容器里的
 // tinymapper 有 CAP_SYS_RESOURCE，1 MiB 以内都能扩）。双向各 8 MiB 后按 checkPipes 核对新 pipe 的容量 size：
 //   - warn：--pipe-size 1024，EPERM，上限 131072：一行 warn 报出 1024、128、128 KiB，新 pipe 都请求、实际 128 KiB；
+//   - warn-600：--pipe-size 600，EPERM，上限 524288：探测请求取整后的 1 MiB，warn 报的是给的 600 KiB（以前报取整后的 1024），512 KiB；
 //   - default-info：不给 --pipe-size，EPERM，上限 131072：默认值降到上限只记一行 info（审查 L4，同 D40），没有 warn，128 KiB；
 //   - max-equal：1024，EPERM，上限恰为 1048576：不降（比较是 >），没有那一行，仍为 1 MiB；
 //   - unreadable：1024，EPERM，打开 pipe-max-size 返回 ENOENT：不降，仍为 1 MiB；
@@ -3773,6 +3874,7 @@ func TestSplicePipeSizeProbe(t *testing.T) {
 		line    string
 	}{
 		{"warn", []string{"--pipe-size", "1024"}, 1 << 20, syscall.EPERM, "131072\n", 1, 128 << 10, "[WARN]", capWarn},
+		{"warn-600", []string{"--pipe-size", "600"}, 1 << 20, syscall.EPERM, "524288\n", 1, 512 << 10, "[WARN]", "--pipe-size 600 KiB is above fs.pipe-max-size (512 KiB) and CAP_SYS_RESOURCE is missing, using 512 KiB"},
 		{"default-info", nil, 256 << 10, syscall.EPERM, "131072\n", 1, 128 << 10, "[INFO]", capInfo},
 		{"max-equal", []string{"--pipe-size", "1024"}, 1 << 20, syscall.EPERM, "1048576\n", 1, 1 << 20, "", ""},
 		{"unreadable", []string{"--pipe-size", "1024"}, 1 << 20, syscall.EPERM, "", 1, 1 << 20, "", ""},

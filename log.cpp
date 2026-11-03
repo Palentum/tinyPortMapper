@@ -14,6 +14,7 @@ void log0(const char * file,const char * function,int line,int level,const char*
 
 	//级别由调用它的宏判断：mylog 按 log_level 过滤，mylog_unfiltered 只排除 log_never
 	if(level>log_trace||level<0) return ;
+	int saved_errno=errno;//不改 errno：调用方可以记完日志再按 errno 分支（localtime_r 首次载入时区、写 stdout 失败都会改它）
 
 
 	//时间戳和各级别的"颜色[时间][级别]"前缀按秒缓存，每个线程一份（M2，L6：主线程与各 worker 线程都写日志，DNS 线程不写）。
@@ -74,6 +75,7 @@ void log0(const char * file,const char * function,int line,int level,const char*
 	//文件、管道、journald 等在缓冲写满时写出，其余由主线程的 main_timer_cb 每 timer_interval 刷新，myexit 退出前也会刷新
 	if(stdout_is_tty)
 		fflush(stdout);
+	errno=saved_errno;
 }
 
 void log_bare(int level,const char* str, ...)

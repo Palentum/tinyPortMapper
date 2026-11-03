@@ -184,6 +184,50 @@ func TestHelpOutput(t *testing.T) {
 	}
 }
 
+// --disable-color 在 -h 之前之后都生效：-h 在颜色预扫描之后处理，myexit 不在帮助末尾补颜色复位码（以前 -h 先于预扫描，输出以 "\x1b[0m" 结尾）
+func TestHelpNoColor(t *testing.T) {
+	t.Parallel()
+	for _, args := range [][]string{{"--disable-color", "-h"}, {"--help", "--disable-color"}} {
+		out, err := exec.Command(mapperBin, args...).Output()
+		if err != nil {
+			t.Fatalf("%v 退出状态异常：%v", args, err)
+		}
+		if !strings.Contains(string(out), "-h,--help") || strings.Contains(string(out), "\x1b[") {
+			t.Errorf("%v：帮助文本不完整或带颜色控制码（%d B），末尾 %q", args, len(out), out[max(0, len(out)-16):])
+		}
+	}
+}
+
+// 配置文件 stat 得到却打不开（非 root 读属主 root 的 0600 文件）：fatal 行带上 errno（以前是 "<path>:0: path: failed to open config file"，
+// 看不出原因）。文件直接建在 /tmp：t.TempDir() 的目录是 0700，uid 65534 在 stat 时就 EACCES，走的是 "cannot be accessed"
+func TestConfigOpenError(t *testing.T) {
+	t.Parallel()
+	if os.Getuid() != 0 {
+		t.Skip("要以 root 运行：以 uid 65534 启动 tinymapper，读 root 的 0600 文件")
+	}
+	f, err := os.CreateTemp("/tmp", "mapper-*.toml") // 0600
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Remove(f.Name()) })
+	if _, err := fmt.Fprintf(f, "[[endpoints]]\nlisten = %q\nremote = %q\n", loopback4(t), loopback4(t)); err != nil {
+		t.Fatal(err)
+	}
+	f.Close()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, mapperBin, mapperArgv("-c", f.Name())...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: 65534, Gid: 65534}}
+	out, err := cmd.CombinedOutput()
+	var ee *exec.ExitError
+	if !errors.As(err, &ee) || ctx.Err() != nil {
+		t.Fatalf("退出状态 %v，期望非零：\n%s", err, out)
+	}
+	if want := "[FATAL]config file " + f.Name() + " cannot be opened, 13:Permission denied"; !strings.Contains(string(out), want) {
+		t.Fatalf("输出中没有 %q：\n%s", want, out)
+	}
+}
+
 // C1：libev 只编入 epoll（修复前 musl 构建回落到 poll），信号通知用 eventfd 而不是 pipe
 func TestEventBackend(t *testing.T) {
 	t.Parallel()
@@ -371,6 +415,20 @@ func TestConfigEquivalence(t *testing.T) {
 			}
 			if !udpRefused(t, listen) || listening(m.pid(), "udp", portOf(listen)) {
 				t.Fatalf("%s：未启用 UDP 时不应监听 UDP", listen)
+			}
+		}
+	})
+	// D123：文件开头的一个 UTF-8 BOM（Windows 编辑器常加）丢掉后照常解析，第 1 行是节头、注释还是空行都一样（以前报
+	// "1: key: missing '=' after key"）；文件中间的与连着的第二个仍报错，见 TestConfigInvalid 的 toml_bom_*
+	t.Run("utf8_bom", func(t *testing.T) {
+		t.Parallel()
+		remote := balancedBackends(t, 1)[0]
+		for _, first := range []string{"[[endpoints]]\n", "# c\n[[endpoints]]\n", "\n[[endpoints]]\n"} {
+			listen := loopback4(t)
+			cfg := writeConfig(t, fmt.Sprintf("\uFEFF%slisten = %q\nremote = %q\n", first, listen, remote))
+			startMapper(t, listenPoints("t", portOf(listen)), "-c", cfg)
+			if got := readLine(t, dial(t, listen)); got != "0" {
+				t.Fatalf("BOM 之后第 1 行为 %q：TCP 连到 %q", first, got)
 			}
 		}
 	})
@@ -565,7 +623,7 @@ func TestConfigInvalid(t *testing.T) {
 		{"cli_log_level_negative", []string{"-l", l, "-r", r1, "-t", "--log-level", "-1"}, "", "invalid log_level"},
 		// 没给值：getopt_long 把下一个参数 -t 当作值，预扫描也一样
 		{"cli_log_level_no_value", []string{"-l", l, "-r", r1, "--log-level", "-t"}, "", "invalid log_level"},
-		{"cli_config_missing", []string{"-c", filepath.Join(dir, "missing.toml")}, "", "cannot be accessed"},
+		{"cli_config_missing", []string{"-c", filepath.Join(dir, "missing.toml")}, "", "cannot be accessed, 2:No such file or directory"},
 		{"cli_config_dir", []string{"-c", dir}, "", "must be a regular file"},
 		{"toml_empty", []string{"-c", "CFG"}, "# 只有注释\n", "at least one [[endpoints]]"},
 		{"toml_missing_listen", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nremote = %q\n", r1), "listen: missing required endpoint key"},
@@ -577,6 +635,9 @@ func TestConfigInvalid(t *testing.T) {
 		{"toml_unknown_section", []string{"-c", "CFG"}, "[log]\n" + ep(""), "unknown or unsupported section"},
 		{"toml_key_outside_section", []string{"-c", "CFG"}, "no_tcp = false\n" + ep(""), "key appears outside"},
 		{"toml_missing_equal", []string{"-c", "CFG"}, ep("no_tcp\n"), "missing '=' after key"},
+		// D123 只丢文件开头的一个 BOM：第 2 行开头的、开头连着的第二个照旧当作 key 的一部分
+		{"toml_bom_line2", []string{"-c", "CFG"}, "# c\n\uFEFF" + ep(""), "mapper.toml:2: key: missing '=' after key"},
+		{"toml_bom_twice", []string{"-c", "CFG"}, "\uFEFF\uFEFF" + ep(""), "mapper.toml:1: key: missing '=' after key"},
 		{"toml_bad_bool", []string{"-c", "CFG"}, ep("use_udp = yes\n"), "expected boolean literal"},
 		{"toml_unquoted_string", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = %s\nremote = %q\n", l, r1), "expected double quoted string"},
 		{"toml_unterminated_string", []string{"-c", "CFG"}, fmt.Sprintf("[[endpoints]]\nlisten = \"%s\nremote = %q\n", l, r1), "unterminated double quoted string"},

@@ -32,25 +32,17 @@
 
 using  namespace std;
 
-typedef unsigned long long u64_t;   //this works on most platform,avoid using the PRId64
-typedef long long i64_t;
-
-typedef unsigned int u32_t;
-typedef int i32_t;
-
 int disable_tcp_nodelay=0;
 //--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe。splice 本身不可用时由碰到的 worker 运行期置 1（审查 L1），各 worker 都读：relaxed 原子（M2）
 std::atomic<int> disable_splice(0);
-int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
+int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优；UDP 会话 socket 才用 *BUFFORCE（D38 修订；--udp-gro 时的发送缓冲见 listen_fd_buf_size）；tcp_unshrink_sndbuf 不动（D54）
 //--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
 //（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时各 worker 的 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲（D114：监听开不了的 worker 也挂）
 int udp_gro=0;
 
-int max_pending_packet=0;
-
 static app_config_t app_config;
 
-int listen_fd_buf_size=2*1024*1024;//UDP 监听 socket 的 SO_SNDBUF/SO_RCVBUF，--udp-listen-buf
+int listen_fd_buf_size=2*1024*1024;//UDP 监听 socket 的 SO_SNDBUF/SO_RCVBUF，--udp-listen-buf；--udp-gro 且它大于 socket_buf_size 时也是 UDP 会话 socket 的 SO_SNDBUF，有权限时 FORCE（D44）
 static const u32_t dns_refresh_interval=30000;
 //DNS 线程数取引用的域名个数，最多这么多（D108）：getaddrinfo 没有截止时间（glibc 的 TCP 回退可能永远不返回），一个线程只卡一个域名
 static const int dns_thread_max=4;
@@ -76,8 +68,6 @@ static const size_t worker_stack_size=256*1024;//musl 1.1.16（OpenWRT SDK）默
 //比它小时内核把 MSS 截到窗口（tcp_bound_to_half_wnd），也不会在窗口边沿切出小段。更大的第一次写入可能被没对齐 MSS 的窗口边沿
 //切出一个小段（如后端接收缓冲 8 KiB 时初始窗口 7240、路径 MSS 1388），尾段就要等这个小段的 ACK
 static const int nodelay_first_max=536;
-
-int VVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVVV;
 
 //侵入式双链表（T9）：节点就是连接对象本身（继承 lru_node_t），表头最近活动、表尾最久未活动；挂入、挪动、摘除都不分配内存、不查哈希
 struct lru_collector_t:not_copy_able_t
@@ -159,7 +149,7 @@ struct lru_collector_t:not_copy_able_t
 	}
 };
 
-//ASan 构建：池里空闲的对象和缓冲标为不可访问（T11）。对象常在同一轮被下一个连接取走，漏了 ev_io_stop 时多数先触发 libev 的 corrupted watcher 断言，没被复用时才报 use-after-poison
+//ASan 构建：池里空闲的对象和缓冲标为不可访问（T11）：归还之后、被复用之前再访问（悬空指针）时报 use-after-poison。漏了 ev_io_stop 时 obj_pool_t::put() 的常开检查（X1，D30）在归还时就中止
 #ifdef __SANITIZE_ADDRESS__
 extern "C" void __asan_poison_memory_region(void const volatile *addr, size_t size);
 extern "C" void __asan_unpoison_memory_region(void const volatile *addr, size_t size);
@@ -220,7 +210,7 @@ static void __attribute__((noinline,cold)) pool_put_busy_abort()
 }
 
 static const int obj_pool_slab_objs=64;
-//连接对象池（T11）：一次 malloc 64 个对象（slab），释放的对象进空闲链表，建连先从链表取，热路径上不调 malloc；slab 不归还，保留量为全部规则连接数的峰值向上取整到 64。
+//连接对象池（T11）：一次 malloc 64 个对象（slab），释放的对象进空闲链表，建连先从链表取，热路径上不调 malloc；每个 worker 各一个池（M1），slab 不归还，保留量为本 worker 全部规则连接数的峰值向上取整到 64，进程合计是各 worker 的峰值之和。
 //取出时就地重新构造，状态与新对象相同（LRU 的 prev/next 为 0，watcher 清零，对 ev_io_stop 等价于 ev_init）。归还前两个 watcher 都要 ev_io_stop：
 //它同时清除本轮还没回调的事件，归还后同一轮里后面 accept 的连接就可能取走这块内存（T10）
 template<class T> struct obj_pool_t
@@ -431,7 +421,7 @@ static void tcp_pipe_probe()
 	int page=(int)sysconf(_SC_PAGESIZE);
 	tcp_pipe_min_size=16*page;
 	//内核把 F_SETPIPE_SZ 的大小向上取到 2 的幂页数（如 300 KiB → 512 KiB），先按同样规则取整：探测没设成功时读上限与每回调预算也与之后的 pipe 一致（审查 L2）
-	int pages=1;
+	int pages=1,requested=tcp_pipe_size;//降到上限时日志报取整前的值
 	while(pages*page<tcp_pipe_size) pages*=2;
 	tcp_pipe_size=pages*page;
 	int fds[2];
@@ -454,7 +444,7 @@ static void tcp_pipe_probe()
 				if(max_size>0&&tcp_pipe_size>max_size)
 				{
 					mylog(pipe_size_explicit?log_warn:log_info,"%s %d KiB is above fs.pipe-max-size (%d KiB) and CAP_SYS_RESOURCE is missing, using %d KiB\n",
-						pipe_size_explicit?"--pipe-size":"default pipe size",tcp_pipe_size/1024,max_size/1024,max_size/1024);
+						pipe_size_explicit?"--pipe-size":"default pipe size",requested/1024,max_size/1024,max_size/1024);
 					tcp_pipe_size=max_size;
 				}
 			}
@@ -822,7 +812,7 @@ static void udp_hash_seed_init()
 static const u32_t udp_table_min_cap=64;
 //客户端地址 → UDP 会话（U2）：开放寻址、线性探测，容量是 2 的幂，最多装到 3/4。槽里存会话指针和键的哈希：探测时先比哈希，
 //不读别的会话对象；扩容时按存下的哈希重新放，不重算。删除用后移（backward shift），没有墓碑。容量从 64 起按需翻倍、不缩
-//（同对象池的 slab），每条规则最多 max_conn_num 个会话，即最多 32768 槽（LP64 512 KiB）
+//（同对象池的 slab）。每条规则在每个 worker 各一张表（M1），max_conn_num 按规则在所有 worker 合计（M4）：一张表最多 32768 槽（LP64 512 KiB），一条规则 N 个 worker 合计最多 N 倍
 struct udp_table_t:not_copy_able_t
 {
 	struct slot_t
@@ -854,7 +844,7 @@ struct udp_table_t:not_copy_able_t
 		if(slots!=0&&(u32_t)(cnt+1)*4<=(mask+1)*3) return 0;
 		return grow();
 	}
-	int __attribute__((noinline)) grow()//不内联进 udp_accept_cb
+	int __attribute__((noinline)) grow()//扩容少见，不内联进 udp_new_session
 	{
 		u32_t cap=slots?mask+1:0;
 		u32_t new_cap=cap?cap*2:udp_table_min_cap;
@@ -1302,12 +1292,11 @@ static void dns_worker_main()
 		char err[dns_error_len];
 		int ret=resolve_domain_addresses(request.host,port,addrs,dns_max_result,addr_count,err,sizeof(err),&find[0],&found[0],n);
 
-		std::vector<dns_refresh_result_t> results(n);
+		std::vector<dns_refresh_result_t> results(n);//值初始化：各项先清零（err 只在失败时写）
 		for(int k=0;k<n;k++)
 		{
 			const dns_refresh_entry_t &entry=request.entries[k];
 			dns_refresh_result_t &result=results[k];
-			memset(&result,0,sizeof(result));
 			result.rule_index=entry.rule_index;
 			result.remote_index=entry.remote_index;
 			snprintf(result.host,sizeof(result.host),"%s",request.host);
@@ -1370,7 +1359,7 @@ static void dns_apply_result(dns_refresh_result_t &result)
 
 	if(result.ok==0)
 	{
-		mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",t->rule_index,t->remote_index,t->host,t->port,result.err);
+		mylog(log_warn,"rule %d remote %d domain %s:%u resolve failed: %s, keeping current address\n",t->rule_index,t->remote_index+1,t->host,t->port,result.err);//remote 与 rule 一样从 1 编号（D125）
 		return;
 	}
 	if(result.current_still_valid)
@@ -1465,7 +1454,7 @@ static void worker_dns_update(worker_t &w,const worker_msg_t &m)
 		target.gen++;
 		int closed[2],kept[2];
 		remote_sweep(rule,m.remote_index,closed,kept);
-		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",rule.index,m.remote_index,target.host,target.port,old_addr,new_addr,closed[0],closed[1],kept[0],kept[1]);
+		mylog(log_info,"rule %d remote %d domain %s:%u changed from %s to %s, closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",rule.index,m.remote_index+1,target.host,target.port,old_addr,new_addr,closed[0],closed[1],kept[0],kept[1]);//remote 从 1 编号（D125）
 		return;
 	}
 }
@@ -1672,7 +1661,6 @@ static int tcp_splice_err_is_sock(int fd)
 //对它直接 ADD，fd 仍在 epoll 中时就成了 ADD（EEXIST）再 MOD（T13）
 void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 {
-	//mylog(log_info,"[tcp]tcp_cb called \n");
 	tcp_pair_t &tcp_pair=*(tcp_pair_t *)watcher->data;
 	DEBUG_ASSERT(tcp_pair.owner!=0);
 	conn_manager_tcp_t &conn_manager_tcp=tcp_pair.owner->tcp_manager;
@@ -1688,7 +1676,7 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	}
 	if((revents&(EV_READ|EV_WRITE))==0)
 	{
-		mylog(log_fatal,"[tcp]got unexpected event,events[idx].events=%x\n",(u32_t)revents);
+		mylog(log_fatal,"[tcp]got unexpected event,revents=%x\n",(u32_t)revents);
 		myexit(-1);
 	}
 
@@ -1713,8 +1701,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	int other_fd=other_info.fd;
 
 	DEBUG_ASSERT(watcher->fd==my_fd);
-
-	//zdmylog(log_info,"[tcp]my_fd=%d,other_fd=%d \n",my_fd,other_fd);
 
 	//上游建连中（CONNECTING）：watcher 同时等读写。建连失败时 EPOLLERR/EPOLLHUP 被 libev 报成读写同时就绪，
 	//只报可写就是连上了；报了可读（失败，或连上后已有数据、FIN、RST）才用 SO_ERROR 区分
@@ -1768,10 +1754,11 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 	if( (revents & EV_READ) !=0  )
 	{
-		mylog(log_trace,"[tcp]events[idx].events & EPOLLIN !=0 \n");
+		mylog(log_trace,"[tcp]revents & EV_READ !=0\n");
+		//libev 只报 watcher 登记了的事件，别处改 events 都经 ev_io_stop（同时清掉本轮还没回调的事件）：这里与写分支开头的同样检查只防本回调里摘掉了 EV_READ/EV_WRITE 却没清 revents
 		if((my_info.ev.events&EV_READ) ==0)
 		{
-			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLIN) ==0 \n");
+			mylog(log_debug,"[tcp]out of date event, (my_info.ev.events&EV_READ) ==0\n");
 			return;
 		}
 		DEBUG_ASSERT(my_info.data_len==0&&my_info.buf==0&&my_info.pipe.r<0);
@@ -1798,8 +1785,8 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				{
 					//splice 本身不可用（如 seccomp 白名单里没有它）：什么都没读，整个进程改走拷贝（审查 L1）。
 					//这条连接的待决错误不算（D110）：落到下面按读出错关闭（这时再 recv 只会读到 0）
-					mylog(log_warn,"[tcp]splice failed (%s), forwarding all TCP by copy from now on\n",get_sock_error());
-					disable_splice.store(1,memory_order_relaxed);
+					if(!disable_splice.exchange(1,memory_order_relaxed))//几个 worker 同时碰到时只由把它从 0 换成 1 的记 warn（D128）
+						mylog(log_warn,"[tcp]splice failed (%s), forwarding all TCP by copy from now on\n",get_sock_error());
 					spliced=0;
 				}
 			}
@@ -1864,7 +1851,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 			return;
 		}
 		conn_manager_tcp.lru.update(&tcp_pair);
-		//tcp_pair.last_active_time=get_current_time();
 
 		my_info.splice_next=(recv_len>=splice_read_min);
 		my_info.data_len=recv_len;
@@ -1943,27 +1929,15 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 
 		if(my_info.data_len!=0)
 		{
-
-			//epoll_event ev;
-
-			//ev=other_info.ev;
-			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, other_fd, &ev);
-			//assert(ret==0);
 			if(other_info.connected)
 			{
 				ev_io_stop(loop, &other_info.ev);
 				other_info.ev.events|=EV_WRITE;
 				ev_io_start(loop, &other_info.ev);
 			}
-
-
-			//ev=my_info.ev;
-			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, my_fd, &ev);
-			//assert(ret==0);
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_READ;
 			ev_io_start(loop, &my_info.ev);
-
 		}
 
 	}
@@ -1971,11 +1945,11 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	//那个方向的源端也一直停读。读分支提前返回的路径（半关闭、过时事件）上本侧已不再等读，下一轮只报写，最多推迟一轮
 	if( (revents & EV_WRITE) !=0)
 	{
-		mylog(log_trace,"[tcp]events[idx].events & EPOLLOUT !=0\n");
+		mylog(log_trace,"[tcp]revents & EV_WRITE !=0\n");
 
 		if( (my_info.ev.events&EV_WRITE) ==0)
 		{
-			mylog(log_debug,"[tcp]out of date event, my_info.ev.events&EPOLLOUT) ==0 \n");
+			mylog(log_debug,"[tcp]out of date event, (my_info.ev.events&EV_WRITE) ==0\n");
 			return;
 		}
 
@@ -2019,8 +1993,6 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		}
 		conn_manager_tcp.lru.update(&tcp_pair);
 
-		//tcp_pair.last_active_time=get_current_time();
-
 		mylog(log_trace,"[tcp]fd=%d send len=%d\n",my_fd,send_len);
 		other_info.data_len-=send_len;
 		conn_manager_tcp.bytes[dir]+=send_len;
@@ -2040,31 +2012,18 @@ void tcp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 				other_info.buf=0;
 			}
 
-			//ev=my_info.ev;
-			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, my_fd, &ev);
-			//assert(ret==0);
 			ev_io_stop(loop, &my_info.ev);
 			my_info.ev.events&=~EV_WRITE;
 			ev_io_start(loop, &my_info.ev);
 
 			DEBUG_ASSERT((other_info.ev.events & EV_READ)==0);
-
-
-
-			//ev=other_info.ev;
-			//ret = epoll_ctl(epollfd, EPOLL_CTL_MOD, other_fd, &ev);
-			//assert(ret==0);
 			ev_io_stop(loop, &other_info.ev);
 			other_info.ev.events|=EV_READ;
 			ev_io_start(loop, &other_info.ev);
 		}
-		else
-		{
-			//keep waitting for EPOLLOUT;
-		}
 	}
 }
-//接受一个连接；返回 0 表示本轮到此为止（backlog 已空、accept 失败，或上游 connect 立即失败）
+//接受一个连接；返回 0 表示本轮到此为止（backlog 已空、accept 失败，或上游 connect 立即失败）。accept 遇到 EMFILE/ENFILE 而 tcp_pipe_trim 关掉了空闲 pipe 时返回 1，同一轮接着 accept（D52）
 static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 {
 	forward_rule_t *rule=(forward_rule_t *)watcher->data;
@@ -2073,11 +2032,6 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	worker_t &w=*rule->worker;
 	int ret;
 	int local_listen_fd_tcp=watcher->fd;
-	/*if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
-	{
-		mylog(log_error,"[tcp]EPOLLERR or EPOLLHUP from listen_fd events[idx].events=%x \n",events[idx].events);
-		//if there is an error, we will eventually get it at accept()
-	}*/
 
 	socklen_t tmp_len = sizeof(address_t::storage_t);
 	address_t::storage_t tmp_sockaddr_in={0};
@@ -2089,7 +2043,7 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	{
 		int err=errno;
 		if(err==EAGAIN||err==EWOULDBLOCK) return 0;//backlog 已取空，是一轮的正常结束，不记日志
-		mylog(log_warn,"[tcp]accept failed %d %s\n", new_fd,get_sock_error());
+		mylog(log_warn,"[tcp]accept failed on rule %d listen %s, %s\n",rule->index,rule->local_addr.get_str(),get_sock_error());
 		//fd 用完时先关掉空闲 pipe，关掉了就接着 accept（客户端还在 backlog 里），否则按 C6 停到下一个周期（D52）
 		if((err==EMFILE||err==ENFILE)&&tcp_pipe_trim(w)>0) return 1;
 		if(err!=EINTR&&err!=ECONNABORTED)
@@ -2110,7 +2064,6 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 		mylog(log_warn,"[tcp]new connection from {%s},but ignored,bc of max_conn_num reached\n",tmp_addr.get_str());
 		close(new_fd);
 		return 1;
-		//continue;
 	}
 	//先取对象再建上游 socket：分配失败时上游看不到这次连接，也不推进 roundrobin
 	tcp_pair_t *new_pair=w.tcp_pair_pool.get();
@@ -2177,28 +2130,14 @@ static int tcp_accept_one(struct ev_loop *loop, struct ev_io *watcher)
 	tcp_pair.remote.connected=(ret==0);
 
 	tcp_pair.local.fd=new_fd;
-	//tcp_pair.local.ev.events=EV_READ;
 	tcp_pair.local.ev.data=&tcp_pair;
 
 	tcp_pair.remote.fd=new_remote_fd;
-	//tcp_pair.remote.ev.events=EV_READ;
 	tcp_pair.remote.ev.data=&tcp_pair;
 	tcp_pair.remote.nodelay_wait=!disable_tcp_nodelay;//TCP_NODELAY 由 nodelay_before_send 在 send 之前设（T15）
 
-	conn_manager_tcp.lru.update(&tcp_pair);
-	//tcp_pair.last_active_time=get_current_time();
-
-	//epoll_event ev;
-
-	//ev=tcp_pair.local.ev;
-	//ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, new_fd, &ev);
-	//assert(ret==0);
 	ev_io_init (&tcp_pair.local.ev, tcp_cb, new_fd, EV_READ);
 	ev_io_start(loop, &tcp_pair.local.ev);
-
-	//ev=tcp_pair.remote.ev;
-	//ret = epoll_ctl(epollfd, EPOLL_CTL_ADD, new_remote_fd, &ev);
-	//assert(ret==0);
 
 	//建连中同时等读写，由 tcp_cb 判定建连结果
 	ev_io_init (&tcp_pair.remote.ev, tcp_cb, new_remote_fd, tcp_pair.remote.connected?EV_READ:EV_READ|EV_WRITE);
@@ -2213,8 +2152,8 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		mylog(log_warn,"[tcp]accept watcher of listen fd %d got EV_ERROR\n",watcher->fd);
 		return ;
 	}
-	//一直 accept 到 backlog 为空，每轮循环最多 max_accept_per_round 个（D13）：其他 watcher 每轮只做一次收发，
-	//而每个新连接要做 accept、socket、connect 等十来次 syscall，上限决定建连突发时事件循环一轮停多久
+	//一直 accept 到 backlog 为空，每轮循环最多 max_accept_per_round 个（D13）：每个新连接要做 accept、socket、connect 等十来次 syscall，
+	//上限决定建连突发时事件循环一轮停多久（D13 实测 8 个最长约 0.2 ms）
 	for(int i=0;i<max_accept_per_round;i++)
 	{
 		if(!tcp_accept_one(loop,watcher)) break;
@@ -2222,7 +2161,7 @@ void tcp_accept_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 }
 
 //一个 worker 每个定时器周期要做的事（M1）：清空闲连接、再查 DNS 旧地址上留下的连接（remote_sweep）、重启被停掉的监听 watcher、
-//pipe 池标志复位与重扩。由 worker 自己 loop 上的定时器调用（L7）
+//pipe 池标志复位与重扩，splice 运行期不可用之后关掉空闲 pipe 与 scratch pipe（D128）。由 worker 自己 loop 上的定时器调用（L7）
 static void worker_tick(worker_t &w)
 {
 	my_time_t now=w.clock.now();
@@ -2237,7 +2176,7 @@ static void worker_tick(worker_t &w)
 			int closed[2],kept[2];
 			remote_sweep(*it,(int)r,closed,kept);
 			if(closed[0]+closed[1]>0)
-				mylog(log_info,"rule %d remote %d domain %s:%u old address check: closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",it->index,(int)r,target.host,target.port,closed[0],closed[1],kept[0],kept[1]);
+				mylog(log_info,"rule %d remote %d domain %s:%u old address check: closed unresponsive tcp=%d udp=%d, kept tcp=%d udp=%d\n",it->index,(int)r+1,target.host,target.port,closed[0],closed[1],kept[0],kept[1]);//remote 从 1 编号（D125）
 		}
 		if(it->enable_tcp&&!ev_is_active(&it->tcp_accept_watcher))
 		{
@@ -2255,6 +2194,11 @@ static void worker_tick(worker_t &w)
 	{
 		w.tcp_pipe_pool.quota_hit=0;
 		while(w.tcp_pipe_pool.free_cnt>w.tcp_pipe_pool.max_free) w.tcp_pipe_pool.discard(w.tcp_pipe_pool.free_pipes[--w.tcp_pipe_pool.free_cnt]);
+	}
+	if(disable_splice.load(memory_order_relaxed))//splice 运行期不可用（审查 L1）之后不再取 pipe：空闲的与 scratch 关掉，方向持有的排空还回来后下一周期关（D128；--disable-splice 时本来就没有）
+	{
+		while(w.tcp_pipe_pool.free_cnt>0) w.tcp_pipe_pool.discard(w.tcp_pipe_pool.free_pipes[--w.tcp_pipe_pool.free_cnt]);
+		if(w.tcp_pipe_scratch.r>=0) w.tcp_pipe_pool.discard(w.tcp_pipe_scratch);
 	}
 	if(w.tcp_pipe_pool.resize_fail!=0&&w.tcp_pipe_scratch.r>=0) w.tcp_pipe_pool.regrow(w.tcp_pipe_scratch);
 }
@@ -2294,15 +2238,6 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		conn_manager_udp.erase(&udp_pair);
 		return;
 	}
-	//assert(conn_manager.exist_fd(udp_fd));
-	//if(!conn_manager.exist_fd(udp_fd)) continue;
-
-	/*
-	if((events[idx].events & EPOLLERR) !=0 ||(events[idx].events & EPOLLHUP) !=0)
-	{
-		mylog(log_warn,"[udp]EPOLLERR or EPOLLHUP from udp_remote_fd events[idx].events=%x \n",events[idx].events);
-
-	}*/
 
 	udp_batch_t &b=udp_pair.owner->worker->udp_batch;
 	DEBUG_ASSERT(b.rn<udp_batch_max);//批满时当场就发出了
@@ -2323,7 +2258,7 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 		if(udp_gro) b.gso[i]=udp_recv_ctrl(b.rin[i].msg_hdr,0,b.addr[i]);
 		if(b.rin[i].msg_hdr.msg_flags&MSG_TRUNC)
 		{
-			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",udp_pair.adress.get_str(),max_data_len_udp);
+			mylog(log_warn,"[udp]huge packet for {%s}, data_len > %d,dropped\n",udp_pair.adress.get_str(),max_data_len_udp);
 			b.rrule[i]=0;
 			continue;
 		}
@@ -2345,10 +2280,9 @@ void udp_cb(struct ev_loop *loop, struct ev_io *watcher, int revents)
 	b.rn+=n;
 	conn_manager_udp.lru.update(&udp_pair);
 	udp_pair.unans=0;//收到回包：上游还在应答（remote_sweep）
-	//udp_pair.last_active_time=get_current_time();
 	if(b.rn==udp_batch_max) udp_flush_return(b);
 }
-//客户端 tmp_addr 的第一个包：建会话。失败时返回 0，这个包丢弃；hash 是 find() 算出的 tmp_addr 的哈希。不内联进逐包的循环
+//客户端 tmp_addr 的第一个包：建会话。失败时返回 0，这个包丢弃；hash 是 find() 算出的 tmp_addr 的哈希。不内联进逐包的循环。建不成的日志同 TCP 记 warn（D124）
 static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *loop,forward_rule_t *rule,address_t &tmp_addr,u32_t hash)
 {
 	conn_manager_udp_t &conn_manager_udp=rule->udp_manager;
@@ -2358,14 +2292,14 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	if(conn_manager_udp.conns->fetch_add(1,memory_order_relaxed)>=max_conn_num)
 	{
 		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
-		mylog(log_info,"[udp]new connection from {%s},but ignored,bc of max_conv_num reached\n",tmp_addr.get_str());
+		mylog(log_warn,"[udp]new connection from {%s},but ignored,bc of max_conn_num reached\n",tmp_addr.get_str());
 		return 0;
 	}
 	//会话表要扩容时在选上游、建 socket 之前做：失败只丢这个包，轮询序号不前进
 	if(conn_manager_udp.sessions.reserve_one()!=0)
 	{
 		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
-		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+		mylog(log_warn,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 		return 0;
 	}
 	int remote_index=select_remote_index(*rule,tmp_addr);
@@ -2381,7 +2315,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 			w.udp_new_blocked=1;
 			mylog(log_warn,"[udp]new connection from {%s},but no free local port or fd for udp fd (%s),not creating udp sessions until the next timer tick\n",tmp_addr.get_str(),get_sock_error());
 		}
-		else mylog(log_info,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
+		else mylog(log_warn,"[udp]new connection from {%s} ,but create udp fd failed\n",tmp_addr.get_str());
 		return 0;
 	}
 	//U5：回包经网卡时也聚合；失败时这个会话只是收不到合并包
@@ -2392,7 +2326,7 @@ static udp_pair_t * __attribute__((noinline)) udp_new_session(struct ev_loop *lo
 	if(new_pair==0)
 	{
 		conn_manager_udp.conns->fetch_sub(1,memory_order_relaxed);
-		mylog(log_info,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
+		mylog(log_warn,"[udp]new connection from {%s},but malloc for connection objects failed\n",tmp_addr.get_str());
 		close(new_udp_fd);
 		return 0;
 	}
@@ -2634,7 +2568,7 @@ static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &lef
 				pl=pi->cmsg_len;
 				memcpy(udp_ret_pi(sc),pi,pl);
 			}
-			if(l>(size_t)gso)
+			if(l>(size_t)gso)//同 udp_batch_gso：只有一段的块（已关 GSO 时每块都是）不挂 UDP_SEGMENT；三种布局同 udp_ret_set_ctrl
 			{
 				uint16_t v=(uint16_t)gso;
 				memcpy(CMSG_DATA(&sc.hdr),&v,sizeof(v));
@@ -2758,7 +2692,7 @@ static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 			continue;
 		}
 	eagain:
-		//left：udp_send_split 停下的那个合并包还没发的数据报，它本身已算在 sent 之前，所以本组剩下的从 sent+1 起
+		//left 不为 0：udp_send_split 停在 msgs[sent] 这个合并包里（sent 没有前进；返回 -1 时 left 至少为 1），left 是它还没发的数据报，本组其余的包从 sent+1 起；为 0 时 [sent,cnt) 都没发
 		{
 			int dropped=left!=0?left+udp_msgs_segs(msgs,sent+1,cnt):udp_msgs_segs(msgs,sent,cnt);
 			c.mgr.drop[c.dir]+=dropped;
@@ -2827,7 +2761,7 @@ static void udp_forward_batch(struct ev_loop *loop,forward_rule_t *rule,int n)
 
 		if(h.msg_flags&MSG_TRUNC)
 		{
-			mylog(log_warn,"huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
+			mylog(log_warn,"[udp]huge packet from {%s}, data_len > %d,dropped\n",tmp_addr.get_str(),max_data_len_udp);
 			continue;
 		}
 		if(gso<0)
@@ -3173,7 +3107,11 @@ static void *worker_main(void *arg)
 	return 0;
 }
 //有序退出（M6，S8）：通知每个 worker 退出 loop，合计最多等 1 s，再由调用方 myexit。不用 pthread_join：worker 卡住时 SIGTERM 也要能退出，
-//musl 1.1.16 又没有 pthread_timedjoin_np。DNS 线程不等：它可能阻塞在 getaddrinfo 里，_exit 直接结束它
+//musl 1.1.16 又没有 pthread_timedjoin_np。DNS 线程不等：它可能阻塞在 getaddrinfo 里，_exit 直接结束它。
+//例外（审查 I-6、I-7）：截止时间只能用 CLOCK_REALTIME（sem_timedwait 只认它，musl 1.1.16 没有 sem_clockwait），glibc 上等待期间
+//墙钟回拨多少就多等多少、向前跳则提前超时（musl 每次调用换算成相对超时，只受两次调用之间的跳变影响）；stdout 写不出去（读端停止读取）时
+//主线程卡在写 stdout 上（main_timer_cb 的 fflush、退出路径上的日志与 myexit 的 fflush，或等拿着 stdout 锁、卡在 write(1) 里的 worker），
+//SIGTERM/SIGINT 要等读端恢复才退出
 static void workers_stop()
 {
 	for(size_t i=0;i<workers.size();i++)
@@ -3191,9 +3129,10 @@ static void workers_stop()
 		}
 	}
 }
+//接住 SIGPIPE 只为不让它终止进程，不记日志：worker 线程与 DNS 线程屏蔽了它（D62），到这里的只有主线程自己写 stdout 失败（读端已退出）
+//与外部的 kill -PIPE。前者记的日志行写不出去，还会让下一次 main_timer_cb 的 fflush 再失败、再来一次 SIGPIPE，每 400 ms 一轮
 void sigpipe_cb(struct ev_loop *l, ev_signal *w, int revents)
 {
-	mylog(log_info, "got sigpipe, ignored\n");
 }
 
 void sigterm_cb(struct ev_loop *l, ev_signal *w, int revents)
@@ -3680,11 +3619,6 @@ int event_loop()
 	tcp_listen_rules.reserve(app_config.rules.size());
 	udp_listen_rules.reserve(app_config.rules.size());
 
-	if(app_config.rules.empty())
-	{
-		mylog(log_fatal,"no forward rules configured\n");
-		myexit(-1);
-	}
 	rule_shared=new rule_shared_t[app_config.rules.size()];
 	for(size_t i=0;i<app_config.rules.size();i++)
 		if(app_config.rules[i].balance_strategy==balance_strategy_roundrobin)
@@ -3795,6 +3729,11 @@ int event_loop()
 		}
 	}
 	pthread_attr_destroy(&attr);
+	//主线程恢复继承来的屏蔽字，但解除它处理的这三个（D127）：父进程屏蔽了它们时（屏蔽字跨 exec 继承），libev 4.24 的 ev_signal_start 在
+	//flags 为 0 时不解除（只在 EVFLAG_NOSIGMASK 时解除），所有线程都屏蔽着，kill -TERM/-USR1 永远待决。SIGPIPE 屏蔽着也只是待决
+	sigdelset(&old,SIGTERM);
+	sigdelset(&old,SIGINT);
+	sigdelset(&old,SIGUSR1);
 	pthread_sigmask(SIG_SETMASK,&old,0);
 
 	ev_run(loop, 0);
@@ -3805,6 +3744,7 @@ void print_help()
 {
 	char git_version_buf[100]={0};
 	strncpy(git_version_buf,gitversion,10);
+	if(strstr(gitversion,"-dirty")) strcat(git_version_buf,"-dirty");//D126：git describe --dirty 把它加在 40 位哈希之后，截短后补回
 
 	printf("\n");
 	printf("tinyPortMapper\n");
@@ -3850,16 +3790,13 @@ void print_help()
 	printf("    --cpu-affinity                        pin worker i to the i-th usable CPU; above 1 worker, also send each new TCP\n");
 	printf("                                          connection to the worker on the CPU that received it (Linux 4.6+),\n");
 	printf("                                          off by default; needs the NIC's receive queues spread over those CPUs\n");
-	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn \n");
+	printf("    --log-level           <number>        0: never    1: fatal   2: error   3: warn\n");
 	printf("                                          4: info (default)      5: debug   6: trace\n");
 	printf("    --log-position                        enable file name, function name, line number in log\n");
 	printf("    --disable-color                       disable log color\n");
-	printf("    --enable-color                        enable log color, log color is enabled by default on most platforms\n");
+	printf("    --enable-color                        enable log color (on by default, also when stdout is not a terminal)\n");
 	printf("    -h,--help                             print this help message\n");
 	printf("\n");
-
-
-	//printf("common options,these options must be same on both side\n");
 }
 //命令行数值选项的值只认十进制数字：符号、空白、单位后缀、十六进制、空串与超过 INT_MAX 都返回 -1，由调用方按越界报错（D100；
 //sscanf("%d") 会把 "512k" 读成 512、"4294968320" 回绕成 1024）
@@ -3903,14 +3840,6 @@ void process_arg(int argc, char *argv[])
 		print_help();
 		myexit( -1);
 	}
-	for (i = 0; i < argc; i++)
-	{
-		if(strcmp(argv[i],"-h")==0||strcmp(argv[i],"--help")==0)
-		{
-			print_help();
-			myexit(0);
-		}
-	}
 	//日志级别和颜色要在第一行日志之前定下来，所以先用同一张 long_options 单独过一遍 getopt_long：
 	//--log-level=N、缩写、"--" 之后不再解析、哪个参数被当作选项的值，都与下面的正式解析一致。
 	//在 argv 的副本上做（GNU getopt 会重排 argv，下面回显的仍是原始顺序）；opterr=0，未知选项、缺值等留给正式解析报
@@ -3943,6 +3872,14 @@ void process_arg(int argc, char *argv[])
 		}
 	}
 	opterr=1;
+	for (i = 0; i < argc; i++)//在颜色预扫描之后：--disable-color 时 myexit 不在帮助末尾补 RESET
+	{
+		if(strcmp(argv[i],"-h")==0||strcmp(argv[i],"--help")==0)
+		{
+			print_help();
+			myexit(0);
+		}
+	}
 
     mylog(log_info,"argc=%d ", argc);
 
@@ -3950,12 +3887,6 @@ void process_arg(int argc, char *argv[])
 		log_bare(log_info, "%s ", argv[i]);
 	}
 	log_bare(log_info, "\n");
-
-	if (argc == 1)
-	{
-		print_help();
-		myexit(-1);
-	}
 
 	app_config.rules.clear();
 	const char *config_path=0;
@@ -4137,7 +4068,7 @@ void process_arg(int argc, char *argv[])
 		struct stat st;
 		if(stat(config_path,&st)!=0)
 		{
-			mylog(log_fatal,"config file %s cannot be accessed\n",config_path);
+			mylog(log_fatal,"config file %s cannot be accessed, %s\n",config_path,get_sock_error());
 			myexit(-1);
 		}
 		if(!S_ISREG(st.st_mode))
@@ -4184,9 +4115,8 @@ void process_arg(int argc, char *argv[])
 		forward_rule_config_t rule;
 		rule.enable_tcp=cli_enable_tcp;
 		rule.enable_udp=cli_enable_udp;
-		snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",local_arg);
 		char err[dns_error_len];
-		if(rule.local_addr.from_str(rule.listen_str,err,sizeof(err))!=0)
+		if(rule.local_addr.from_str(local_arg,err,sizeof(err))!=0)
 		{
 			mylog(log_fatal,"-l %s: %s\n",local_arg,err);
 			myexit(-1);
@@ -4215,22 +4145,6 @@ void process_arg(int argc, char *argv[])
 		mylog(log_fatal,"no forward rules configured\n");
 		myexit(-1);
 	}
-}
-
-int unit_test()
-{
-	//lru_cache_t<string,u64_t> cache;
-
-	address_t::hash_function hash;
-	address_t test;
-	test.from_str((char*)"[2001:19f0:7001:1111:00:ff:11:22]:443",0,0);
-	printf("%s\n",test.get_str());
-	printf("%d\n",hash(test));
-	test.from_str((char*)"44.55.66.77:443",0,0);
-	printf("%s\n",test.get_str());
-	printf("%d\n",hash(test));
-
-	return 0;
 }
 
 int main(int argc, char *argv[])
@@ -4274,12 +4188,10 @@ int main(int argc, char *argv[])
     ev_signal_init(&signal_watcher_sigusr1, sigusr1_cb, SIGUSR1);
     ev_signal_start(loop, &signal_watcher_sigusr1);
 
-	//unit_test();
 	assert(sizeof(u64_t)==8);
 	assert(sizeof(i64_t)==8);
 	assert(sizeof(u32_t)==4);
 	assert(sizeof(i32_t)==4);
-	int i, j, k;
 	process_arg(argc,argv);
 	//SIGTERM、SIGINT 解析完参数才交给 libev（D105）：process_arg 里同步解析域名 remote，解析器在 EINTR 后接着等，期间保持默认处置，收到即终止；
 	//之后的启动步骤都很快，信号留到 ev_run 走有序退出。SIGPIPE、SIGUSR1 在上面就接住：它们的默认处置也是终止进程

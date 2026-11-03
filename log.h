@@ -66,7 +66,7 @@ extern int enable_log_color;
 
 void log0(const char * file,const char * function,int line,int level,const char* str, ...) __attribute__((format(printf,5,6)));
 
-void log_bare(int level,const char* str, ...);
+void log_bare(int level,const char* str, ...) __attribute__((format(printf,2,3)));
 
 
 //#endif

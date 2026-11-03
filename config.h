@@ -45,12 +45,7 @@ struct forward_rule_base_t
 
 struct forward_rule_config_t:forward_rule_base_t
 {
-	char listen_str[max_addr_len];
 	vector<remote_target_config_t> remote_targets;
-	forward_rule_config_t()
-	{
-		listen_str[0]=0;
-	}
 };
 
 struct app_config_t
@@ -60,4 +55,4 @@ struct app_config_t
 
 int parse_remote_config_target(const char *str, remote_target_config_t &target, char *err, int err_len);
 int parse_balance_spec(const char *spec, int remote_count, balance_strategy_t &strategy, vector<int> &weights, char *err, int err_len);
-int load_config_file(const char *path, app_config_t &config);
+void load_config_file(const char *path, app_config_t &config);//出错时写 fatal 日志并退出，不返回

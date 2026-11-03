@@ -338,6 +338,36 @@ func TestWorkerThreads(t *testing.T) {
 	})
 }
 
+// D127：父进程屏蔽了 SIGTERM、SIGINT、SIGUSR1 时（屏蔽字跨 exec 继承），主线程恢复继承来的屏蔽字时解除这三个：libev 4.24 的 ev_signal_start
+// 在 flags 为 0 时不解除（与 ev.pod 相反），以前它们在每个线程上都屏蔽着，kill -USR1、-TERM 一直待决。startMapperBlockedSignals 启动后
+// SIGUSR1 照常输出统计（这时主线程已恢复屏蔽字），主线程（TID 等于 pid）的 SigBlk 不含这三个，SIGTERM 记 "got sigterm, exit" 并以 0 退出
+func TestInheritedSignalMask(t *testing.T) {
+	t.Parallel()
+	remote := serveTCP(t, loopback4(t), echoHandler("")).addr
+	listen := loopback4(t)
+	m := startMapperBlockedSignals(t, listenPoints("t", portOf(listen)), "-l", listen, "-r", remote, "-t")
+	mustEcho(t, dial(t, listen), "x")
+	m.statsAfterSignal(t)
+	var three uint64
+	for _, s := range blockedSignals {
+		three |= sigBit(s)
+	}
+	if blk := sigBlk(t, m.pid(), m.pid()); blk&three != 0 {
+		t.Errorf("主线程的 SigBlk=%#x 仍屏蔽着 %#x：继承来的 SIGTERM、SIGINT、SIGUSR1 应当解除（D127）", blk, blk&three)
+	}
+	m.cmd.Process.Signal(syscall.SIGTERM)
+	if m.aliveAfter(2 * time.Second) {
+		t.Fatal("SIGTERM 后 2 s 内未退出")
+	}
+	m.stop(t, true)
+	if m.exitErr != nil {
+		t.Fatalf("SIGTERM 后退出状态异常：%v", m.exitErr)
+	}
+	if k := m.logLines("got sigterm, exit"); k != 1 {
+		t.Fatalf("日志中有 %d 行 \"got sigterm, exit\"，期望 1 行：\n%s", k, m.logTail(5))
+	}
+}
+
 // S2：每条规则在每个 worker 各有一个监听（TCP、UDP 分别），N=2、4。三条规则：IPv4 的 TCP+UDP、IPv6 仅 UDP、双栈 [::] 仅 TCP。
 // 进程的 socket 恰为这些监听（TCP 启动探测用的 socket 已关闭），每条规则都能转发（双栈规则另经 IPv4 连一次）
 func TestWorkerListeners(t *testing.T) {
@@ -717,7 +747,7 @@ func TestWorkerTCPMaxConn(t *testing.T) {
 
 // S7（M4）+ S5（M3）：UDP 的 max_conn_num 按所有 worker 合计，释放会话时名额还回去。N=2，remote 为 /etc/hosts 里的域名
 // （TPM_IN_CONTAINER）。客户端绑固定的源地址与端口（127.0.2.1、127.0.2.2 各 10000 个，端口 1024 起，原因见 TestUDPMaxConn），
-// 顺序建满 20000 个会话，第 20001 个客户端被忽略（一行 max_conv_num 的日志、没有回包），两个 worker 都有会话；旧后端不再回包，
+// 顺序建满 20000 个会话，第 20001 个客户端被忽略（一行 max_conn_num 的日志、没有回包），两个 worker 都有会话；旧后端不再回包，
 // 20000 个客户端各发一包，再改 /etc/hosts 让地址变化，每个 worker 各关掉自己的会话（remote_sweep：两行 changed from，或刷新早于 10 s 时
 // 30 s 后的 old address check 行，closed udp= 之和 20000），会话数归零；20000 个客户端再各发一包：都由新地址的后端回应
 // （会话重建，名额全部还回来了才建得满），第 20001 个仍被忽略
@@ -728,7 +758,7 @@ func TestWorkerUDPMaxConn(t *testing.T) {
 	const maxConn = 20000
 	const perIP, clientPortBase = 10000, 1024
 	const name = "tpm-worker-udpmax.test"
-	const ignored = "but ignored,bc of max_conv_num reached"
+	const ignored = "but ignored,bc of max_conn_num reached"
 	clientAddr := func(i int) *net.UDPAddr {
 		return &net.UDPAddr{IP: net.IPv4(127, 0, 2, byte(1+i/perIP)), Port: clientPortBase + i%perIP}
 	}
@@ -771,7 +801,7 @@ func TestWorkerUDPMaxConn(t *testing.T) {
 		}
 		t.Logf("顺序建立 %d 个 UDP 会话用时 %v", maxConn, time.Since(start).Round(time.Millisecond))
 	}
-	// expectIgnored 让第 20001 个客户端发一包：没有回包，日志里 max_conv_num 的忽略行共 n 行
+	// expectIgnored 让第 20001 个客户端发一包：没有回包，日志里 max_conn_num 的忽略行共 n 行
 	expectIgnored := func(n int) {
 		t.Helper()
 		extra := conns[maxConn]
@@ -780,8 +810,8 @@ func TestWorkerUDPMaxConn(t *testing.T) {
 		}
 		eventually(t, logFlushWithin+ioTimeout, 50*time.Millisecond, func() error {
 			m.fatalIfExited(t, "填满 max_conn_num 后")
-			if k := m.logLines(ignored); k != n {
-				return fmt.Errorf("日志里有 %d 行 max_conv_num 的忽略，期望 %d", k, n)
+			if k := m.logLines("[WARN]", ignored); k != n {
+				return fmt.Errorf("日志里有 %d 行 max_conn_num 的忽略，期望 %d", k, n)
 			}
 			return nil
 		})
@@ -907,7 +937,7 @@ func TestWorkerDNSBroadcast(t *testing.T) {
 		want = append(want, [2]int{w.tcpConns, w.udpSessions})
 	}
 	setLast('3')
-	changed := regexp.MustCompile(`rule 1 remote 0 domain ` + regexp.QuoteMeta(name) + `:\d+ changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
+	changed := regexp.MustCompile(`rule 1 remote 1 domain ` + regexp.QuoteMeta(name) + `:\d+ changed from 127\.0\.0\.2:\d+ to 127\.0\.0\.3:\d+, closed unresponsive tcp=0 udp=0, kept tcp=(\d+) udp=(\d+)$`)
 	var lines [][2]int
 	eventually(t, 50*time.Second, 200*time.Millisecond, func() error {
 		if lines = changedLines(m, changed); len(lines) < n {

@@ -189,7 +189,6 @@ namespace
 		int seen;
 		int has_no_tcp;
 		int has_use_udp;
-		int line;
 		bool no_tcp;
 		bool use_udp;
 		network_config_raw_t()
@@ -197,7 +196,6 @@ namespace
 			seen=0;
 			has_no_tcp=0;
 			has_use_udp=0;
-			line=0;
 			no_tcp=false;
 			use_udp=false;
 		}
@@ -216,8 +214,6 @@ namespace
 		int line_remote;
 		int line_extra_remotes;
 		int line_balance;
-		int line_no_tcp;
-		int line_use_udp;
 		string listen;
 		string remote;
 		vector<string> extra_remotes;
@@ -237,8 +233,6 @@ namespace
 			line_remote=0;
 			line_extra_remotes=0;
 			line_balance=0;
-			line_no_tcp=0;
-			line_use_udp=0;
 			no_tcp=false;
 			use_udp=false;
 		}
@@ -461,7 +455,6 @@ namespace
 			if(endpoint.has_no_tcp) config_fatal(path,line,"no_tcp","duplicate key in [[endpoints]]");
 			endpoint.no_tcp=parse_bool_value(path,line,"no_tcp",value);
 			endpoint.has_no_tcp=1;
-			endpoint.line_no_tcp=line;
 			return;
 		}
 		if(key=="use_udp")
@@ -469,7 +462,6 @@ namespace
 			if(endpoint.has_use_udp) config_fatal(path,line,"use_udp","duplicate key in [[endpoints]]");
 			endpoint.use_udp=parse_bool_value(path,line,"use_udp",value);
 			endpoint.has_use_udp=1;
-			endpoint.line_use_udp=line;
 			return;
 		}
 		config_fatal(path,line,key.c_str(),"unknown key in [[endpoints]]");
@@ -525,7 +517,6 @@ namespace
 			{
 				config_fatal(path,endpoint.line,"no_tcp/use_udp","both tcp and udp are disabled for endpoint");
 			}
-			snprintf(rule.listen_str,sizeof(rule.listen_str),"%s",endpoint.listen.c_str());
 			rule.local_addr=local_addr;
 			rule.remote_targets.reserve(1+endpoint.extra_remotes.size());
 			remote_target_config_t target;
@@ -556,16 +547,13 @@ namespace
 	}
 }
 
-int load_config_file(const char *path, app_config_t &config)
+void load_config_file(const char *path, app_config_t &config)
 {
-	if(path==0 || path[0]==0)
-	{
-		config_fatal("<empty>",0,"path","config path is empty");
-	}
 	ifstream in(path);
-	if(!in.is_open())
+	if(!in.is_open())//调用方已 stat 过、是普通文件：多是 EACCES（非 root 读属主 root 的 0600 文件）
 	{
-		config_fatal(path,0,"path","failed to open config file");
+		mylog(log_fatal,"config file %s cannot be opened, %s\n",path,get_sock_error());
+		myexit(-1);
 	}
 
 	network_config_raw_t network;
@@ -576,6 +564,7 @@ int load_config_file(const char *path, app_config_t &config)
 	while(getline(in,line))
 	{
 		line_no++;
+		if(line_no==1&&line.compare(0,3,"\xEF\xBB\xBF")==0) line.erase(0,3);//UTF-8 BOM（Windows 编辑器常加）：只认文件开头的（D123）
 		string work=strip_comment(path,line_no,line);
 		if(work.empty()) continue;
 		if(work=="[network]")
@@ -585,7 +574,6 @@ int load_config_file(const char *path, app_config_t &config)
 				config_fatal(path,line_no,"network","duplicate [network] section");
 			}
 			network.seen=1;
-			network.line=line_no;
 			section=section_network;
 			continue;
 		}
@@ -629,5 +617,4 @@ int load_config_file(const char *path, app_config_t &config)
 	}
 
 	finalize_config(path,line_no,network,endpoints,config);
-	return 0;
 }

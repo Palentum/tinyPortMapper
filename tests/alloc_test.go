@@ -121,7 +121,7 @@ func assertAlive(t testing.TB, m *mapper) {
 // 三条路径在 v2 构建里的日志关键子串；修复前（HEAD 899770c）打印的是带 myexit 的 [FATAL] 行，据此可区分 F2 与控制组
 const (
 	tcpObjWarn = "[tcp]new connection from"              // 与 objFailTag 同在一行（warn）
-	udpObjWarn = "[udp]new connection from"              // 与 objFailTag 同在一行（v2 为 info）
+	udpObjWarn = "[udp]new connection from"              // 与 objFailTag 同在一行（v2 为 info，D124 起 warn）
 	objFailTag = "but malloc for connection objects failed"
 	tcpBufWarn = "closed bc of malloc for a"             // tcp_cb：... closed bc of malloc for a 65536-byte buffer failed（warn）
 )
@@ -289,10 +289,10 @@ func TestAllocUDPObjPool(t *testing.T) {
 		t.Fatalf("池耗尽时新发送方不应收到回包，却收到 %d 字节", nn)
 	}
 	rej.Close()
-	// 等拒绝日志刷出（info 行同样被缓冲，每 timer_interval(400ms) flush）
+	// 等拒绝日志刷出（warn 行同样被缓冲，每 timer_interval(400ms) flush；D124 起是 warn）
 	eventually(t, logFlushWithin+ioTimeout, 50*time.Millisecond, func() error {
 		assertAlive(t, m)
-		if m.logLines(udpObjWarn, objFailTag) == 0 {
+		if m.logLines("[WARN]", udpObjWarn, objFailTag) == 0 {
 			return fmt.Errorf("还没看到 UDP 对象 slab 的拒绝日志")
 		}
 		return nil

@@ -829,7 +829,7 @@ func TestDomainRefreshSlowHost(t *testing.T) {
 
 	workers := m.threads()
 	changed := func(i int) string {
-		return fmt.Sprintf("rule %d remote 0 domain %s:%d changed from 127.0.3.1:%d to 127.0.3.2:%d,", i+1, mover, ports[i], ports[i], ports[i])
+		return fmt.Sprintf("rule %d remote 1 domain %s:%d changed from 127.0.3.1:%d to 127.0.3.2:%d,", i+1, mover, ports[i], ports[i], ports[i])
 	}
 	eventually(t, 45*time.Second, 200*time.Millisecond, func() error {
 		for i := 2; i < 4; i++ {
