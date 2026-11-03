@@ -1303,7 +1303,7 @@ func resetSendError(t *testing.T, dir string, splice bool, args []string) {
 }
 
 // 空闲超时释放持有 pipe 的连接对（TPM_SLOW，--sock-buf 200 见 holdSockBuf）：clear_inactive 走的是 erase()，不是 RST、出错时的 erase_closed()，
-// pipe 的 close 两处各有一份。
+// 两者共用一份释放代码，这里覆盖空闲淘汰这个入口。
 // 一条连接两个方向都持有 pipe（两端都不读），之后没有任何事件、LRU 时间戳不再刷新，约 360 s 后被清理：持有归零，
 // pipe fd 恰为 2×alloc，非 pipe fd 回到建连前
 func TestSpliceIdleTimeoutHeld(t *testing.T) {

@@ -78,69 +78,6 @@ u64_t loop_clock_t::now()
 }
 
 
-u64_t pack_u64(u32_t a,u32_t b)
-{
-	u64_t ret=a;
-	ret<<=32u;
-	ret+=b;
-	return ret;
-}
-u32_t get_u64_h(u64_t a)
-{
-	return a>>32u;
-}
-u32_t get_u64_l(u64_t a)
-{
-	return (a<<32u)>>32u;
-}
-
-void write_u16(char * p,u16_t w)
-{
-	*(unsigned char*)(p + 1) = (w & 0xff);
-	*(unsigned char*)(p + 0) = (w >> 8);
-}
-u16_t read_u16(char * p)
-{
-	u16_t res;
-	res = *(const unsigned char*)(p + 0);
-	res = *(const unsigned char*)(p + 1) + (res << 8);
-	return res;
-}
-
-void write_u32(char * p,u32_t l)
-{
-	*(unsigned char*)(p + 3) = (unsigned char)((l >>  0) & 0xff);
-	*(unsigned char*)(p + 2) = (unsigned char)((l >>  8) & 0xff);
-	*(unsigned char*)(p + 1) = (unsigned char)((l >> 16) & 0xff);
-	*(unsigned char*)(p + 0) = (unsigned char)((l >> 24) & 0xff);
-}
-u32_t read_u32(char * p)
-{
-	u32_t res;
-	res = *(const unsigned char*)(p + 0);
-	res = *(const unsigned char*)(p + 1) + (res << 8);
-	res = *(const unsigned char*)(p + 2) + (res << 8);
-	res = *(const unsigned char*)(p + 3) + (res << 8);
-	return res;
-}
-
-void write_u64(char * s,u64_t a)
-{
-	assert(0==1);
-}
-u64_t read_u64(char * s)
-{
-	assert(0==1);
-	return 0;
-}
-
-
-char * my_ntoa(u32_t ip)
-{
-	in_addr a;
-	a.s_addr=ip;
-	return inet_ntoa(a);
-}
 /*
 u64_t get_true_random_number_64()
 {
@@ -196,23 +133,6 @@ u64_t hton64(u64_t a)
 	else return a;
 
 }*/
-
-void setnonblocking(int sock) {
-	int opts;
-	opts = fcntl(sock, F_GETFL);
-
-	if (opts < 0) {
-    	mylog(log_fatal,"fcntl(sock,GETFL)\n");
-		//perror("fcntl(sock,GETFL)");
-		myexit(1);
-	}
-	opts = opts | O_NONBLOCK;
-	if (fcntl(sock, F_SETFL, opts) < 0) {
-    	mylog(log_fatal,"fcntl(sock,SETFL,opts)\n");
-		//perror("fcntl(sock,SETFL,opts)");
-		myexit(1);
-	}
-}
 
 int set_buf_size(int fd,int socket_buf_size)
 {
@@ -297,10 +217,6 @@ int random_between(u32_t a,u32_t b)
 }*/
 
 
-int round_up_div(int a,int b)
-{
-	return (a+b-1)/b;
-}
 /*
 int create_fifo(char * file)
 {
@@ -340,33 +256,6 @@ int create_fifo(char * file)
 }*/
 
 
-int new_listen_socket(int &fd,u32_t ip,int port)
-{
-	fd =socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-
-	int yes = 1;
-	//setsockopt(udp_fd, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
-
-	struct sockaddr_in local_me={0};
-
-	socklen_t slen = sizeof(sockaddr_in);
-	//memset(&local_me, 0, sizeof(local_me));
-	local_me.sin_family = AF_INET;
-	local_me.sin_port = htons(port);
-	local_me.sin_addr.s_addr = ip;
-
-	if (::bind(fd, (struct sockaddr*) &local_me, slen) == -1) {
-		mylog(log_fatal,"socket bind error\n");
-		//perror("socket bind error");
-		myexit(1);
-	}
-	setnonblocking(fd);
-    set_buf_size(fd,socket_buf_size);
-
-    mylog(log_debug,"local_listen_fd=%d\n,",fd);
-
-	return 0;
-}
 /*
 int set_timer(int epollfd,int &timer_fd)
 {
@@ -882,18 +771,6 @@ int address_t::new_connected_udp_fd()
 	}
 
 	return new_udp_fd;
-}
-
-u32_t djb2(unsigned char *str, int len) {
-    u32_t hash = 5381;
-    int c;
-    for (int i=0; i<len ;i++) {
-        c = *(str++);
-        hash = ((hash << 5) + hash) ^ c; /* (hash * 33) ^ c */
-    }
-
-    hash = htonl(hash);
-    return hash;
 }
 
 u32_t sdbm(unsigned char *str, int len) {

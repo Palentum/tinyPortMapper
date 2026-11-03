@@ -27,21 +27,29 @@ struct remote_target_config_t
 	}
 };
 
-struct forward_rule_config_t
+//规则配置里 worker 的运行时也要的部分：main.cpp 的 forward_rule_t 继承它，worker_add_rule 整体复制
+struct forward_rule_base_t
 {
 	address_t local_addr;
 	int enable_tcp;
 	int enable_udp;
-	char listen_str[max_addr_len];
-	vector<remote_target_config_t> remote_targets;
 	balance_strategy_t balance_strategy;
 	vector<int> balance_weights;
-	forward_rule_config_t()
+	forward_rule_base_t()
 	{
 		enable_tcp=0;
 		enable_udp=0;
-		listen_str[0]=0;
 		balance_strategy=balance_strategy_off;
+	}
+};
+
+struct forward_rule_config_t:forward_rule_base_t
+{
+	char listen_str[max_addr_len];
+	vector<remote_target_config_t> remote_targets;
+	forward_rule_config_t()
+	{
+		listen_str[0]=0;
 	}
 };
 

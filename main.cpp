@@ -38,7 +38,6 @@ typedef long long i64_t;
 typedef unsigned int u32_t;
 typedef int i32_t;
 
-int disable_conn_clear=0;
 int disable_tcp_nodelay=0;
 //--disable-splice（D48）：TCP 只走 recv/send 拷贝路径，不创建 pipe。splice 本身不可用时由碰到的 worker 运行期置 1（审查 L1），各 worker 都读：relaxed 原子（M2）
 std::atomic<int> disable_splice(0);
@@ -568,6 +567,9 @@ struct udp_batch_t
 	mmsghdr seg[udp_batch_max];
 	iovec seg_iov[udp_batch_max][2];
 	udp_ret_ctrl_t seg_ctrl[udp_batch_max];
+	//构造时 msg_name、msg_iov 指向本对象自己的数组，填充又要求它在 worker_new() 清零的页里：不能复制，只能按引用使用（同 lru_collector_t）
+	udp_batch_t(const udp_batch_t &)=delete;
+	udp_batch_t & operator=(const udp_batch_t &)=delete;
 	static void init_segment(cmsghdr &h)
 	{
 		h.cmsg_level=SOL_UDP;
@@ -909,6 +911,7 @@ struct udp_table_t:not_copy_able_t
 struct worker_t;
 struct conn_manager_udp_t
 {
+	typedef udp_pair_t pair_t;//LRU 里挂的对象（clear_inactive 按它转换）
 	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把会话还回它的池
 	std::atomic<int> *conns;//本规则在所有 worker 合计的会话数（M4，S7）：max_conn_num 按它判断，建会话时加、erase 时减
 	udp_table_t sessions;
@@ -916,7 +919,6 @@ struct conn_manager_udp_t
 
 	long long last_clear_time;
 	lru_collector_t lru;
-	//list<udp_pair_t>::iterator clear_it;
 	//O1 累计计数，SIGUSR1 时输出：total 新建的会话数；pkts/bytes 发送成功的包数与字节数，drop 发送失败（含 EAGAIN）丢掉的包数。[0] 客户端→上游，[1] 上游→客户端
 	u64_t total;
 	u64_t pkts[2],bytes[2],drop[2];
@@ -931,7 +933,6 @@ struct conn_manager_udp_t
 		conns=0;
 		last_hit=0;
 		last_clear_time=0;
-		//clear_it=udp_pair_list.begin();
 		total=0;
 		memset(pkts,0,sizeof(pkts));
 		memset(bytes,0,sizeof(bytes));
@@ -952,46 +953,11 @@ struct conn_manager_udp_t
 	}
 
 	int erase(udp_pair_t *pair);//定义在 worker_t 之后
-
-	int clear_inactive()
-	{
-		if(lru.clock->now()-last_clear_time>conn_clear_interval)
-		{
-			last_clear_time=lru.clock->now();
-			return clear_inactive0();
-		}
-		return 0;
-	}
-	int clear_inactive0()
-	{
-		if(disable_conn_clear) return 0;
-
-		int cnt=0;
-		//list<tcp_pair_t>::iterator it=clear_it,old_it;
-		int size=lru.size();
-		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
-
-		u64_t current_time=lru.clock->now();
-		num_to_clean=min(num_to_clean,size);
-		for(;;)
-		{
-			if(cnt>=num_to_clean) break;
-			//if(tcp_pair_list.begin()==tcp_pair_list.end()) break;
-			if(lru.empty()) break;
-			lru_collector_t::key_t key;
-			my_time_t ts=lru.peek_back(key);
-			if(current_time- ts < conn_timeout_udp) break;
-
-			erase( static_cast<udp_pair_t *>(key) );
-
-			cnt++;
-		}
-		return 0;
-	}
 };
 
 struct conn_manager_tcp_t
 {
+	typedef tcp_pair_t pair_t;//同 conn_manager_udp_t
 	worker_t *worker;//所属 worker（M1）：erase 用它的 loop 停 watcher、把缓冲、pipe 与连接对还回它的池
 	std::atomic<int> *conns;//本规则在所有 worker 合计的连接对数（M4，S7）：max_conn_num 按它判断，建连时加、erase/erase_closed 时减
 	long long last_clear_time;
@@ -1012,66 +978,44 @@ struct conn_manager_tcp_t
 		memset(splice_bytes,0,sizeof(splice_bytes));
 		splice_fallback=0;
 	}
-	int erase(tcp_pair_t *pair);//定义在 worker_t 之后
-	int erase_closed(tcp_pair_t *pair);
-
-	int clear_inactive()
+	int erase(tcp_pair_t *pair,const char *why="inactive");//定义在 worker_t 之后；why 只用于日志，空闲淘汰（clear_inactive）用默认值
+	int erase_closed(tcp_pair_t *pair)//出错、EOF 与 remote_sweep 的释放
 	{
-		if(lru.clock->now()-last_clear_time>conn_clear_interval)
-		{
-			last_clear_time=lru.clock->now();
-			return clear_inactive0();
-		}
-		return 0;
-	}
-	int clear_inactive0()
-	{
-
-		if(disable_conn_clear) return 0;
-
-		int cnt=0;
-		//list<tcp_pair_t>::iterator it=clear_it,old_it;
-		int size=lru.size();
-		int num_to_clean=size/conn_clear_ratio+conn_clear_min;   //clear 2% each time,to avoid latency glitch
-
-		u64_t current_time=lru.clock->now();
-		num_to_clean=min(num_to_clean,size);
-		for(;;)
-		{
-			if(cnt>=num_to_clean) break;
-			//if(tcp_pair_list.begin()==tcp_pair_list.end()) break;
-			if(lru.empty()) break;
-			lru_collector_t::key_t key;
-			my_time_t ts=lru.peek_back(key);
-			if(current_time- ts < conn_timeout_tcp) break;
-
-			erase( static_cast<tcp_pair_t *>(key) );
-
-			cnt++;
-		}
-		//clear_it=it;
-
-		return 0;
+		return erase(pair,"closed");
 	}
 };
 
-//worker 的规则副本里的一个 remote（DNS 的刷新时间与查询状态在主线程的 dns_targets 里，M3）
-struct remote_target_t
+//两个管理器的空闲淘汰：worker_tick 每次都调用，距上一轮超过 conn_clear_interval 才做一轮（400 ms 的 tick 下约 1.2 s 一轮），
+//从 LRU（T9）表尾起释放空闲达到 timeout 的连接对或会话。每轮最多 size/conn_clear_ratio+conn_clear_min 个（约 3.3%）：
+//大量同时过期时分几轮做完，避免一次释放太多造成延迟毛刺
+template<class manager_t>
+static void clear_inactive(manager_t &m,u32_t timeout)
 {
-	address_t addr;
-	int is_domain;
-	char remote_str[max_remote_len];
-	char host[max_domain_len];
-	u32_t port;
+	if(m.lru.clock->now()-m.last_clear_time<=conn_clear_interval) return;
+	m.last_clear_time=m.lru.clock->now();
+	int cnt=0;
+	int size=m.lru.size();
+	int num_to_clean=min(size/conn_clear_ratio+conn_clear_min,size);
+	u64_t current_time=m.lru.clock->now();
+	while(cnt<num_to_clean&&!m.lru.empty())
+	{
+		lru_collector_t::key_t key;
+		my_time_t ts=m.lru.peek_back(key);
+		if(current_time-ts<timeout) break;
+		m.erase(static_cast<typename manager_t::pair_t *>(key));
+		cnt++;
+	}
+}
+
+//worker 的规则副本里的一个 remote：配置（worker_add_rule 整体复制）加本 worker 的运行期状态；addr 由 worker_dns_update 改写
+//（DNS 的刷新时间与查询状态在主线程的 dns_targets 里，M3）
+struct remote_target_t:remote_target_config_t
+{
 	u32_t gen;//本 worker 收到的地址变化次数（worker_dns_update 加一）：连接对与会话建立时记下，不同即连在旧地址上
 	my_time_t sweep_at;//旧地址上还留着可用的连接对或会话时，worker_tick 到这个时间再查一次（remote_sweep）；0 为没有
 	my_time_t swept_at;//上一次 remote_sweep 的时间
-	remote_target_t()
+	explicit remote_target_t(const remote_target_config_t &config):remote_target_config_t(config)
 	{
-		is_domain=0;
-		remote_str[0]=0;
-		host[0]=0;
-		port=0;
 		gen=0;
 		sweep_at=0;
 		swept_at=0;
@@ -1080,15 +1024,11 @@ struct remote_target_t
 
 struct rule_shared_t;
 
-struct forward_rule_t:not_copy_able_t
+//基类 forward_rule_base_t 见 config.h
+struct forward_rule_t:not_copy_able_t,forward_rule_base_t
 {
 	int index;
-	address_t local_addr;
-	int enable_tcp;
-	int enable_udp;
 	vector<remote_target_t> remote_targets;
-	balance_strategy_t balance_strategy;
-	vector<int> balance_weights;
 	rule_shared_t *shared;//本规则所有 worker 共用的状态，roundrobin 经它选 remote（D85）
 	worker_t *worker;//所属 worker（M1）：本对象是这条规则在它那里的运行时，连接对与会话经 owner 找到它
 	int local_listen_fd_tcp;
@@ -1101,9 +1041,6 @@ struct forward_rule_t:not_copy_able_t
 	forward_rule_t()
 	{
 		index=0;
-		enable_tcp=0;
-		enable_udp=0;
-		balance_strategy=balance_strategy_off;
 		shared=0;
 		worker=0;
 		local_listen_fd_tcp=-1;
@@ -1224,7 +1161,7 @@ static void worker_post(worker_t &w,const worker_msg_t &m)
 	ev_async_send(w.loop,&w.ctrl_watcher);
 }
 
-int conn_manager_tcp_t::erase(tcp_pair_t *pair)
+int conn_manager_tcp_t::erase(tcp_pair_t *pair,const char *why)
 {
 	//两侧都 stop 之后才能归还：watcher->data 直接指向本对象，ev_io_stop 同时清除本轮还没回调的事件，归还后不会再有它的回调。
 	//close 后 fd 号、归还后对象都可能被本轮后面 accept 的连接复用，它的 watcher 经 ev_io_init（EV__IOFDSET）重新登记进 epoll（T10、T11），
@@ -1235,26 +1172,7 @@ int conn_manager_tcp_t::erase(tcp_pair_t *pair)
 
 	close(pair->local.fd);
 	close(pair->remote.fd);
-	mylog(log_info,"[tcp]inactive connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
-	mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
-	lru.erase(pair);
-	if(pair->local.buf) worker->tcp_buf_pool.put(pair->local.buf);
-	if(pair->remote.buf) worker->tcp_buf_pool.put(pair->remote.buf);
-	if(pair->local.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->local.pipe);//方向持有 pipe 时里面一定有数据
-	if(pair->remote.pipe.r>=0) worker->tcp_pipe_pool.discard(pair->remote.pipe);
-	worker->tcp_pair_pool.put(pair);
-	conns->fetch_sub(1,memory_order_relaxed);
-	return 0;
-}
-int conn_manager_tcp_t::erase_closed(tcp_pair_t *pair)//just a copy of erase()
-{
-	struct ev_loop * loop= worker->loop;
-	ev_io_stop(loop, &pair->local.ev);
-	ev_io_stop(loop, &pair->remote.ev);
-
-	close(pair->local.fd);
-	close(pair->remote.fd);
-	mylog(log_info,"[tcp]closed connection {%s} cleared, tcp connections=%d\n",pair->addr.get_str(),lru.size()-1);
+	mylog(log_info,"[tcp]%s connection {%s} cleared, tcp connections=%d\n",why,pair->addr.get_str(),lru.size()-1);
 	mylog(log_debug,"[tcp] lru.size()=%d\n",(int)lru.size()-1);
 	lru.erase(pair);
 	if(pair->local.buf) worker->tcp_buf_pool.put(pair->local.buf);
@@ -2310,8 +2228,8 @@ static void worker_tick(worker_t &w)
 	my_time_t now=w.clock.now();
 	for(auto it=w.rules.begin();it!=w.rules.end();++it)
 	{
-		it->tcp_manager.clear_inactive();
-		it->udp_manager.clear_inactive();
+		clear_inactive(it->tcp_manager,conn_timeout_tcp);
+		clear_inactive(it->udp_manager,conn_timeout_udp);
 		for(size_t r=0;r<it->remote_targets.size();r++)
 		{
 			remote_target_t &target=it->remote_targets[r];
@@ -3409,24 +3327,11 @@ static void worker_add_rule(worker_t *w,size_t i)
 	rule.udp_manager.pktinfo_logged=&rule_shared[i].pktinfo_logged;
 	forward_rule_config_t &rule_config=app_config.rules[i];
 	rule.index=(int)i+1;
-	rule.local_addr=rule_config.local_addr;
-	rule.enable_tcp=rule_config.enable_tcp;
-	rule.enable_udp=rule_config.enable_udp;
-	rule.balance_strategy=rule_config.balance_strategy;
-	rule.balance_weights=rule_config.balance_weights;
+	static_cast<forward_rule_base_t &>(rule)=rule_config;
 	assert(!rule_config.remote_targets.empty());
 	rule.remote_targets.reserve(rule_config.remote_targets.size());
 	for(size_t j=0;j<rule_config.remote_targets.size();j++)
-	{
-		const remote_target_config_t &config_target=rule_config.remote_targets[j];
-		remote_target_t target;
-		target.addr=config_target.addr;
-		target.is_domain=config_target.is_domain;
-		snprintf(target.remote_str,sizeof(target.remote_str),"%s",config_target.remote_str);
-		snprintf(target.host,sizeof(target.host),"%s",config_target.host);
-		target.port=config_target.port;
-		rule.remote_targets.push_back(target);
-	}
+		rule.remote_targets.push_back(remote_target_t(rule_config.remote_targets[j]));
 	if(rule.balance_strategy!=balance_strategy_off)
 	{
 		assert(rule.balance_weights.size()==rule.remote_targets.size());
