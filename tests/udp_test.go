@@ -16,6 +16,7 @@ import (
 	"syscall"
 	"testing"
 	"time"
+	"unsafe"
 )
 
 // 各种包长（含大于 MTU 的包）原样往返
@@ -716,6 +717,149 @@ func TestUDPMaxConn(t *testing.T) {
 	})
 	if s := m.statsAfterSignal(t).udp[1]; s.sessions != maxConn {
 		t.Errorf("统计 sessions=%d，期望 %d", s.sessions, maxConn)
+	}
+}
+
+// fmix64 与它的逆（D118）：x^=x>>33 是自逆的（移位不小于 32），两个乘数都是奇数，模 2^64 可逆
+func fmix64(x uint64) uint64 {
+	x ^= x >> 33
+	x *= 0xff51afd7ed558ccd
+	x ^= x >> 33
+	x *= 0xc4ceb9fe1a85ec53
+	x ^= x >> 33
+	return x
+}
+
+func fmix64Inv(x uint64) uint64 {
+	inv := func(c uint64) uint64 { // 牛顿迭代求模 2^64 的乘法逆元
+		y := c
+		for range 6 {
+			y *= 2 - c*y
+		}
+		return y
+	}
+	x ^= x >> 33
+	x *= inv(0xc4ceb9fe1a85ec53)
+	x ^= x >> 33
+	x *= inv(0xff51afd7ed558ccd)
+	x ^= x >> 33
+	return x
+}
+
+// 会话表哈希的种子（D118）。不加种子的 udp_key_hash（D118 以前）谁都能离线算：一个 IPv6 /64 里用 fmix64 的逆选低 64 位，能凑出
+// 任意多个 32 位哈希全同的客户端地址，它们在线性探测表里堆成一个簇，每次查找都要沿簇逐个读会话对象比较地址（20000 个会话时平均
+// 1 万次）。本用例按无种子的公式算出 n 个这样的源地址（IPV6_FREEBIND 加逐包 IPV6_PKTINFO 指定源地址，不必在 lo 上加地址），另取
+// n 个随机低 64 位作对照，各在一个新启动的 tinymapper（--threads 1，不受 TPM_THREADS 影响）上建满 n 个会话，再按源地址轮转灌包
+// （相邻两包来自不同客户端，每次都错过 last_hit），比较每转发一个包消耗的 CPU。加了种子时两组相当；不加（或种子没取、恒为 0）时
+// 碰撞组高出数倍。只针对公开的无种子公式：换成别的不加种子的哈希时本用例查不出来
+func TestUDPSessionHashSeed(t *testing.T) {
+	t.Parallel()
+	heavy(t)
+	const n = 16000      // 32768 槽的表（第 12289 个会话起）
+	const maxRatio = 3.0 // 碰撞组每包 CPU 不超过对照组的这么多倍
+	cport := freePort(t)
+	var portRaw [2]byte // sin6_port 按内存里的字节（网络序）读成本机序的 u16，与 udp_key_hash 相同
+	binary.BigEndian.PutUint16(portRaw[:], uint16(cport))
+	prefix := [8]byte{0x20, 0x01, 0x0d, 0xb8, 0, 1, 0, 2} // 2001:db8:1:2::/64
+	w0 := binary.NativeEndian.Uint64(prefix[:])
+	h1 := fmix64(fmix64(uint64(binary.NativeEndian.Uint16(portRaw[:]))) ^ w0) // scope_id 为 0
+	srcs := func(coll bool) [][]byte {
+		rng := rand.New(rand.NewPCG(118, 0))
+		oob := make([][]byte, n)
+		for i := range oob {
+			w1 := rng.Uint64()
+			if coll {
+				w1 = fmix64Inv(uint64(i+1)<<32|0x1234beef) ^ h1 // 无种子时 (u32)fmix64(h1^w1) 恒为 0x1234beef
+			}
+			var a [16]byte
+			copy(a[:], prefix[:])
+			binary.NativeEndian.PutUint64(a[8:], w1)
+			b := make([]byte, syscall.CmsgSpace(20)) // in6_pktinfo：地址 16 字节 + ifindex
+			h := (*syscall.Cmsghdr)(unsafe.Pointer(&b[0]))
+			h.Level, h.Type = syscall.IPPROTO_IPV6, syscall.IPV6_PKTINFO
+			h.SetLen(syscall.CmsgLen(20))
+			copy(b[syscall.CmsgLen(0):], a[:])
+			oob[i] = b
+		}
+		return oob
+	}
+	cl, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6unspecified, Port: cport})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { cl.Close() })
+	rc, err := cl.SyscallConn()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var serr error
+	rc.Control(func(fd uintptr) { serr = syscall.SetsockoptInt(int(fd), syscall.IPPROTO_IPV6, 78, 1) }) // IPV6_FREEBIND
+	if serr != nil {
+		t.Fatalf("setsockopt IPV6_FREEBIND：%v", serr)
+	}
+	msg := []byte("d118")
+	perPkt := func(name string, oob [][]byte) float64 {
+		// 上游只收不读：包在它的接收缓冲满后由内核丢弃，两组在 tinymapper 一侧的开销相同
+		be, err := net.ListenUDP("udp6", &net.UDPAddr{IP: net.IPv6loopback, Port: freePort(t)})
+		if err != nil {
+			t.Fatal(err)
+		}
+		defer be.Close()
+		lport := freePort(t)
+		m := startMapper(t, listenPoints("u", lport), "--threads", "1", "--log-level", "3",
+			"-l", hostPort("::1", lport), "-r", be.LocalAddr().String(), "-u")
+		defer m.stop(t, false)
+		dst := &net.UDPAddr{IP: net.IPv6loopback, Port: lport}
+		send := func(i int) {
+			if _, _, err := cl.WriteMsgUDP(msg, oob[i], dst); err != nil {
+				t.Fatalf("%s：从第 %d 个源地址发送失败：%v", name, i, err)
+			}
+		}
+		// 建会话：每个源地址一包，每 256 包歇 2 ms 免得冲满监听 socket 的接收缓冲；丢了的整轮重发（已有会话照常转发），
+		// 第 k 轮歇 2k ms：无种子时碰撞组每包要走长簇，整轮重发按第一轮的速率会冲满接收缓冲，会话再也建不全
+		for round := 1; ; round++ {
+			for i := range n {
+				send(i)
+				if i%256 == 255 {
+					time.Sleep(time.Duration(2*round) * time.Millisecond)
+				}
+			}
+			s := m.statsAfterSignal(t).udp[1]
+			if s.sessions == n {
+				break
+			}
+			if round == 5 {
+				t.Fatalf("%s：发了 %d 轮后 sessions=%d，期望 %d", name, round, s.sessions, n)
+			}
+		}
+		// 灌包：3 个 goroutine 各按自己的步长轮转源地址，1 s 后停，再等 tinymapper 处理完接收缓冲里剩下的
+		up0, c0 := m.statsAfterSignal(t).udp[1].upPkts, m.cpuTicks(t)
+		stop := time.Now().Add(time.Second)
+		var wg sync.WaitGroup
+		for g := range 3 {
+			wg.Add(1)
+			go func() {
+				defer wg.Done()
+				for i := g; time.Now().Before(stop); i = (i + 3) % n {
+					cl.WriteMsgUDP(msg, oob[i], dst)
+				}
+			}()
+		}
+		wg.Wait()
+		time.Sleep(300 * time.Millisecond)
+		c1, up1 := m.cpuTicks(t), m.statsAfterSignal(t).udp[1].upPkts
+		if up1 == up0 || c1 == c0 {
+			t.Fatalf("%s：灌包期间转发 %d 个包、CPU %d 个滴答，无从比较", name, up1-up0, c1-c0)
+		}
+		ns := float64(c1-c0) * 1e7 / float64(up1-up0)
+		t.Logf("%s：%d 个会话，转发 %d 个包，CPU %.2f s，每包 %.0f ns", name, n, up1-up0, float64(c1-c0)/100, ns)
+		return ns
+	}
+	base := perPkt("随机低 64 位", srcs(false))
+	coll := perPkt("无种子哈希全同", srcs(true))
+	if coll > maxRatio*base {
+		t.Errorf("按无种子哈希挑出的 %d 个源地址每包 CPU %.0f ns，是随机地址（%.0f ns）的 %.1f 倍（上限 %.0f 倍）：会话表哈希没有种子，"+
+			"可离线挑出的地址把表堆成了长簇", n, coll, base, coll/base, maxRatio)
 	}
 }
 

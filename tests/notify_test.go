@@ -203,10 +203,11 @@ type notifyCall struct {
 
 func (c notifyCall) fd(i int) int { return int(int32(c.args[i])) }
 
-// notifier 回应 tinymapper 的被通知调用：先问 hold，它返回通道时这次调用先不回应，通道关闭后照常执行（notifier 照常处理别的线程的调用，
-// 用于让一个 worker 线程停在系统调用里，S8 的退出超时）；再问 addFD，它返回测试进程的一个 fd 时把它装进 tinymapper、以新 fd 号作为这次
-// 调用的返回值（调用不执行）；再问 emulate，它返回 ok 时这次调用不执行、直接以 val 返回（输出参数由 emulate 经 writeTargetMem 写好）；
-// 否则 decide 返回 0 表示照常执行，返回 errno 则以它失败
+// notifier 回应 tinymapper 的被通知调用：先问 hold，它返回通道时这次调用先不回应，通道关闭后再问 decide，没设或返回 0 时照常执行
+// （notifier 照常处理别的线程的调用，用于让一个 worker 线程停在系统调用里，S8 的退出超时；D115 让压住的调用随后以 EINVAL 失败）；
+// 再问 addFD，它返回测试进程的一个 fd 时把它装进 tinymapper、以新 fd 号作为这次调用的返回值（调用不执行）；再问 emulate，它返回 ok 时
+// 这次调用不执行、直接以 val 返回（输出参数由 emulate 经 writeTargetMem 写好）；否则 decide 返回 0 表示照常执行，返回 errno 则以它失败。
+// 压住的调用放开后在它自己的 goroutine 里问 decide，与 loop 里对别的调用的 decide 并发：和 hold 一起用的 decide 必须并发安全
 type notifier struct {
 	fd      int
 	hold    atomic.Pointer[func(notifyCall) <-chan struct{}]
@@ -312,6 +313,12 @@ func (n *notifier) loop() {
 					case <-ch:
 					case <-n.gone:
 						return
+					}
+					if f := n.decide.Load(); f != nil {
+						if errno := (*f)(c); errno != 0 {
+							ne.PutUint32(resp[16:], uint32(-int32(errno)))
+							ne.PutUint32(resp[20:], 0)
+						}
 					}
 					for {
 						if _, _, e := syscall.Syscall(syscall.SYS_IOCTL, uintptr(n.fd), seccompNotifSend, uintptr(unsafe.Pointer(&resp[0]))); e != syscall.EINTR {

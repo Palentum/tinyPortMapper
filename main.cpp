@@ -39,7 +39,7 @@ int disable_tcp_nodelay=0;
 std::atomic<int> disable_splice(0);
 int sock_buf_explicit=0;//给了 --sock-buf：TCP socket 才设 SO_SNDBUF/SO_RCVBUF，否则交给内核自动调优
 //--udp-gro（U5，D41）：UDP 监听与会话 socket 开 UDP_GRO，收到的 GRO 合并包整包带 UDP_SEGMENT 转发。第一个监听 socket 开不了
-//（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时各 worker 的 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲
+//（5.0 以前的内核）时清零，这时还没有 socket 开着 UDP_GRO；为 1 时各 worker 的 udp_batch 的 in/rin 带着收 cmsg 的控制缓冲（D114：监听开不了的 worker 也挂）
 int udp_gro=0;
 
 int max_pending_packet=0;
@@ -569,7 +569,7 @@ struct udp_batch_t
 		h.cmsg_type=UDP_SEGMENT;
 		h.cmsg_len=CMSG_LEN(sizeof(uint16_t));//内核要求恰好是这个长度，否则 EINVAL
 	}
-	//所属 worker 的监听 socket 开了 UDP_GRO（udp_gro_listen，rin_too 为 1：会话 socket 也开）或 PKTINFO（udp_pktinfo_listen）之后调用，可重复
+	//--udp-gro 仍开着时每个监听 socket 设过 UDP_GRO 之后不论成败（udp_gro_listen，rin_too 为 1：会话 socket 也开，D114），或开了 PKTINFO 之后（udp_pktinfo_listen）调用，可重复
 	void attach_ctrl(int rin_too)
 	{
 		in_ctrl=1;
@@ -763,6 +763,7 @@ static inline int udp_key_eq(const address_t &a,const address_t &b)
 	memcpy(y,&b.inner.ipv6.sin6_addr,sizeof(y));
 	return x[0]==y[0]&&x[1]==y[1]&&a.inner.ipv6.sin6_scope_id==b.inner.ipv6.sin6_scope_id;
 }
+static u64_t udp_hash_seed;//D118：进程启动时 udp_hash_seed_init() 取一次随机数（主线程，worker 线程启动前），之后只读
 static inline u64_t udp_key_mix(u64_t x)//murmur3 的 fmix64
 {
 	x^=x>>33;
@@ -772,16 +773,43 @@ static inline u64_t udp_key_mix(u64_t x)//murmur3 的 fmix64
 	x^=x>>33;
 	return x;
 }
-//每个 64 位字并入后混合一次：IPv4 一次，IPv6 三次。族不参与：一个会话表只属于一个监听 socket
+//每个 64 位字并入后混合一次：IPv4 一次，IPv6 三次。族不参与：一个会话表只属于一个监听 socket。种子异或进第一个字（D118）：
+//不加种子时攻击者可以离线挑出槽号相同的源地址（IPv6 一个 /64 能凑出任意多个 32 位哈希全同的地址），把会话表堆成一个长簇。
+//tests/udp_test.go 的 TestUDPSessionHashSeed 照抄了这里不加种子的公式（fmix64、字的顺序、端口字节序）来构造攻击集，改公式时要一起改，
+//否则那个用例会恒通过
 static inline u32_t udp_key_hash(const address_t &a)
 {
 	if(a.inner.ipv4.sin_family==AF_INET)
-		return (u32_t)udp_key_mix((u64_t)a.inner.ipv4.sin_addr.s_addr<<16|a.inner.ipv4.sin_port);
+		return (u32_t)udp_key_mix(((u64_t)a.inner.ipv4.sin_addr.s_addr<<16|a.inner.ipv4.sin_port)^udp_hash_seed);
 	u64_t w[2];
 	memcpy(w,&a.inner.ipv6.sin6_addr,sizeof(w));
-	u64_t h=udp_key_mix((u64_t)a.inner.ipv6.sin6_scope_id<<16|a.inner.ipv6.sin6_port);
+	u64_t h=udp_key_mix(((u64_t)a.inner.ipv6.sin6_scope_id<<16|a.inner.ipv6.sin6_port)^udp_hash_seed);
 	h=udp_key_mix(h^w[0]);
 	return (u32_t)udp_key_mix(h^w[1]);
+}
+//D118：getrandom（3.17 起；GRND_NONBLOCK：crng 还没就绪时返回 EAGAIN，不等）→ /dev/urandom（5.18 以前从不等待；5.18 起 crng 未就绪时
+//urandom_read（5.19 起为 urandom_read_iter）先调 try_to_generate_entropy，开机早期可能先跑一小段 jitter 熵生成，但不会无限期阻塞）→ 启动时刻、pid 与栈地址。
+//不用 getauxval(AT_RANDOM)：那 16 字节是 libc 的栈保护值与指针保护（musl 1.2 为 malloc）的秘密值
+static void udp_hash_seed_init()
+{
+	u64_t s=0;
+	long n=-1;
+#ifdef SYS_getrandom
+	n=syscall(SYS_getrandom,(long)&s,(long)sizeof(s),1L);//变参按 long 读；1 即 GRND_NONBLOCK
+#endif
+	if(n!=(long)sizeof(s))
+	{
+		int fd=open("/dev/urandom",O_RDONLY|O_CLOEXEC);
+		n=fd<0?-1:read(fd,&s,sizeof(s));
+		if(fd>=0) close(fd);
+	}
+	if(n!=(long)sizeof(s))
+	{
+		timespec t;
+		clock_gettime(CLOCK_MONOTONIC,&t);
+		s=udp_key_mix(((u64_t)t.tv_sec*1000000000+t.tv_nsec)^(u64_t)getpid()<<48^(u64_t)(uintptr_t)&t);
+	}
+	udp_hash_seed=s;
 }
 
 static const u32_t udp_table_min_cap=64;
@@ -2512,20 +2540,29 @@ static void udp_send_warn(int dir,int ret,int dropped)
 	else
 		mylog(log_warn,"[udp]sendmmsg to clients returned %d,%s,dropped %d packets\n",ret,get_sock_error(),dropped);
 }
-//U5（审查 L1）：5.0–5.15 未打补丁的内核（v5.16 修复，回移到 5.4.151–180、5.10.81–100 之间）按含 IP/UDP 头的长度判断段数上限，
-//64 个满段必报 EINVAL。碰到一次就置 1，之后每次 GSO 至多 udp_gso_cap() 段，段数加头长不超过 64 段。6.13 以前段长超过路径 MTU
-//也报 EINVAL，段长 ≤1023 B 的 64 段合并包碰上它时会误置：只是此后 64 段的合并包拆成两块发，那个会话随后照常回退
-static std::atomic<int> udp_gso_hdr_cap(0);//各 worker 共用（M2）：relaxed，两个 worker 同时碰上时各记一行 debug
+//U5（审查 L1）：5.0–5.15 未打补丁的内核（v5.16 修复；IPv4 的 udp_send_skb 回移到 5.4.165、5.10.85、5.15.8，IPv6 的 udp_v6_send_skb
+//回移到 5.4.170、5.10.90、5.15.13）按含 IP/UDP 头的长度判断段数上限，64 个满段必报 EINVAL。碰到一次就置 1，之后每次 GSO 至多
+//udp_gso_cap() 段，段数加头长不超过 64 段。6.13 以前段长超过路径 MTU 也报 EINVAL，段长 ≤1023 B 的 64 段合并包碰上它时会误置：
+//只是此后 64 段的合并包拆成两块发，那个会话随后照常回退
+static std::atomic<int> udp_gso_hdr_cap(0);//各 worker 共用（M2）：relaxed，只定块的大小，是不是旧内核上限只看段数（D115）
+//旧内核上限下一次 GSO 的段数：48 是 IPv6 加 UDP 头（IPv4 的 28 也在内）。udp_gso_cap 与 udp_gso_old_limit 共用这一个公式（D115）
+static inline int udp_gso_old_cap(int gso)
+{
+	return udp_gso_max_segs-(48+gso-1)/gso;
+}
 static inline int udp_gso_cap(int gso)
 {
-	return udp_gso_hdr_cap.load(memory_order_relaxed)?udp_gso_max_segs-(48+gso-1)/gso:udp_gso_max_segs;
+	return udp_gso_hdr_cap.load(memory_order_relaxed)?udp_gso_old_cap(gso):udp_gso_max_segs;
 }
-//段长 gso、segs 段的 GSO 发送报 err 时：是上面的旧内核上限就记住并返回 1（按更小的块重发即可，不关 GSO），否则 0
+//段长 gso、segs 段的 GSO 发送报 err 时：是上面的旧内核上限就记住并返回 1（按更小的块重发即可，不关 GSO），否则 0。只看段数不看标志
+//（D115）：别的 worker 刚置位时，本 worker 置位前排好的 64 段条目报的 EINVAL 也是这个上限，不能当成 GSO 失败关掉会话的 GSO。
+//返回 1 时标志已置位，重切的块至多 udp_gso_old_cap() 段，同一个包不会再返回 1（两处若各写一份公式，不一致时旧内核上会反复重切、
+//worker 活锁）。debug 只记第一次
 static int udp_gso_old_limit(int err,int gso,int segs)
 {
-	if(err!=EINVAL||udp_gso_hdr_cap.load(memory_order_relaxed)||segs<=udp_gso_max_segs-(48+gso-1)/gso) return 0;
-	udp_gso_hdr_cap.store(1,memory_order_relaxed);
-	mylog(log_debug,"[udp]GSO send of %d segments failed with EINVAL (Linux 5.0-5.15 count the IP/UDP headers against UDP_MAX_SEGMENTS, or the path MTU is smaller), sending at most %d segments at a time from now on\n",segs,udp_gso_cap(gso));
+	if(err!=EINVAL||segs<=udp_gso_old_cap(gso)) return 0;
+	if(!udp_gso_hdr_cap.exchange(1,memory_order_relaxed))
+		mylog(log_debug,"[udp]GSO send of %d segments failed with EINVAL (Linux 5.0-5.15 count the IP/UDP headers against UDP_MAX_SEGMENTS, or the path MTU is smaller), sending at most %d segments at a time from now on\n",segs,udp_gso_old_cap(gso));
 	return 1;
 }
 //U5：GSO 本身发不出去：6.11 以前出口没有 TX 校验和 offload、或带 IPsec 时 EIO；段长超过路径 MTU 时 6.13 以前 EINVAL、6.14 起 EMSGSIZE；
@@ -2642,8 +2679,11 @@ static int udp_iov_range(const msghdr &src,size_t off,size_t len,iovec *dst)
 }
 //U5：把第 i 条（GRO 合并包）切成每块至多 udp_gso_cap() 段（这个会话这个方向已关 GSO 时每块一个数据报）发出，用于：sendmmsg 发它失败之后、
 //已关 GSO、段数超过上限。一次 sendmmsg 至多 udp_batch_max 块，失败语义同 udp_send_group：GSO 本身的错误先关掉 GSO，这一块改为逐个
-//数据报重发；其他错误丢掉这一块；EAGAIN 时把这个包剩下的数据报数记进 left、返回 -1，由调用方连同本组剩下的包一起计入 drop、记一行 warn
-static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &left)
+//数据报重发；其他错误丢掉这一块。例外（D116）：tried 为 0（预先切块，主路径没发过）时，带 UDP_SEGMENT 的块碰上这类错误，从这一块起
+//把这次 sendmmsg 原样重发一次（待取的 ICMP 错误已随失败的那次取走），再失败才丢，每个包至多重发一次；tried 为 1（主路径发它失败后交来，
+//那次已经取走错误）时照旧丢。单个数据报的块（已关 GSO，或切到最后只剩一段）同普通包，不重发。
+//EAGAIN 时把这个包剩下的数据报数记进 left、返回 -1，由调用方连同本组剩下的包一起计入 drop、记一行 warn
+static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &left,int tried)
 {
 	udp_batch_t &b=c.b;
 	const mmsghdr &m=msgs[i];
@@ -2715,6 +2755,11 @@ static int udp_send_split(udp_send_ctx_t &c,mmsghdr *msgs,int i,int cnt,int &lef
 				udp_gso_turn_off(c,msgs,i,cnt);
 			continue;
 		}
+		if(!tried&&udp_msg_gso(b.seg[0])!=0)
+		{
+			tried=1;
+			continue;
+		}
 		int dropped=udp_msg_segs(b.seg[0]);
 		c.mgr.drop[c.dir]+=dropped;
 		udp_send_warn(c.dir,ret,dropped);
@@ -2732,7 +2777,7 @@ static inline int udp_gso_split_needed(const mmsghdr &m,unsigned char gso_off)
 //一组 cnt 个包，dir 为 0 时是一个会话本批的入向包（U3，发往会话 socket），为 1 时是一个规则的回包（U4，发往监听 socket，
 //各包带客户端地址）：sendmmsg 只发出一部分时从断点接着发（内核不报断点处的错误，重发一次才知道它是否仍失败）。
 //EAGAIN 丢掉剩下的包，不排队（UDP 语义）；其他错误（EMSGSIZE 等）只丢断点处这一个包。入向时上一个包引来的 ICMP（ECONNREFUSED）
-//只让断点处的发送失败，错误随之被取走，重发就成功：只有一组的第一个包碰上它时才丢包、记 warn（逐包 send 时每次都丢）；
+//只让断点处的发送失败，错误随之被取走，重发就成功：只有某次 sendmmsg 的第一条碰上它时才丢包、记 warn（逐包 send 时每次都丢），即一组的第一个包，或紧跟在 udp_send_split 切块发送之后的包（切块本身的首块见 udp_send_split）；
 //监听 socket 没有 connect，不收 ICMP 错误。
 //U5：带 UDP_SEGMENT 的条目（GRO 合并包）发送失败时不按一个包丢，交给 udp_send_split 重发：GSO 本身的错误（udp_gso_errno）
 //先关掉它所属会话这个方向的 GSO（udp_gso_turn_off）再逐个数据报发，其他错误按至多上限段再发一次。pkts/drop 按数据报计。
@@ -2750,7 +2795,7 @@ static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 			while(end<cnt&&!udp_gso_split_needed(msgs[end],c.off[c.stride*end])) end++;
 			if(end==sent)
 			{
-				if(udp_send_split(c,msgs,sent,cnt,left)<0) goto eagain;
+				if(udp_send_split(c,msgs,sent,cnt,left,0)<0) goto eagain;
 				sent++;
 				continue;
 			}
@@ -2779,7 +2824,7 @@ static void udp_send_group(udp_send_ctx_t &c,mmsghdr *msgs,int cnt)
 			{
 				if(udp_gso_errno(errno)&&!udp_gso_old_limit(errno,udp_msg_gso(msgs[sent]),udp_msg_segs(msgs[sent])))
 					udp_gso_turn_off(c,msgs,sent,cnt);
-				if(udp_send_split(c,msgs,sent,cnt,left)<0) goto eagain;
+				if(udp_send_split(c,msgs,sent,cnt,left,1)<0) goto eagain;
 				sent++;
 				continue;
 			}
@@ -3256,7 +3301,9 @@ static void check_and_record_listen(unordered_map<address_t,int,address_t::hash_
 }
 
 //U5：监听 socket 开 UDP_GRO。开成功时给所属 worker 的 udp_batch 挂上收 cmsg 的控制缓冲（每个 worker 一份批，重复挂是同样的指针）；
-//第一个就失败（5.0 以前的内核）时整个特性关闭，这时还没有 socket 开着 UDP_GRO。之后的失败每条规则只记一行（warned 由调用方按规则给）：那个监听 socket 收到的都是普通数据报
+//第一个就失败（5.0 以前的内核）时整个特性关闭，这时还没有 socket 开着 UDP_GRO。之后的失败每条规则只记一行（warned 由调用方按规则给）：
+//那个监听 socket 收到的都是普通数据报，但同一 worker 的会话 socket 仍开 UDP_GRO，照样挂（D114：否则某个 worker 的监听全部失败时，
+//它的回程批没有控制缓冲，合并回包 MSG_CTRUNC 整包丢弃）；普通数据报不带 UDP_GRO cmsg，挂着不影响
 static void udp_gro_listen(forward_rule_t &rule,int &warned)
 {
 	static int gro_socks=0;
@@ -3271,6 +3318,7 @@ static void udp_gro_listen(forward_rule_t &rule,int &warned)
 			rule.index,get_sock_error(),gro_socks==0?", UDP_GRO stays off":"");
 	warned=1;
 	if(gro_socks==0) udp_gro=0;
+	else rule.worker->udp_batch.attach_ctrl(1);//D114
 }
 //D87、D88：通配地址的 UDP 监听开收包的 PKTINFO，回包以客户端发往的地址为源（udp_ret_set_ctrl）。[::] 开 IPV6_RECVPKTINFO：
 //IPv4 客户端的目的以 v4-mapped 地址给出（3.14 起；3.10–3.13 上没有，这些客户端的回包照旧由内核选源）；只收 IPv4 的 0.0.0.0 与
@@ -3728,6 +3776,7 @@ int event_loop()
 		if(app_config.rules[i].balance_strategy==balance_strategy_roundrobin)
 			rr_build_seq(app_config.rules[i].balance_weights,rule_shared[i].rr_seq);
 	if(cpu_affinity) cpu_affinity_init();
+	udp_hash_seed_init();
 
 	for(int k=0;k<worker_count;k++)
 	{
@@ -3862,6 +3911,9 @@ void print_help()
 	printf("    -t                                  enable TCP forwarding/mapping\n");
 	printf("    -u                                  enable UDP forwarding/mapping\n");
 	printf("    remote supports IPv4, [IPv6], or hostname; hostname is refreshed every 30s\n");
+	//D117：空闲超时（common.h conn_timeout_tcp/udp）与 UDP 会话的 fd、本地端口占用写进帮助，README 的 Options 块照抄输出的这两行
+	printf("    connections without data in either direction are closed after %us (TCP) or %us (UDP); every UDP client\n",conn_timeout_tcp/1000,conn_timeout_udp/1000);
+	printf("    ip:port keeps its own session socket (one fd, one local port) until then: raise ulimit -n for busy UDP rules\n");
 	printf("\n");
 
 	printf("other options:\n");

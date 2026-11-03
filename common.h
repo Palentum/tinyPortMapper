@@ -104,6 +104,7 @@ const int dns_max_result=16;
 const int max_data_len_udp=65536;
 const int max_data_len_tcp=65536;//一次 recv 最多读这么多，也是 TCP 缓冲池每块的大小（T11）
 
+//空闲超时（ms）：从任一方向最后一次有数据起算（UDP 读到数据报，TCP 收到或发出数据）。print_help 按这里的值输出，README 里的数值要一起改（D117）
 const u32_t conn_timeout_udp=180000;
 const u32_t conn_timeout_tcp=360000;
 

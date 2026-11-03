@@ -15,6 +15,7 @@ package tests
 
 import (
 	"bytes"
+	"encoding/binary"
 	"errors"
 	"fmt"
 	"net"
@@ -26,6 +27,8 @@ import (
 	"runtime"
 	"slices"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"syscall"
 	"testing"
 	"time"
@@ -1023,6 +1026,61 @@ func TestUDPGROSendError(t *testing.T) {
 	}
 }
 
+// U5（D116）：预先切块的合并包（段数超过 udp_gso_cap()，这里 100 段拆成 64+36，不先走主路径的 sendmmsg）在 udp_send_split 里第一次
+// 发送碰上一次性的错误时，同主路径（D41）再发一次，不把整块丢掉。暂停期间先伪造一个"后端端口不可达"的 ICMP，让会话 socket 带上
+// sk_err=ECONNREFUSED，再排进这个合并包：恢复后同一次 epoll_wait 报出两个 fd，监听 socket 在就绪链表里靠后，libev 后登记的先调，
+// 入向的第一次 sendmmsg 取走这个错误、第一块失败（会话的 udp_cb 随后 recvmmsg 只得到 EAGAIN，日志没有 "[udp]recv failed"）。
+// 期望 100 个数据报都到后端，up_drop=0，没有 warn（修复前第一块的 64 个数据报整块丢弃：up_drop=64，一行 sendmmsg 的 warn）。
+// 两个包由绑在同一个 CPU 上的线程发出：lo 收包的 softirq 推迟到 ksoftirqd 时，同一 CPU 的 backlog 仍按先后处理，ICMP 一定先于合并包生效
+func TestUDPGROSplitPendingError(t *testing.T) {
+	t.Parallel()
+	singleWorkerOnly(t, "暂停期间经 sock_diag 确认合并包已排进监听 socket（queueGSO）")
+	be := newGRORecorder(t, loopback4(t), false)
+	listen := loopback4(t)
+	m := startMapper(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", be.addr, "-u", "--udp-gro")
+	c := udpDial(t, "", listen)
+	hello := []byte("hello")
+	session := helloGRO(t, be, hello, func(b []byte) error { _, err := c.Write(b); return err })
+	p := gsoPkt{gsoData(160, 10000), 100}
+	runtime.LockOSThread() // 用例中途失败时线程随 goroutine 退出，绑核不会留给别的 goroutine
+	cpus, err := schedGetaffinity(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schedSetaffinity(0, cpus[:1]); err != nil {
+		t.Fatal(err)
+	}
+	m.pause(t)
+	icmpPortUnreachable(t, session, be.addr)
+	queueGSO(t, m, listen, []gsoSend{{c, nil, p}})
+	if err := schedSetaffinity(0, cpus); err != nil {
+		t.Fatal(err)
+	}
+	runtime.UnlockOSThread()
+	m.resume(t)
+	n := uint64(1 + len(p.segs()))
+	var s udpStat
+	eventually(t, ioTimeout, 50*time.Millisecond, func() error {
+		if s = m.statsAfterSignal(t).udp[1]; s.upPkts+s.upDrop < n {
+			return fmt.Errorf("up_pkts=%d up_drop=%d，期望合计 %d", s.upPkts, s.upDrop, n)
+		}
+		return nil
+	})
+	if l := m.logLines("[udp]recv failed"); l != 0 {
+		t.Fatalf("用例前提不成立：会话的 udp_cb 先取走了 ICMP 错误（%d 行 recv failed），入向发送没有碰上它", l)
+	}
+	if s.upPkts != n || s.upDrop != 0 || s.upGSOFallback != 0 {
+		t.Errorf("统计 up_pkts=%d up_drop=%d up_gso_fallback=%d，期望 %d/0/0（待取的 ICMP 错误随第一次发送取走，这一块应再发一次）",
+			s.upPkts, s.upDrop, s.upGSOFallback, n)
+	}
+	expectNoWarn(t, m)
+	if t.Failed() {
+		t.FailNow()
+	}
+	got, _, _ := be.bySource(t, int(n))
+	expectBySource(t, got, [][][]byte{append([][]byte{hello}, p.segs()...)})
+}
+
 // U5（D44，审查 H1）：给了 --udp-gro 且 --udp-listen-buf 大于会话缓冲（--sock-buf，默认 1 MiB）时，会话 socket 的 SO_SNDBUF 取监听
 // 缓冲的大小、用 FORCE（有 CAP_NET_ADMIN 时不受 wmem_max 截断）：一次入向回调可能把监听队列里积压的合并包全交给一个会话，sndbuf 装不下
 // 就 EAGAIN 丢掉整组。SO_RCVBUF 不变（D38：只有给了 --sock-buf 才 FORCE）。没给 --udp-gro，或监听缓冲不大于会话缓冲（含相等的边界）时
@@ -1428,4 +1486,239 @@ func TestUDPGROSetsockoptFail(t *testing.T) {
 			}
 		})
 	}
+}
+
+// D114：--threads 2，只有 worker 1 的监听 socket 开不了 UDP_GRO（seccomp 按 fd 让 setsockopt 返回 ENOPROTOOPT；主线程按 worker 顺序建
+// 监听 socket，fd 相邻，worker 0 的先开成功，特性仍开着）。worker 1 的会话 socket 照样开 UDP_GRO：16 个客户端按 4 元组哈希分到两个 worker
+// （worker 行核对 worker 1 分到了会话），后端给每个会话回一个 5 段的合并包，每个客户端都原样收到带 GSO 的转发（修复前 worker 1 的回程批
+// 没挂控制缓冲，合并回包 MSG_CTRUNC、整包丢弃、每包一行 warn）。只有那一行监听 socket 的 warn（不带 UDP_GRO stays off），down_gro、
+// down_pkts 为全部回包的段数，down_drop 为 0
+func TestUDPGROSetsockoptFailWorker(t *testing.T) {
+	t.Parallel()
+	be := newGRORecorder(t, loopback4(t), true)
+	listen := loopback4(t)
+	wait := listenPoints("u", portOf(listen))
+	args := []string{"-l", listen, "-r", be.addr, "-u", "--udp-gro", "--threads", "2", "--log-level", "5"}
+	probe := startMapper(t, wait, args...)
+	lo, hi := listenFDRange(t, probe.pid(), "udp", portOf(listen))
+	probe.stop(t, false)
+	if hi-lo != 2 {
+		t.Fatalf("监听 socket 的 fd 区间为 [%d, %d)，期望每个 worker 一个、共 2 个", lo, hi)
+	}
+	m := startMapperGROFail(t, lo+1, hi, wait, args...)
+	const ctrunc = "control data truncated (MSG_CTRUNC)"
+	t.Cleanup(func() {
+		if t.Failed() {
+			t.Logf("日志里 %q 的 warn 有 %d 行", ctrunc, m.logLines(ctrunc))
+		}
+	})
+	const n = 16
+	cls := make([]*groClient, n)
+	sessions := make([]string, n)
+	for i := range cls {
+		cl := newGROClient(t, "127.0.0.1", listen)
+		cls[i] = cl
+		sessions[i] = helloGRO(t, be, fmt.Appendf(nil, "hello-%d", i), func(b []byte) error { return cl.send(gsoPkt{b, 0}) })
+	}
+	if d := m.statsAfterSignal(t); len(d.workers) != 2 || d.workers[1].udpSessions == 0 {
+		t.Fatalf("worker 行 %+v：worker 1 没有分到会话，测不到", d.workers)
+	}
+	var want uint64
+	for i, cl := range cls {
+		down := gsoPkt{gsoData(130+i, 4500), 1000}
+		be.sendTo(t, sessions[i], down)
+		cl.expect(t, down.forwarded(), fmt.Sprintf("客户端 %d（会话 %s）", i, sessions[i]))
+		want += uint64(len(down.segs()))
+	}
+	if s := m.statsAfterSignal(t).udp[1]; s.sessions != n || s.downGRO != want || s.downPkts != want || s.downDrop != 0 {
+		t.Errorf("统计 sessions=%d down_gro=%d down_pkts=%d down_drop=%d，期望 %d/%d/%d/0", s.sessions, s.downGRO, s.downPkts, s.downDrop, n, want, want)
+	}
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if k := m.logLines("rule 1 "+groSetFailWarn, groSetFailHint); k != 1 {
+			return fmt.Errorf("日志里有 %d 行规则 1 的监听 socket 开 UDP_GRO 失败的 warn，期望 1", k)
+		}
+		return nil
+	})
+	if k := m.logLines("UDP_GRO stays off"); k != 0 {
+		t.Errorf("日志里有 %d 行说特性关闭了：worker 0 的监听 socket 开成功了", k)
+	}
+	if k := m.logLines(ctrunc); k != 0 {
+		t.Errorf("日志里有 %d 行 %q 的 warn：worker 1 的合并回包被丢弃", k, ctrunc)
+	}
+}
+
+// ---- D115：旧内核段数上限的 EINVAL 跨 worker 竞态 ----
+
+// sendmmsgFirstGSO 读被通知的 sendmmsg 第一条消息的 UDP_SEGMENT 段长与数据总长（经 /proc/<pid>/mem）。64 位小端布局：struct mmsghdr
+// 以 msghdr 开头，msg_iov 在偏移 16、msg_iovlen 在 24、msg_control 在 32、msg_controllen 在 40（musl 在 int 字段旁的填充由 tinymapper
+// 保持为 0，按 u64 读即可）；cmsg 的 level、type 在偏移 8、12，数据从 16 起。第一个 cmsg 不是 UDP_SEGMENT 时 gso 为 0。
+// 只读向量的第一条：用它的旧内核模拟（TestUDPGSOOldLimitRace 的 oldLimit）看不到排在后面的条目
+func sendmmsgFirstGSO(c notifyCall) (gso, length int, err error) {
+	ne := binary.NativeEndian
+	h, err := readTargetMem(c.pid, c.args[1], 48)
+	if err != nil {
+		return 0, 0, err
+	}
+	iov, iovlen, ctl, ctllen := ne.Uint64(h[16:]), ne.Uint64(h[24:]), ne.Uint64(h[32:]), ne.Uint64(h[40:])
+	if iovlen > 1024 {
+		return 0, 0, fmt.Errorf("msg_iovlen 为 %d", iovlen)
+	}
+	if iovlen > 0 {
+		v, err := readTargetMem(c.pid, iov, 16*int(iovlen))
+		if err != nil {
+			return 0, 0, err
+		}
+		for k := range int(iovlen) {
+			length += int(ne.Uint64(v[16*k+8:]))
+		}
+	}
+	if ctl != 0 && ctllen >= uint64(syscall.CmsgLen(2)) {
+		cm, err := readTargetMem(c.pid, ctl, syscall.CmsgLen(2))
+		if err != nil {
+			return 0, 0, err
+		}
+		if ne.Uint32(cm[8:]) == solUDP && ne.Uint32(cm[12:]) == udpSegmentOpt {
+			gso = int(ne.Uint16(cm[16:]))
+		}
+	}
+	return gso, length, nil
+}
+
+// D115：旧内核（5.0–5.15 没有 v5.16 的修复）上 64 段的 GSO 发送必报 EINVAL，两个 worker 前后脚碰上。--threads 2、--udp-gro，seccomp 用户态
+// 通知看 tinymapper 的每次 sendmmsg：会话 socket 上第一条带 UDP_SEGMENT、数据加 28 字节 IPv4/UDP 头超过 64 段的，按旧内核返回 EINVAL
+// （这个内核本身发得出去）。两个客户端分在两个 worker 上（按转发 hello 的线程区分），各发一个 64 段（段长 1000）的合并包：worker A 的那次
+// sendmmsg 先压住，worker B 的返回 EINVAL，等 B 按 63 段一块重发（这时 B 已经置位 udp_gso_hdr_cap）之后放开 A，同样返回 EINVAL。A 也按
+// 旧内核上限处理：两个包都以 63 段的合并包加 1 个普通数据报到达后端；A 随后再发的 64 段合并包直接按 63+1 发出、不再注入。注入的 EINVAL
+// 恰好两次，up_gso_fallback=0，没有 GSO 回退行，旧内核上限的 debug 只有一行（修复前 A 见标志已置位，把 EINVAL 当成 GSO 本身失败：
+// 关掉这个会话入向的 GSO、两个包都逐个数据报发出，up_gso_fallback=1，记一行回退的 info）
+func TestUDPGSOOldLimitRace(t *testing.T) {
+	t.Parallel()
+	be := newGRORecorder(t, loopback4(t), true)
+	listen := loopback4(t)
+	m, nf := startMapperSendNotify(t, listenPoints("u", portOf(listen)), "-l", listen, "-r", be.addr, "-u", "--udp-gro", "--threads", "2", "--log-level", "5")
+	lo, hi := listenFDRange(t, m.pid(), "udp", portOf(listen))
+	const gso = 1000
+	var readErrs atomic.Int32
+	upSend := func(c notifyCall) bool { return c.nr == sendmmsgNR[runtime.GOARCH] && (c.fd(0) < lo || c.fd(0) >= hi) }
+	// 旧内核 udp_send_skb：skb->len（含 IP/UDP 头）> gso_size*UDP_MAX_SEGMENTS 时 EINVAL。只模拟本用例的场景：只看 sendmmsg 向量的
+	// 第一条，只按 IPv4 的 28 字节头算；超上限的条目排在第二条以后、或走 IPv6（40+8 字节头）时不注入，这个内核照常发出
+	oldLimit := func(c notifyCall) bool {
+		g, n, err := sendmmsgFirstGSO(c)
+		if err != nil {
+			readErrs.Add(1)
+		}
+		return g > 0 && n+28 > g*gsoMaxSegs
+	}
+	var last, tidA, tidB atomic.Int64
+	var injected, resentB atomic.Int32
+	nf.setDecide(func(c notifyCall) syscall.Errno {
+		if !upSend(c) {
+			return 0
+		}
+		last.Store(int64(c.pid))
+		if oldLimit(c) {
+			injected.Add(1)
+			return syscall.EINVAL
+		}
+		if int64(c.pid) == tidB.Load() && injected.Load() > 0 {
+			resentB.Store(1)
+		}
+		return 0
+	})
+	type client struct {
+		cl      *groClient
+		session string
+		tid     int64
+	}
+	var a, b *client
+	for i := 0; i < 32 && b == nil; i++ {
+		cl := newGROClient(t, "127.0.0.1", listen)
+		s := helloGRO(t, be, fmt.Appendf(nil, "hello-%d", i), func(p []byte) error { return cl.send(gsoPkt{p, 0}) })
+		c := &client{cl, s, last.Load()}
+		if a == nil {
+			a = c
+		} else if c.tid != a.tid {
+			b = c
+		}
+	}
+	if b == nil {
+		t.Fatalf("32 个客户端的 hello 都由线程 %d 转发：测不到两个 worker", a.tid)
+	}
+	tidA.Store(a.tid)
+	tidB.Store(b.tid)
+	release := make(chan struct{})
+	var once sync.Once
+	free := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(free)
+	var held atomic.Int32
+	nf.setHold(func(c notifyCall) <-chan struct{} {
+		if int64(c.pid) == tidA.Load() && upSend(c) && oldLimit(c) && held.CompareAndSwap(0, 1) {
+			return release
+		}
+		return nil
+	})
+	pkt := func(seed int) gsoPkt { return gsoPkt{gsoData(seed, gsoMaxSegs*gso), gso} }
+	pa, pb, pa2 := pkt(151), pkt(152), pkt(153)
+	hellos := be.count()
+	if err := a.cl.send(pa); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, ioTimeout, 2*time.Millisecond, func() error {
+		if held.Load() == 0 {
+			return errors.New("worker A 转发 64 段合并包的 sendmmsg 还没有被压住")
+		}
+		return nil
+	})
+	if err := b.cl.send(pb); err != nil {
+		t.Fatal(err)
+	}
+	eventually(t, ioTimeout, 2*time.Millisecond, func() error {
+		if resentB.Load() == 0 {
+			return fmt.Errorf("worker B 还没有在 EINVAL 之后重发（已注入 %d 次）", injected.Load())
+		}
+		return nil
+	})
+	free()
+	be.wait(t, hellos+2*gsoMaxSegs)
+	if err := a.cl.send(pa2); err != nil {
+		t.Fatal(err)
+	}
+	got := be.msgsBySource(t, hellos+3*gsoMaxSegs)
+	capped := func(ps ...gsoPkt) (out []groMsg) { // 每块至多 64−⌈48/1000⌉ = 63 段：63 段的合并包加 1 个普通数据报
+		for _, p := range ps {
+			k := (gsoMaxSegs - 1) * gso
+			out = append(out, groMsg{data: p.data[:k], gso: gso}, groMsg{data: p.data[k:]})
+		}
+		return out
+	}
+	for _, c := range []struct {
+		name string
+		cl   *client
+		want []groMsg
+	}{{"A", a, capped(pa, pa2)}, {"B", b, capped(pb)}} {
+		g := got[c.cl.session]
+		if len(g) < len(c.want) || !msgsEqual(g[len(g)-len(c.want):], c.want) {
+			t.Errorf("worker %s 的会话 %s 转发到后端的是 %s，期望最后是 %s", c.name, c.cl.session, describeMsgs(g), describeMsgs(c.want))
+		}
+	}
+	if v := injected.Load(); v != 2 {
+		t.Errorf("按旧内核注入了 %d 次 EINVAL，期望 2 次（A、B 各一次，之后的块都不超过 63 段）", v)
+	}
+	if v := readErrs.Load(); v != 0 {
+		t.Errorf("读 tinymapper 的 sendmmsg 参数失败 %d 次", v)
+	}
+	s := m.statsAfterSignal(t).udp[1]
+	if s.upGSOFallback != 0 || s.upGRO != 3*gsoMaxSegs || s.upDrop != 0 || s.upPkts != uint64(be.count()) {
+		t.Errorf("统计 up_gso_fallback=%d up_gro=%d up_drop=%d up_pkts=%d，期望 0/%d/0/%d", s.upGSOFallback, s.upGRO, s.upDrop, s.upPkts, 3*gsoMaxSegs, be.count())
+	}
+	if l := gsoFallbackLines(m, "session"); len(l) != 0 {
+		t.Errorf("日志里有 %d 行会话 socket 的 GSO 回退：%q", len(l), l[0])
+	}
+	eventually(t, logFlushWithin, 50*time.Millisecond, func() error {
+		if k := m.logLines("[udp]GSO send of 64 segments failed with EINVAL"); k != 1 {
+			return fmt.Errorf("旧内核段数上限的 debug 有 %d 行，期望 1 行", k)
+		}
+		return nil
+	})
+	expectNoWarn(t, m)
 }
